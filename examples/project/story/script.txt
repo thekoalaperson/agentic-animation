@@ -1,0 +1,2 @@
+001 | Narrator | कमरे में एक दीपक जलता है। | A lamp burns in the room.
+002 | Narrator | खिड़की से सुबह की रोशनी आती है। | Morning light enters through the window.

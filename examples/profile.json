@@ -1,0 +1,16 @@
+{
+  "workspaceRoot": "/path/to/private-studio",
+  "projectRoot": "/path/to/private-studio/project",
+  "authorizer": "Project owner",
+  "channel": {
+    "name": "Example Studio",
+    "handle": "@example-studio",
+    "id": "configure-your-channel",
+    "language": "hi"
+  },
+  "workers": {
+    "h3": {"root": "/srv/animation", "python": "/srv/animation/venv/bin/python"},
+    "audio": {"root": "/srv/animation", "python": "/srv/animation/audio/bin/python"},
+    "hd": {"root": "/srv/animation", "python": "/srv/animation/hd/bin/python"}
+  }
+}

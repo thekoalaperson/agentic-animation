@@ -1,0 +1,7 @@
+{
+  "episode": "demo",
+  "stills": [
+    {"still_id": "demo-s001", "beat": "opening", "speaker": null},
+    {"still_id": "demo-s002", "beat": "ending", "speaker": null}
+  ]
+}
