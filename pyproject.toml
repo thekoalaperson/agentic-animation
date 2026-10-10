@@ -1,0 +1,10 @@
+[project]
+name = "agentic-animation"
+version = "0.1.0"
+description = "Reference-grounded animation production tools and agent guidance"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["numpy==2.4.6", "pillow==12.3.0", "requests==2.34.2"]
+
+[tool.uv]
+package = false
