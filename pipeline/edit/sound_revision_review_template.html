@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sound revision review</title>
+<style>
+:root{color-scheme:dark;--slate:#192832;--sky:#b7c8d4;--paper:#f0e8d8;--brass:#d6b56e;--plum:#514258;--warning:#c67d79}
+*{box-sizing:border-box}body{margin:0;background:var(--slate);color:var(--paper);font:15px/1.45 system-ui,sans-serif}main{max-width:1000px;margin:0 auto;padding:16px 22px 40px}header,.controls,.choice,.topline{display:flex;align-items:center;gap:9px;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:12px}header strong{font-size:17px}select,button,textarea{font:inherit;color:inherit;background:#243b48;border:1px solid #647784;border-radius:5px}button,select{padding:7px 12px}button,summary{cursor:pointer}button:hover{background:#345362}button[aria-pressed=true]{background:var(--brass);border-color:var(--brass);color:#192832;font-weight:700}:focus-visible{outline:3px solid var(--brass);outline-offset:3px}h1{font:normal 26px/1.2 Georgia,serif;margin:0 0 5px}p{margin:5px 0 10px;max-width:79ch}.muted,small{color:var(--sky)}.danger{color:var(--warning)}#intent{min-height:22px}video{display:block;width:100%;height:min(43vh,470px);background:#080e12;border-radius:6px;object-fit:contain}.controls{margin:9px 0}.controls .transport{margin-left:auto}.wave-row{display:grid;grid-template-columns:100px 1fr;gap:8px;align-items:center;margin:4px 0}.wave-button{font-size:13px;padding:4px 7px}.wave{position:relative;height:27px;cursor:crosshair;background:#203542;border-radius:3px;overflow:hidden}.wave svg{width:100%;height:100%;display:block}.needle{position:absolute;width:2px;inset:0 auto 0 0;background:var(--paper);pointer-events:none}.choice{margin:12px 0 6px}.choice span{margin-right:5px}textarea{width:100%;min-height:58px;padding:8px 10px;resize:vertical}#saveState{min-height:20px;font-size:12px}.help{font-size:12px;margin:3px 0 14px}.status{font-size:13px;min-height:20px}.details{border-top:1px solid #526572;margin-top:17px;padding-top:9px}summary{font-weight:600;padding:3px 0 7px}.raw-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.raw-item{min-width:0;margin:10px 0 16px}.raw-item h2{font:normal 19px Georgia,serif;margin:0 0 6px}audio{width:100%;height:34px}.prompt{font-size:13px;color:var(--sky);white-space:pre-wrap;line-height:1.55}pre{white-space:pre-wrap;font:inherit;font-size:14px;max-width:78ch}.sfx-note{min-height:45px;font-size:13px}a{color:var(--brass)}footer{margin-top:22px;font-size:12px;color:var(--sky)}#currentLine{font-size:15px;margin:7px 0 3px;min-height:24px}.clock{font-variant-numeric:tabular-nums;color:var(--sky);font-size:13px}.spacer{flex:1}.raw-item .wave{margin:8px 0;height:32px}.error-box{color:var(--warning);margin:20px 0}.source-detail{font-size:12px;overflow-wrap:anywhere}.raw-item details{margin:7px 0}
+@media(max-width:600px){main{padding:12px}header strong{width:100%}h1{font-size:23px}video{height:auto;max-height:42vh}.controls .transport{margin-left:0}.raw-grid{grid-template-columns:1fr}.wave-row{grid-template-columns:83px 1fr}.choice{gap:6px}.choice button{padding:6px 9px}select{max-width:100%}#currentLine{font-size:14px}}
+</style>
+<main id="app">
+<header><strong>Sound revision</strong><select id="scene" aria-label="Choose scene"></select><button id="export">Export my notes</button></header>
+<div class="topline"><h1 id="title"></h1><span class="spacer"></span><span id="sceneClock" class="clock"></span></div>
+<p id="intent" class="muted"></p>
+<video id="player" controls playsinline preload="metadata"></video>
+<p id="currentLine" lang="hi"></p>
+<div class="controls"><div id="variants" class="controls" style="margin:0"></div><button class="transport" id="play">Play</button><button id="restart">Restart</button><span id="time" class="clock"></span></div>
+<div id="waves" aria-label="Same-scale audio waveforms"></div>
+<div id="status" class="status muted" role="status" aria-live="polite"></div>
+<div class="choice"><span>For this scene:</span><button data-choice="1">Prefer A</button><button data-choice="2">Prefer B</button><button data-choice="neither">Neither</button><button data-choice="">Clear choice</button></div>
+<textarea id="notes" aria-label="Feedback for this scene" placeholder="Does it feel right? Which moments need more threat, space, weight or variety?"></textarea>
+<div id="saveState" role="status"></div>
+<p class="help">← → sound · ↑ ↓ scene · Space play/pause. In notes, type normally; Ctrl+Space plays, Alt+arrows navigate, Esc leaves the box. Switching sound keeps your place.</p>
+<details class="details"><summary>Listen to the music alone · exact prompts · Hindi lines</summary><div id="rawMusic" class="raw-grid"></div><details><summary>All lines in this excerpt</summary><pre id="text" lang="hi"></pre></details><details><summary>How this comparison was made</summary><p id="scope" class="muted"></p><p class="muted">New A and B have identical effects. Only their music take changes. These are direction tests, not the finished mix; effect anchors still need final frame-level checking. Waveforms show amplitude, not emotion or quality.</p><div id="effects" class="source-detail"></div></details></details>
+<details class="details" id="sfx"><summary>Generated effects · listen separately and leave notes</summary><p class="muted">Unmodified source files. Start with a comfortable playback volume. Pitch, speed and placement in the scene versions may differ.</p><div id="rawSfx" class="raw-grid"></div></details>
+<footer>Listening prototypes only. The current full-film sound has not been replaced, and no selection is pre-approved.</footer>
+</main>
+<script>
+'use strict';
+const DATA=/*__DATA__*/null;
+if(!DATA){document.getElementById('app').innerHTML='<h1>This is the empty design template</h1><p class="error-box">Open the generated SOUND_REVISION_REVIEW.html in the episode’s work/sound-rebuild-v2/review-v1 folder. This template has no sounds.</p>';}
+else {
+const $=id=>document.getElementById(id), player=$('player');
+const reviewBinding=JSON.stringify({plan:DATA.planSha256,music:DATA.musicManifestSha256,variants:DATA.scenes.map(s=>s.variants.map(v=>v.sha256)),sounds:DATA.sounds.map(s=>s.sha256)});
+const storageKey='sound-revision-'+reviewBinding;
+let saved={scenes:{},sounds:{}}, storageOK=true, sceneIndex=0, variantIndex=1, loadToken=0, playbackTarget=null;
+try{const s=JSON.parse(localStorage.getItem(storageKey)||'null');if(s&&s.scenes&&s.sounds)saved=s;}catch(e){storageOK=false;}
+const fmt=t=>Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0');
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const current=()=>DATA.scenes[sceneIndex];
+function save(){try{localStorage.setItem(storageKey,JSON.stringify(saved));storageOK=true;}catch(e){storageOK=false;}$('saveState').textContent=storageOK?'Notes saved on this browser. Export when finished.':'Browser storage unavailable. Keep this page open and export your notes.';$('saveState').className=storageOK?'muted':'danger';}
+function pauseOthers(except){document.querySelectorAll('audio,video').forEach(m=>{if(m!==except)m.pause();});}
+document.addEventListener('play',e=>{if(e.target.matches('audio,video'))pauseOthers(e.target);},true);
+function waveHTML(values){return '<svg viewBox="0 0 480 40" preserveAspectRatio="none" aria-hidden="true"><path d="'+values.map((v,i)=>'M'+(i*480/values.length).toFixed(2)+' '+(20-Math.min(v,1)*19).toFixed(2)+'v'+(Math.min(v,1)*38).toFixed(2)).join(' ')+'" stroke="'+(getComputedStyle(document.documentElement).getPropertyValue('--sky').trim())+'" stroke-width="1"/></svg><i class="needle"></i>';}
+async function play(){if(playbackTarget){playbackTarget.playing=true;$('play').textContent='Pause';return;}try{await player.play();}catch(e){$('status').textContent='Playback needs a click on Play, or this file is unavailable.';}}
+function toggle(){if(playbackTarget){playbackTarget.playing=!playbackTarget.playing;$('play').textContent=playbackTarget.playing?'Pause':'Play';}else if(player.paused)play();else player.pause();}
+function chooseVariant(i,keep=true,seek=null){
+ const s=current();variantIndex=(i+3)%3;const t=seek!==null?seek:(keep?(playbackTarget?playbackTarget.time:player.currentTime):0), resume=keep&&(playbackTarget?playbackTarget.playing:!player.paused), token=++loadToken;
+ playbackTarget={time:t||0,playing:resume};
+ player.pause();$('status').textContent='Loading '+s.variants[variantIndex].label+'…';
+ player.onloadedmetadata=()=>{if(token!==loadToken||player.readyState<1||!playbackTarget)return;const target=playbackTarget;player.currentTime=Math.min(target.time,Math.max(0,player.duration-.05));playbackTarget=null;$('status').textContent=s.variants[variantIndex].label+' · identical picture and voice level';if(target.playing)play();updateTime();};
+ player.onerror=()=>{if(token===loadToken){playbackTarget=null;$('play').textContent='Play';$('status').textContent='Cannot open '+s.variants[variantIndex].url+'. Keep the review folder and its media together.';}};
+ player.src=s.variants[variantIndex].url;player.load();
+ document.querySelectorAll('[data-variant]').forEach(b=>b.setAttribute('aria-pressed',Number(b.dataset.variant)===variantIndex));
+}
+function updateTime(){
+ const s=current(),t=playbackTarget?playbackTarget.time:(player.currentTime||0); $('time').textContent=fmt(t)+' / '+fmt(s.duration);
+ document.querySelectorAll('#waves [data-wave]').forEach(w=>w.setAttribute('aria-valuenow',Math.min(t,s.duration)));
+ document.querySelectorAll('#waves .needle').forEach(n=>n.style.left=Math.min(100,t/s.duration*100)+'%');
+ const line=(s.lines||[]).find(l=>t>=l.start&&t<l.end);$('currentLine').textContent=line?line.text:'';
+}
+function refreshChoice(){let value=saved.scenes[current().id]?.choice||'';document.querySelectorAll('[data-choice]').forEach(b=>b.setAttribute('aria-pressed',!!value&&b.dataset.choice===value));}
+function renderScene(i){
+ pauseOthers(null);sceneIndex=(i+DATA.scenes.length)%DATA.scenes.length;const s=current();$('scene').value=sceneIndex;
+ $('title').textContent=s.title;$('intent').textContent=s.intent;$('sceneClock').textContent=fmt(s.start)+'–'+fmt(s.end)+' in film';$('text').textContent=s.text;$('scope').textContent=DATA.scope;
+ $('variants').innerHTML=s.variants.map((v,j)=>'<button data-variant="'+j+'">'+esc(v.label)+'</button>').join('');
+ $('waves').innerHTML=s.variants.map((v,j)=>'<div class="wave-row"><button class="wave-button" data-variant="'+j+'">'+esc(v.label)+'</button><div class="wave" tabindex="0" role="slider" aria-label="Seek '+esc(v.label)+'" data-wave="'+j+'" aria-valuemin="0" aria-valuemax="'+s.duration+'" aria-valuenow="0">'+waveHTML(v.wave)+'</div></div>').join('');
+ document.querySelectorAll('[data-variant]').forEach(b=>b.onclick=()=>chooseVariant(Number(b.dataset.variant)));
+ document.querySelectorAll('[data-wave]').forEach(w=>{w.onclick=e=>{const at=Math.max(0,Math.min(1,(e.clientX-w.getBoundingClientRect().left)/w.clientWidth))*s.duration;if(Number(w.dataset.wave)!==variantIndex){chooseVariant(Number(w.dataset.wave),true,at);}else if(playbackTarget){playbackTarget.time=at;}else{player.currentTime=Math.min(at,Math.max(0,player.duration-.05));}updateTime();};});
+ $('notes').value=saved.scenes[s.id]?.notes||'';refreshChoice();
+ $('rawMusic').innerHTML=s.variants.filter(v=>v.music).map(v=>'<section class="raw-item"><h2>'+esc(v.label)+' · music only</h2><audio controls preload="metadata" src="'+esc(v.music.url)+'"></audio><p class="muted source-detail">Scene uses '+fmt(v.music.sourceStart)+'–'+fmt(v.music.sourceEnd)+' of this track.</p><details><summary>Exact generation prompt</summary><p class="prompt">'+esc(v.music.prompt)+'</p></details><a class="source-detail" href="'+esc(v.music.url)+'">Open original track</a></section>').join('');
+ $('effects').innerHTML=s.effects.length?s.effects.map(e=>'<p>'+esc(e.family.replaceAll('-',' '))+' at '+fmt(e.atSeconds)+'; pitch '+e.semitones+' semitones; speed '+e.speed+'×.</p>').join(''):'No added effects in this excerpt. Grief gets space.';
+ chooseVariant(variantIndex,false);save();
+}
+DATA.scenes.forEach((s,i)=>$('scene').add(new Option(s.title,i)));
+$('scene').onchange=()=>renderScene(Number($('scene').value));$('play').onclick=toggle;$('restart').onclick=()=>{if(playbackTarget)playbackTarget.time=0;else player.currentTime=0;play();};
+player.ontimeupdate=updateTime;player.onplay=()=>{$('play').textContent='Pause';};player.onpause=()=>{$('play').textContent=playbackTarget?.playing?'Pause':'Play';};
+$('notes').oninput=()=>{const id=current().id;saved.scenes[id]={...saved.scenes[id],notes:$('notes').value,updatedAt:new Date().toISOString()};save();};
+document.querySelectorAll('[data-choice]').forEach(b=>b.onclick=()=>{const id=current().id;saved.scenes[id]={...saved.scenes[id],choice:b.dataset.choice,updatedAt:new Date().toISOString()};refreshChoice();save();});
+$('rawSfx').innerHTML=DATA.sounds.map(s=>'<section class="raw-item"><h2>'+esc(s.title)+' <small>'+s.duration+'s</small></h2><audio controls preload="metadata" src="'+esc(s.url)+'"></audio><div class="wave" data-sfx-wave="'+esc(s.id)+'">'+waveHTML(s.peaks)+'</div>'+(s.warning?'<p class="danger">'+esc(s.warning)+'</p>':'')+'<details><summary>Prompt and screening note</summary><p class="prompt">'+esc(s.prompt)+'</p><p class="source-detail muted">'+esc(s.speechScreen)+'</p></details><textarea class="sfx-note" data-sound="'+esc(s.id)+'" aria-label="Notes on '+esc(s.title)+'" placeholder="Keep? Too similar? Pitch, weight or texture notes…">'+esc(saved.sounds[s.id]?.notes||'')+'</textarea></section>').join('');
+document.querySelectorAll('[data-sound]').forEach(el=>el.oninput=()=>{saved.sounds[el.dataset.sound]={notes:el.value,updatedAt:new Date().toISOString()};save();});
+document.querySelectorAll('[data-sfx-wave]').forEach(w=>{const a=w.parentElement.querySelector('audio');w.onclick=e=>{if(Number.isFinite(a.duration))a.currentTime=(e.clientX-w.getBoundingClientRect().left)/w.clientWidth*a.duration;};a.ontimeupdate=()=>w.querySelector('.needle').style.left=(a.currentTime/a.duration*100||0)+'%';});
+document.addEventListener('error',e=>{if(e.target.tagName==='AUDIO'){let p=document.createElement('p');p.className='danger';p.textContent='Sound file is unavailable. Keep music-pilot and sfx-pilot beside this review folder.';e.target.after(p);}},true);
+document.addEventListener('keydown',e=>{
+ if(e.target.tagName==='AUDIO'&&!e.altKey&&!e.ctrlKey&&!e.metaKey){if(e.code==='Space'){e.preventDefault();e.stopPropagation();if(e.target.paused)e.target.play().catch(()=>{$('status').textContent='This audio file could not start. Try its Play control.';});else e.target.pause();}return;}
+ const editing=e.target.matches('textarea,input,select')||e.target.isContentEditable;
+ if(e.key==='Escape'&&editing){e.target.blur();e.preventDefault();return;}
+ if(editing&&!((e.ctrlKey&&e.code==='Space')||(e.altKey&&e.key.startsWith('Arrow'))))return;
+ if(e.metaKey||(e.ctrlKey&&e.code!=='Space'))return;
+ if(e.code==='Space'){e.preventDefault();e.stopPropagation();toggle();}
+ else if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();e.stopPropagation();chooseVariant(variantIndex+(e.key==='ArrowRight'?1:-1));}
+ else if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();e.stopPropagation();renderScene(sceneIndex+(e.key==='ArrowDown'?1:-1));}
+},true);
+$('export').onclick=()=>{
+ const result={episode:DATA.episode,reviewVersion:DATA.version,exportedAt:new Date().toISOString(),reviewBinding,planSha256:DATA.planSha256,musicManifestSha256:DATA.musicManifestSha256,finalFilmApproved:false,
+ scenes:DATA.scenes.map(s=>({id:s.id,shots:s.shots,choice:saved.scenes[s.id]?.choice||null,notes:saved.scenes[s.id]?.notes||'',candidates:s.variants.map(v=>({key:v.key,mixedSha256:v.sha256,musicSha256:v.music?.sha256||null}))})),
+ sounds:DATA.sounds.map(s=>({id:s.id,sha256:s.sha256,notes:saved.sounds[s.id]?.notes||'',screeningWarning:s.warning}))};
+ const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download='SOUND_REVISION_REVIEW.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+renderScene(0);
+}
+</script>
+</html>
