@@ -113,6 +113,35 @@ class DialogueFiniteTest(unittest.TestCase):
         with self.assertRaisesRegex(RUNNER.PlanError,'exact Hindi missing'):
             RUNNER.execute(7,False)
 
+    def test_geometry_warnings_leave_every_serialized_record_unchanged(self):
+        from PIL import Image
+        Image.new('RGB', (64, 64), 'gray').save(self.source, format='PNG')
+        self.doc['jobs'][0]['sourceSha256'] = RUNNER.sha256(self.source)
+        self.save()
+        warned = RUNNER.load_plan(RUNNER.MANIFEST, 7)
+        with mock.patch.object(RUNNER, 'source_geometry_warnings', return_value=[]):
+            quiet = RUNNER.load_plan(RUNNER.MANIFEST, 7)
+        self.assertEqual([w['jobId'] for w in warned['geometryWarnings']], ['demo-s1001'])
+        self.assertEqual(quiet['geometryWarnings'], [])
+
+        def serialized(plan):
+            return json.dumps({
+                'requests': [RUNNER.execution_request(plan, row) for row in plan['jobs']],
+                'requestHashes': [row['executionRequestSha256'] for row in plan['jobs']],
+                'expected': [RUNNER.expected_record(plan, row) for row in plan['jobs']],
+                'commands': [RUNNER.generation_command(plan, row) for row in plan['jobs']],
+                'finiteExecution': RUNNER.finite_execution(plan),
+                'creditPreflight': RUNNER.credit_preflight(plan, 100.0, 35, 1),
+            }, sort_keys=True)
+        self.assertEqual(serialized(warned), serialized(quiet))
+
+        with mock.patch.object(RUNNER.subprocess, 'run'):
+            loud = RUNNER.execute(7, False)
+            with mock.patch.object(RUNNER, 'source_geometry_warnings', return_value=[]):
+                silent = RUNNER.execute(7, False)
+        self.assertEqual({k: v for k, v in loud.items() if k != 'geometryWarnings'},
+                         {k: v for k, v in silent.items() if k != 'geometryWarnings'})
+
 
 if __name__ == '__main__':
     unittest.main()

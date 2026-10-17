@@ -497,6 +497,42 @@ def preflight(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dic
     return pending, completed
 
 
+def finite_execution(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite scope an approval record must match."""
+    return {"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
+            "credits": plan["maximumCredits"]}
+
+
+def credit_preflight(plan: dict[str, Any], available: float, estimated: float,
+                     concurrency: int) -> dict[str, Any]:
+    """The credit-preflight.json record written before any submission."""
+    return {
+        "manifestSha256": plan["manifestSha256"], "availableCredits": available,
+        "estimatedNewCredits": estimated, "pricing": plan["pricing"],
+        "maximumCredits": plan["maximumCredits"],
+        "concurrency": concurrency, "noTopup": True,
+    }
+
+
+def generation_command(plan: dict[str, Any], row: dict[str, Any]) -> list[str]:
+    """The kie_video.py invocation whose arguments become the sidecar's localRequest."""
+    return [
+        sys.executable,
+        str(ROOT / "pipeline/kie_video.py"),
+        "grok15",
+        str(row["outputPath"]),
+        str(row["promptPath"]),
+        str(row["sourcePath"]),
+        "--res", "720p",
+        "--dur", str(row["durationSeconds"]),
+        "--ar", "16:9",
+        "--job-id", row["id"],
+        "--manifest-sha256", plan["manifestSha256"],
+        "--source-sha256", row["sourceSha256"],
+        "--execution-request-sha256", row["executionRequestSha256"],
+    ]
+
+
 def acquire_lock(path: Path, manifest_sha256: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -517,8 +553,7 @@ def execute(max_generated_seconds: int, submit: bool,
         approval = validate_paid_approval(
             approval_admission, episode=EPISODE_CODE, lane="grok-dialogue",
             manifest_path=plan["manifestPath"], manifest_sha256=plan["manifestSha256"],
-            finite_execution={"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
-                              "credits": plan["maximumCredits"]},
+            finite_execution=finite_execution(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
@@ -563,30 +598,11 @@ def execute(max_generated_seconds: int, submit: bool,
         estimated_credits = remaining_seconds * plan["pricing"]["creditsPerSecond"]
         if wallet_before < estimated_credits:
             raise PlanError("Insufficient existing Kie credits; no top-up or overage")
-        atomic_json(HERE / "credit-preflight.json", {
-            "manifestSha256": plan["manifestSha256"], "availableCredits": wallet_before,
-            "estimatedNewCredits": estimated_credits, "pricing": plan["pricing"],
-            "maximumCredits": plan["maximumCredits"],
-            "concurrency": concurrency, "noTopup": True,
-        })
+        atomic_json(HERE / "credit-preflight.json",
+                    credit_preflight(plan, wallet_before, estimated_credits, concurrency))
         def generate_row(row):
             stem = row["outputPath"]
-            command = [
-                sys.executable,
-                str(ROOT / "pipeline/kie_video.py"),
-                "grok15",
-                str(stem),
-                str(row["promptPath"]),
-                str(row["sourcePath"]),
-                "--res", "720p",
-                "--dur", str(row["durationSeconds"]),
-                "--ar", "16:9",
-                "--job-id", row["id"],
-                "--manifest-sha256", plan["manifestSha256"],
-                "--source-sha256", row["sourceSha256"],
-                "--execution-request-sha256", row["executionRequestSha256"],
-            ]
-            result = subprocess.run(command, cwd=ROOT)
+            result = subprocess.run(generation_command(plan, row), cwd=ROOT)
             if result.returncode:
                 recovery = stem.with_suffix(".pending.json")
                 state = ("durable recovery state exists" if recovery.exists()
