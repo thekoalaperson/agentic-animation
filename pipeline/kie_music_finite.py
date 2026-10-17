@@ -153,6 +153,36 @@ def _verified_binding(manifest_path: Path, doc: dict[str, Any],
     return {"kind": path_key, "path": str(path), "sha256": actual}
 
 
+def _verified_authority(manifest_path: Path, doc: dict[str, Any]) -> dict[str, Any] | None:
+    """Check authority and creative bindings at load time, so the dry run finds a change.
+
+    Paths resolve from the manifest's directory, exactly as run_score_gpu.py
+    always resolved them. A manifest without these fields is unchanged.
+    """
+    raw_path, raw_sha = doc.get("authority"), doc.get("authoritySha256")
+    result: dict[str, Any] = {}
+    if raw_path is not None or raw_sha is not None:
+        if not isinstance(raw_path, str) or not raw_path or not isinstance(raw_sha, str):
+            raise PlanError("authority and authoritySha256 must be supplied together")
+        path = (manifest_path.parent / raw_path).resolve()
+        if not path.is_file() or _sha_file(path) != raw_sha:
+            raise PlanError(f"authority changed after the score manifest was frozen: {path}")
+        result["authority"] = {"path": str(path), "sha256": raw_sha}
+    bindings = doc.get("creativeBindings")
+    if bindings is not None:
+        if not isinstance(bindings, list):
+            raise PlanError("creativeBindings must be a list of {path, sha256}")
+        for position, binding in enumerate(bindings):
+            if (not isinstance(binding, dict) or not isinstance(binding.get("path"), str)
+                    or not isinstance(binding.get("sha256"), str)):
+                raise PlanError(f"creativeBindings[{position}] must carry path and sha256")
+            path = (manifest_path.parent / binding["path"]).resolve()
+            if not path.is_file() or _sha_file(path) != binding["sha256"]:
+                raise PlanError(f"creative/timing input changed after freezing: {binding['path']}")
+        result["creativeBindings"] = len(bindings)
+    return result or None
+
+
 def load_plan(manifest_path: Path, max_requests: int,
               max_credits: int) -> dict[str, Any]:
     if max_requests <= 0 or max_credits <= 0:
@@ -178,6 +208,7 @@ def load_plan(manifest_path: Path, max_requests: int,
     production_binding = _verified_binding(
         manifest_path, doc, "productionOverrides", "productionOverridesSha256"
     )
+    authority = _verified_authority(manifest_path, doc)
     try:
         source = json.loads(source_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -243,7 +274,7 @@ def load_plan(manifest_path: Path, max_requests: int,
     fingerprint = _sha_file(manifest_path)
     return {"path": str(manifest_path), "sha256": fingerprint, "doc": doc,
             "sourceSha256": source_sha, "cues": cues, "outputRoot": str(output_root),
-            "productionBinding": production_binding,
+            "productionBinding": production_binding, "authority": authority,
             "expectedCandidatesPerRequest": expected_candidates,
             "requestCount": request_count, "expectedCredits": expected_credits,
             "maxRequests": max_requests, "maxCredits": max_credits}

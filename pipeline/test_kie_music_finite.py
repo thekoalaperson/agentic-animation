@@ -63,6 +63,23 @@ class FiniteKieMusicTest(unittest.TestCase):
     def state_for(manifest: Path) -> Path:
         return manifest.with_suffix(".state.json")
 
+    def test_authority_and_creative_bindings_are_checked_by_the_dry_run(self):
+        for changed in ("GOAL.md", "timing.json"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self.fixture(root)
+                for name in ("GOAL.md", "timing.json"):
+                    (root / name).write_text("demo\n", encoding="utf-8")
+                digest = hashlib.sha256(b"demo\n").hexdigest()
+                doc = json.loads(manifest.read_text())
+                doc.update(authority="GOAL.md", authoritySha256=digest,
+                           creativeBindings=[{"path": "timing.json", "sha256": digest}])
+                manifest.write_text(json.dumps(doc), encoding="utf-8")
+                self.assertEqual(finite.execute(manifest, 2, 24)["operation"], "DRY_RUN")
+                (root / changed).write_text("changed\n", encoding="utf-8")
+                with self.assertRaisesRegex(finite.PlanError, "changed after freezing|authority changed"):
+                    finite.execute(manifest, 2, 24)
+
     def test_gpu_wrapper_imports_shared_receipt_helpers(self):
         wrapper = importlib.import_module("run_score_gpu")
         with tempfile.TemporaryDirectory() as tmp:

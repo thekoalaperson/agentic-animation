@@ -166,6 +166,23 @@ def _verified_binding(manifest_path: Path, doc: dict[str, Any],
     return {"kind": path_key, "path": str(path), "sha256": actual}
 
 
+def _verified_authority(manifest_path: Path, doc: dict[str, Any]) -> dict[str, str] | None:
+    """Check the production authority at load time, so the dry run finds a change.
+
+    Paths resolve from the manifest's directory, exactly as the GPU wrapper
+    always resolved them. A manifest without an authority binding is unchanged.
+    """
+    raw_path, raw_sha = doc.get("authority"), doc.get("authoritySha256")
+    if raw_path is None and raw_sha is None:
+        return None
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(raw_sha, str):
+        raise PlanError("authority and authoritySha256 must be supplied together")
+    path = (manifest_path.parent / raw_path).resolve()
+    if not path.is_file() or _sha256_file(path) != raw_sha:
+        raise PlanError(f"production authority changed after the narration manifest was frozen: {path}")
+    return {"path": str(path), "sha256": raw_sha}
+
+
 def _validate_voice_settings(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PlanError("voiceSettings must be an object")
@@ -237,6 +254,7 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
             ),
         ) if binding is not None
     ]
+    authority = _verified_authority(manifest_path, doc)
     normalized: list[dict[str, Any]] = []
     ids: set[str] = set()
     outputs: set[str] = set()
@@ -320,6 +338,7 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
             "sourceBindings": bindings,
             "sourceBindingsSha256": _canonical_sha(bindings),
             "financialApproval": doc.get("financialApproval") is True,
+            "authority": authority,
             "episode": doc.get("episode"),
             "approvalAdmissionSha256": None, "approvalAuthorizationId": None}
 

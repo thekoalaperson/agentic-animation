@@ -74,6 +74,33 @@ class FiniteElevenBatchTest(unittest.TestCase):
                 self.assertEqual((dry["financialApproval"], dry["financialAuthorized"]),
                                  (boolean, False))
 
+    def test_authority_change_is_found_by_the_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authority = root / "GOAL.md"
+            authority.write_text("demo direction\n", encoding="utf-8")
+            manifest = self.manifest(root)
+            doc = json.loads(manifest.read_text())
+            doc.update(authority="GOAL.md", authoritySha256=finite._sha256_file(authority))
+            manifest.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(finite.execute(manifest, self.cap(manifest), submit=False)["mode"], "DRY_RUN")
+            authority.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(finite.PlanError, "authority changed"):
+                finite.execute(manifest, self.cap(manifest), submit=False)
+
+    def test_wrapper_counts_only_characters_still_pending(self):
+        wrapper = importlib.import_module("run_narration_gpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.manifest(Path(tmp), items=[
+                {"id": "a", "text": "पहला वाक्य।", "output": "a.mp3"},
+                {"id": "b", "text": "दूसरा।", "output": "b.mp3"}])
+            plan = finite.load_plan(manifest, self.cap(manifest))
+            state = self.state_for(manifest)
+            self.assertEqual(wrapper.pending_characters(plan, state), plan["aggregateCharacters"])
+            finite._atomic_json(state, {"items": {"a": {"status": "COMPLETED"},
+                                                  "b": {"status": "PLANNED"}}})
+            self.assertEqual(wrapper.pending_characters(plan, state), len("दूसरा।"))
+
     def test_gpu_wrapper_imports_shared_receipt_helpers(self):
         wrapper = importlib.import_module("run_narration_gpu")
         with tempfile.TemporaryDirectory() as tmp:

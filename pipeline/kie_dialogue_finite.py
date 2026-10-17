@@ -23,7 +23,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
-from pipeline._common import canonical_sha256, project_root, sha256_file as sha256
+from pipeline._common import (attempt_records, canonical_sha256, project_root,
+                              sha256_file as sha256, write_attempt_json)
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
 EPISODE_CODE = None
@@ -658,7 +659,7 @@ def execute(max_generated_seconds: int, submit: bool,
         estimated_credits = remaining_seconds * plan["pricing"]["creditsPerSecond"]
         if wallet_before < estimated_credits:
             raise PlanError("Insufficient existing Kie credits; no top-up or overage")
-        atomic_json(HERE / "credit-preflight.json", {
+        write_attempt_json(HERE, "credit-preflight", {
             "manifestSha256": plan["manifestSha256"], "availableCredits": wallet_before,
             "estimatedNewCredits": estimated_credits, "pricing": plan["pricing"],
             "maximumCredits": plan["maximumCredits"],
@@ -700,6 +701,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "items": ordered,
             "walletBefore": wallet_before,
             "walletAfter": float(kie("chat/credit")),
+            "preflightAttempts": attempt_records(HERE, "credit-preflight"),
             "accountingNote": "Shared wallet deltas are not per-task billing attribution",
         }
         audit_path = HERE / "technical-audit.json"

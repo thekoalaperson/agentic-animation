@@ -94,6 +94,37 @@ def atomic_new_bytes(path, raw):
             pass
 
 
+def write_attempt_json(directory, stem, value):
+    """Write ``<stem>-attempt-NNN.json`` as a new file; earlier attempts survive.
+
+    Receipts and credit readings from an interrupted run are evidence for the
+    next one, so a resume adds a numbered file instead of replacing the last.
+    """
+    directory = pathlib.Path(directory)
+    raw = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + '\n').encode('utf-8')
+    number = len(attempt_records(directory, stem)) + 1
+    while True:
+        path = directory / f'{stem}-attempt-{number:03d}.json'
+        try:
+            atomic_new_bytes(path, raw)
+            return path
+        except FileExistsError:
+            number += 1
+
+
+def attempt_records(directory, stem):
+    """Return every ``<stem>-attempt-NNN.json`` record in attempt order."""
+    directory = pathlib.Path(directory)
+    found = []
+    for path in directory.glob(f'{stem}-attempt-*.json'):
+        number = path.name[len(stem) + len('-attempt-'):-len('.json')]
+        if number.isdigit():
+            found.append((int(number), path))
+    return [{'attempt': number, 'path': path.name,
+             'record': json.loads(path.read_text(encoding='utf-8'))}
+            for number, path in sorted(found)]
+
+
 def env_key(name):
     # GPU workers receive approved credentials through SSH stdin and child
     # process memory, without staging a secret file in the production bundle.

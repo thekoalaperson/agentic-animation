@@ -3,6 +3,10 @@
 
 Credentials arrive on stdin and remain in memory. No top-up and no automatic
 generation retry; persisted task IDs own recovery. Media decoding stays remote.
+
+Every invocation, --poll-only included, writes a new
+credit-preflight-attempt-NNN.json and execution-receipt-attempt-NNN.json;
+execution-receipt.json lists every attempt's wallet readings.
 """
 import argparse
 import json
@@ -14,6 +18,7 @@ import time
 import urllib.request
 
 from kie_music_finite import execute, load_plan, _atomic_json, _sha_file
+from _common import attempt_records, write_attempt_json
 
 
 def main():
@@ -29,15 +34,25 @@ def main():
     subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                    check=True, capture_output=True, timeout=30)
     manifest = a.manifest.resolve()
+    # load_plan verifies authority and creativeBindings, so a dry run sees a change.
     plan = load_plan(manifest, a.max_requests, a.max_credits)
     doc = plan["doc"]
-    authority = (manifest.parent / doc["authority"]).resolve()
-    if _sha_file(authority) != doc["authoritySha256"]:
-        raise SystemExit("Authority bytes changed")
-    for binding in doc.get("creativeBindings", []):
-        if _sha_file((manifest.parent / binding["path"]).resolve()) != binding["sha256"]:
-            raise SystemExit("Creative/timing input changed")
+    if not (plan["authority"] or {}).get("authority"):
+        raise SystemExit("This wrapper requires an authority and authoritySha256 binding")
     key = json.load(sys.stdin)["kieApiKey"]
+    folder = manifest.parent
+
+    def receipt(status, before, after, **extra):
+        write_attempt_json(folder, "execution-receipt", {
+            "manifestSha256": plan["sha256"], "status": status, "pollOnly": a.poll_only,
+            "walletBeforeThisInvocation": before, "walletAfter": after,
+            "observedWalletDelta": before - after, "topUpAttempted": False,
+            "accountingNote": "Shared wallet observation, not guaranteed per-job attribution",
+            **extra})
+        _atomic_json(folder / "execution-receipt.json", {
+            "manifestSha256": plan["sha256"], "status": status,
+            "attempts": attempt_records(folder, "execution-receipt"),
+            "preflights": attempt_records(folder, "credit-preflight")})
 
     def wallet():
         req = urllib.request.Request("https://api.kie.ai/api/v1/chat/credit",
@@ -55,10 +70,11 @@ def main():
             raise SystemExit("Existing batch: use --poll-only, never start a duplicate")
         if before < plan["expectedCredits"]:
             raise SystemExit("Insufficient existing credits; no top-up/overage")
-        _atomic_json(manifest.parent / "credit-preflight.json", {
-            "manifestSha256": plan["sha256"], "availableCredits": before,
-            "expectedCredits": plan["expectedCredits"], "authoritySha256": doc["authoritySha256"],
-            "computeHost": platform.node(), "topUpAttempted": False})
+    write_attempt_json(folder, "credit-preflight", {
+        "manifestSha256": plan["sha256"], "availableCredits": before,
+        "expectedCredits": plan["expectedCredits"], "authoritySha256": doc["authoritySha256"],
+        "pollOnly": a.poll_only, "computeHost": platform.node(), "topUpAttempted": False})
+    if not a.poll_only:
         print(json.dumps(execute(manifest, a.max_requests, a.max_credits,
                                  "submit", api_key=key, approval_admission=a.approval_admission)), flush=True)
     deadline = time.monotonic() + 1200
@@ -68,16 +84,11 @@ def main():
         statuses = {k: v["status"] for k, v in state["items"].items()}
         print(json.dumps({"poll": result, "statuses": statuses}), flush=True)
         if all(s == "DOWNLOADED" for s in statuses.values()):
-            after = wallet()
-            _atomic_json(manifest.parent / "execution-receipt.json", {
-                "manifestSha256": plan["sha256"], "status": "COMPLETED",
-                "requests": len(statuses), "candidates": sum(len(i["candidates"]) for i in state["items"].values()),
-                "walletBeforeThisInvocation": before, "walletAfter": after,
-                "observedWalletDelta": before-after, "pollOnly": a.poll_only,
-                "accountingNote": "Shared wallet observation, not guaranteed per-job attribution",
-                "topUpAttempted": False})
+            receipt("COMPLETED", before, wallet(), requests=len(statuses),
+                    candidates=sum(len(i["candidates"]) for i in state["items"].values()))
             return
         time.sleep(15)
+    receipt("DEADLINE", before, wallet())
     raise SystemExit("Observation deadline reached; recover the same task IDs with --poll-only")
 
 
