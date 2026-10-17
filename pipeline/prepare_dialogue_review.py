@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""GPU-host-only source-bound dialogue sheets and blind speech-observation jobs.
+"""Source-bound dialogue sheets and blind speech-observation jobs.
 
 No paid API calls. A sheet is evidence for review, never an acceptance record.
+Without --preview this runs on the qualified GPU worker. --preview draws the
+same sheets anywhere ffmpeg runs, names them *-preview-not-final, records the
+real host and ffmpeg build, and writes no observation manifest. When the local
+ffmpeg has no drawtext filter or no font is available, timestamps are not
+burned in; the frame ordinals and times stay in each proof record.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +15,13 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common
+
+WORKER_FONT = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+PREVIEW = "-preview-not-final"
 
 
 def sha(path):
@@ -43,17 +55,39 @@ def select_jobs(plan, selected_ids, expected):
     return rows
 
 
-def main():
+def timestamp_filter(font):
+    """The drawtext stage that burns each frame's time, or '' without a font."""
+    if font is None:
+        return ""
+    if any(c in str(font) for c in "':,[]\\;"):
+        raise ValueError("Unsafe font path for an ffmpeg filter: " + str(font))
+    return ("drawtext=fontfile=" + str(font) + ":"
+            "text='%{pts\\:hms}':fontsize=17:fontcolor=white:box=1:boxcolor=black@0.75:x=4:y=4,")
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path)
     ap.add_argument("--repo-root", type=Path, required=True)
     ap.add_argument("--max-jobs", type=int, required=True)
     ap.add_argument("--ids", help="Explicit comma-separated completed subset; never changes source manifest")
-    a = ap.parse_args()
-    if platform.system() != "Linux":
-        raise SystemExit("Heavy media preparation requires the qualified GPU host")
-    subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                   capture_output=True, check=True, timeout=30)
+    ap.add_argument("--preview", action="store_true",
+                    help="Draw sheets anywhere ffmpeg runs; outputs are labelled preview-not-final")
+    ap.add_argument("--font", type=Path, help="Timestamp font; otherwise the profile fonts.review, then the worker DejaVuSans")
+    a = ap.parse_args(argv)
+    host = None
+    if a.preview:
+        font = _common.review_font(a.font) or (WORKER_FONT if WORKER_FONT.is_file() else None)
+        if "drawtext" not in _common.ffmpeg_capabilities()["filters"]:
+            font = None
+        host = _common.preview_host_record(font)
+    else:
+        if platform.system() != "Linux":
+            raise SystemExit("Heavy media preparation requires the qualified GPU host")
+        subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                       capture_output=True, check=True, timeout=30)
+        font = _common.review_font(a.font) or WORKER_FONT
+    suffix = PREVIEW if a.preview else ""
     root = a.repo_root.resolve()
     manifest = a.manifest.resolve()
     here = manifest.parent
@@ -92,7 +126,7 @@ def main():
         frames = sorted(set(range(0, count, 12)) | {count - 1})
         if len(frames) > 36:
             raise ValueError("Review sheet would omit frames; increase its explicit grid")
-        sheet = review / (row["id"] + "-2fps.jpg")
+        sheet = review / (row["id"] + "-2fps" + suffix + ".jpg")
         proof = sheet.with_suffix(".json")
         entry = dict(id=row["id"], source=str(video.relative_to(here)),
                      sourceSha256=digest, sidecarSha256=sha(meta_path),
@@ -100,6 +134,8 @@ def main():
                      sheet=str(sheet.relative_to(here)), speaker=row["speaker"],
                      hindi=row["hindi"], probe=probe,
                      reviewScope="Every 12th frame plus final frame; not continuous playback or approval")
+        if a.preview:
+            entry.update(preview=True, finalApproved=False, burnedTimestamps=font is not None)
         if sheet.exists() != proof.exists():
             raise ValueError("Incomplete review pair; reconcile before overwriting")
         if sheet.exists():
@@ -109,9 +145,7 @@ def main():
             return old
         rows = (len(frames) + 4) // 5
         vf = ("select='not(mod(n,12))+eq(n," + str(count-1) + ")',scale=384:216,"
-              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
-              "text='%{pts\\:hms}':fontsize=17:fontcolor=white:box=1:boxcolor=black@0.75:x=4:y=4,"
-              "tile=5x" + str(rows))
+              + timestamp_filter(font) + "tile=5x" + str(rows))
         subprocess.run(["ffmpeg", "-v", "error", "-n", "-i", str(video), "-vf", vf,
                         "-frames:v", "1", "-q:v", "2", str(sheet)], check=True, timeout=120)
         entry["sheetSha256"] = sha(sheet)
@@ -120,6 +154,12 @@ def main():
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         evidence = list(pool.map(one, jobs))
+    if a.preview:
+        _common.atomic_json(here / ("dense-review" + PREVIEW + ".json"), {
+            "manifestSha256": sha(manifest), "episode": plan["episode"], "items": evidence,
+            "acceptance": "not implied", "kind": "dialogue-sheets-preview-not-final", "hostRecord": host})
+        print(json.dumps({"jobs": len(jobs), "sheets": len(evidence), "networkCalls": 0, "preview": True}))
+        return
     save(here / "dense-review-index.json", {"manifestSha256": sha(manifest),
         "episode": plan["episode"], "items": evidence, "acceptance": "not implied"})
     blind = {"episode": plan["episode"], "purpose": "Blind native-Hindi completeness observation; advisory only",

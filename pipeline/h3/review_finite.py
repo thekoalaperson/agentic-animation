@@ -1,4 +1,10 @@
-"""Verify a finite H3 queue, ingest silent picture, and create diagnostic sheets."""
+"""Verify a finite H3 queue, ingest silent picture, and create diagnostic sheets.
+
+Without flags this runs on the qualified GPU worker and writes local-audit.json.
+--preview-sheets draws the same sampled sheets from the hash-checked raw
+outputs anywhere ffmpeg runs, into review-preview-not-final/, and never
+ingests or writes local-audit.json.
+"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -8,11 +14,74 @@ import platform
 import subprocess
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "edit"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import _common
 from prepare_episode_production import ingest, probe
+
+PREVIEW = "-preview-not-final"
 
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def sheet_ordinals(frames):
+    """Every 12th native frame plus the exact final frame."""
+    return sorted(set(range(0, frames, 12)) | {frames - 1})
+
+
+def draw_sheet(source, frames, sheet):
+    """The sampled review sheet: a 5-wide grid of every 12th frame and the last."""
+    ordinals = sheet_ordinals(frames)
+    tile_rows = (len(ordinals)+4)//5
+    selection = f"select='eq(mod(n,12),0)+eq(n,{frames-1})'"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source),
+        "-vf", f"{selection},scale=448:-1,tile=5x{tile_rows}",
+        "-frames:v", "1", str(sheet)], check=True)
+    return ordinals
+
+
+def preview_sheets(root, inputs_dir="inputs", outputs_dir="outputs"):
+    """Sheets from completed raw outputs on any host; labelled, never admitted."""
+    manifest_path = (root/inputs_dir/"manifest.json").resolve()
+    manifest_path.relative_to(root)
+    manifest = json.loads(manifest_path.read_text())
+    output_root = (root/outputs_dir).resolve()
+    output_root.relative_to(root)
+    state_bytes = (output_root/"state.json").read_bytes()
+    state = json.loads(state_bytes)
+    if state["manifestSha256"] != sha(manifest_path):
+        raise ValueError("Queue state belongs to another manifest")
+    host = _common.preview_host_record(None)
+    dest = root/("review" + PREVIEW)
+    dest.mkdir(exist_ok=True)
+    rows = []
+    for item in manifest["items"]:
+        rec = state["jobs"].get(item["id"], {})
+        if rec.get("status") != "complete":
+            rows.append(dict(id=item["id"], status="not-complete"))
+            continue
+        raw = (output_root/rec["output"]).resolve()
+        raw.relative_to(output_root)
+        if sha(raw) != rec["sha256"] or rec["sourceSha256"] != item["sourceSha256"]:
+            raise ValueError("Raw output or source changed: " + item["id"])
+        counted = json.loads(subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames", "-of", "json", str(raw)],
+            check=True, capture_output=True, text=True).stdout)
+        frames = int(counted["streams"][0]["nb_read_frames"])
+        sheet = dest/(item["id"] + "-2fps" + PREVIEW + ".jpg")
+        ordinals = draw_sheet(raw, frames, sheet)
+        rows.append(dict(id=item["id"], status="sheet-drawn", rawSha256=rec["sha256"], frames=frames,
+                         expectedFrames=item.get("expectedFrames"), sheet=sheet.name, sheetSha256=sha(sheet),
+                         frameOrdinals=ordinals, timestamps=[round(n/24, 6) for n in ordinals]))
+    audit = dict(kind="h3-review-sheets-preview-not-final", manifestSha256=sha(manifest_path),
+                 stateSha256=hashlib.sha256(state_bytes).hexdigest(), hostRecord=host, finalApproved=False,
+                 reviewerSourceSha256=sha(Path(__file__)),
+                 scope="Sampled sheets of raw outputs for looking only; no ingest, no technical pass, no admission",
+                 outputs=rows)
+    _common.atomic_json(dest/"preview-sheet-audit.json", audit)
+    print(json.dumps({k: v for k, v in audit.items() if k != "outputs"}))
+    return audit
 
 
 def review_used_tails(root, inputs_dir="inputs", tail_plan=None):
@@ -121,12 +190,7 @@ def main(root, inputs_dir="inputs", outputs_dir="outputs"):
             silent = ingest((raw, root/"silent"/(item["id"]+".mp4")))
         assert silent["frames"] == item["expectedFrames"] and silent["audioStreams"] == 0
         sheet = sheet_root/(item["id"]+"-2fps.jpg")
-        ordinals = sorted(set(range(0, silent["frames"], 12)) | {silent["frames"]-1})
-        tile_rows = (len(ordinals)+4)//5
-        selection = f"select='eq(mod(n,12),0)+eq(n,{silent['frames']-1})'"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", silent["file"],
-            "-vf", f"{selection},scale=448:-1,tile=5x{tile_rows}",
-            "-frames:v", "1", str(sheet)], check=True)
+        ordinals = draw_sheet(silent["file"], silent["frames"], sheet)
         return dict(id=item["id"], status="technical-pass", rawSha256=rec["sha256"],
                     sourceSha256=rec["sourceSha256"], silent=silent, sheet=str(sheet),
                     sheetSha256=sha(sheet), frameOrdinals=ordinals,
@@ -155,8 +219,12 @@ if __name__ == "__main__":
     p.add_argument("--outputs-dir", default="outputs")
     p.add_argument("--tail-windows-only", action="store_true")
     p.add_argument("--tail-plan", type=Path, help="Separate hash-bound used-window plan; generation manifest remains immutable")
+    p.add_argument("--preview-sheets", action="store_true",
+                   help="Draw labelled sheets from raw outputs anywhere ffmpeg runs; no ingest, no local-audit.json")
     args = p.parse_args()
-    if args.tail_windows_only:
+    if args.preview_sheets:
+        preview_sheets(args.root.resolve(), args.inputs_dir, args.outputs_dir)
+    elif args.tail_windows_only:
         review_used_tails(args.root.resolve(), args.inputs_dir, args.tail_plan)
     else:
         main(args.root.resolve(), args.inputs_dir, args.outputs_dir)
