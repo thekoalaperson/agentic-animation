@@ -1386,7 +1386,8 @@ class TimelineBuilderTest(unittest.TestCase):
         self.write_rows(rows)
         ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
         self.assertTrue(any(e["type"] == "storyboard-delivery" and e["sceneId"] == "demo-s003"
-                            for e in ready["errors"]))
+                            and "clear the storyboard row's speaker" in e["error"]
+                            for e in ready["errors"]), ready["errors"])
 
     def test_production_override_may_mark_delivery_but_not_contradict_it(self):
         override_path = self.ep / "work/script-v1/overrides.json"
@@ -1439,11 +1440,28 @@ class TimelineBuilderTest(unittest.TestCase):
 
     def test_lane_documents_are_required_only_when_rows_need_them(self):
         self.write_rows([self.rows[2]])
+        self.refresh_provenance()
+        audit_path = self.ep / "work/assembly-v1/timeline-audit.json"
+        # Explicit keys keep both documents required, as every build did before.
+        named, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        named_audit = json.loads(audit_path.read_text())
         config = json.loads(self.config.read_text())
         config.pop("narrationManifest")
         config.pop("h3ReviewLedger")
         self.write_json(self.config, config)
-        self.refresh_provenance()
+        # An existing all-dialogue project relying on the default paths, with
+        # the files present, still binds them: only the edited config differs.
+        defaulted, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        defaulted_audit = json.loads(audit_path.read_text())
+        self.assertEqual(list(defaulted["documents"]),
+                         ["storyboard", "narrationManifest", "dialogueManifest", "h3ReviewLedger",
+                          "narrationState"])
+        self.assertEqual(defaulted["documents"], named["documents"])
+        evidence = named_audit["inputEvidence"]
+        self.assertNotEqual(evidence["config"], defaulted_audit["inputEvidence"]["config"])
+        evidence["config"] = defaulted_audit["inputEvidence"]["config"]
+        self.assertEqual(evidence, defaulted_audit["inputEvidence"])
+        self.assertEqual(timeline._canonical_sha(evidence), defaulted["timelineFingerprint"])
         for name in ("manifest.json", "manifest.eleven-state.json"):
             (self.ep / "work/narration-hi-v1" / name).unlink()
         (self.ep / "work/h3-review-ledger-v1.json").unlink()
@@ -1466,6 +1484,14 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertTrue(ready["ready"], ready)
         self.assertNotIn("narrationManifest", ready["documents"])
         self.assertEqual([e["kind"] for e in plan["events"]], ["picture", "dialogue"])
+        # A named narration state with no manifest to bind is a named error.
+        config = json.loads(self.config.read_text())
+        config["narrationState"] = "work/narration-hi-v1/manifest.eleven-state.json"
+        self.write_json(self.config, config)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "narration-provenance" for e in ready["errors"]), ready)
+        config.pop("narrationState")
+        self.write_json(self.config, config)
         # A document the config names explicitly stays required.
         config = json.loads(self.config.read_text())
         config["h3ReviewLedger"] = "work/missing-ledger.json"
@@ -1530,6 +1556,10 @@ class TimelineBuilderTest(unittest.TestCase):
         bad.append(changed)
         changed = copy.deepcopy(ledger)
         changed["entries"]["demo-s001"]["segments"][0]["origin"]["kind"] = "guess"
+        bad.append(changed)
+        changed = copy.deepcopy(ledger)
+        changed["entries"]["demo-s001"]["segments"][0]["origin"].update(self.write_origin(
+            "flat-receipt.json", {"sha256": sha["demo-s001"]}))
         bad.append(changed)
         changed = copy.deepcopy(ledger)
         changed["entries"]["demo-s004"]["segments"][0]["origin"].update(self.write_origin(

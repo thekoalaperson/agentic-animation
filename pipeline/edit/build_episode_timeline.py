@@ -338,8 +338,9 @@ def _row_delivery(row: dict[str, Any], override: dict[str, Any]) -> tuple[str, s
     if row.get("speaker"):
         if delivery not in (None, "synced") or voice is not None:
             raise ValueError(
-                f"{scene_id}: a storyboard speaker always routes to a lip-sync take; "
-                "a voice heard over picture is written as delivery 'unsynced' with 'voice' and no speaker")
+                f"{scene_id}: the storyboard row's speaker {row['speaker']!r} always routes to a lip-sync "
+                "take; for a voice heard over picture, clear the storyboard row's speaker and write "
+                "delivery 'unsynced' with 'voice'")
         return "dialogue", None
     if delivery == "synced":
         raise ValueError(f"{scene_id}: synced delivery needs a storyboard speaker")
@@ -410,8 +411,9 @@ def _verify_segment_origin(episode: Path, repo: Path, ledger_path: Path,
     kind = origin["kind"]
     if kind == "h3-ingest":
         items = record.get("items")
-        bound = record.get("sha256") == source_sha or (isinstance(items, list) and any(
-            isinstance(item, dict) and item.get("silentSha256") == source_sha for item in items))
+        # An ingest receipt names its outputs per item; a flat hash is not one.
+        bound = isinstance(items, list) and any(
+            isinstance(item, dict) and item.get("silentSha256") == source_sha for item in items)
     elif kind == "kie-video":
         bound = (record.get("outputSha256") == source_sha and record.get("sha256") == source_sha
                  and isinstance(record.get("taskId"), str) and bool(record["taskId"]))
@@ -737,16 +739,26 @@ def build_timeline(
             peek_kinds.add("dialogue" if row.get("speaker") else "narration")
     if not isinstance(peek_rows, list) or not peek_rows:
         peek_kinds = {"narration", "dialogue"}  # unreadable board: keep every lane required
+    def lane_document(key: str, default: str, needed: bool) -> str | None:
+        # A lane document is required when a row needs it, when the config
+        # names it, or when it exists at its default path. The last keeps an
+        # existing project's documents, and so its fingerprint, unchanged.
+        if needed or key in config or _resolve_path(episode, repo, config_path, default).is_file():
+            return config.get(key, default)
+        return None
+
     required_docs = {"storyboard": storyboard_raw}
-    if "narration" in peek_kinds or "narrationManifest" in config:
-        required_docs["narrationManifest"] = config.get(
-            "narrationManifest", "work/narration-hi-v1/manifest.json"
-        )
+    narration_raw = lane_document("narrationManifest", "work/narration-hi-v1/manifest.json",
+                                  "narration" in peek_kinds)
+    if narration_raw is not None:
+        required_docs["narrationManifest"] = narration_raw
     required_docs["dialogueManifest"] = config.get(
         "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
     )
-    if peek_kinds & {"narration", "picture"} or "h3ReviewLedger" in config:
-        required_docs["h3ReviewLedger"] = config.get("h3ReviewLedger", "work/h3-review-ledger-v1.json")
+    ledger_raw = lane_document("h3ReviewLedger", "work/h3-review-ledger-v1.json",
+                               bool(peek_kinds & {"narration", "picture"}))
+    if ledger_raw is not None:
+        required_docs["h3ReviewLedger"] = ledger_raw
     if config.get("productionOverrides"):
         required_docs["productionOverrides"] = config["productionOverrides"]
     if config.get('subtitleManuscript'):
@@ -863,6 +875,8 @@ def build_timeline(
     if narration_state_path is not None and narration_state_path.is_file():
         try:
             narration_state = _read_json_evidence(narration_state_path, "narration finite state")
+            if narration_path is None:
+                raise ValueError("narration finite state names no narration manifest to bind")
             if narration_state.get("manifestSha256") != _sha256(narration_path):
                 raise ValueError("narration finite state does not bind the current manifest")
         except ValueError as exc:

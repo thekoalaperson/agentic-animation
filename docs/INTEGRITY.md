@@ -11,11 +11,16 @@ than guessing from filenames. When a source changes, identify dependent outputs
 so an old cache does not masquerade as an updated result.
 
 A picture review ledger at `schemaVersion` 2 admits a segment only when it
-declares its `sourceSha256` and an `origin` (`h3-ingest`, `kie-video`,
-`derivative` or `supplied`) whose hash-bound record names those bytes; a
-derivative record also names its parent hash and parameters. A version-1
-ledger keeps its recorded behaviour. A wordless picture row needs a declared
-`sourceSha256` under either version.
+declares its `sourceSha256` and an `origin` `{kind, record, recordSha256}`
+whose record sits below the episode, matches that hash and names those bytes
+under the key its kind uses: an `h3-ingest` receipt in `items[].silentSha256`,
+a `kie-video` sidecar in both `sha256` and `outputSha256` beside a `taskId`, a
+`derivative` record in `outputSha256` with a different parent `sourceSha256`
+and non-empty `parameters`, and a `supplied` record in `sha256` or
+`fileSha256`. A derivative's parent hash is checked for shape only, not yet
+resolved to an admitted record of its own. A version-1 ledger keeps its
+recorded behaviour. A wordless picture row needs a declared `sourceSha256`
+under either version.
 
 Describe evidence honestly: generated, downloaded, technically checked, sampled,
 watched, and approved mean different things. An optional review record describes

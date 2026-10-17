@@ -36,7 +36,9 @@ keeps the speaker's name as `voice` and sends the line through the narration
 lane, clocked by its measured file, with subtitles that name that voice;
 `Narrator` is shorthand for this. A `wordless` row is written with the speaker
 `-` and empty text and becomes a picture event with no voice, no breath and no
-subtitle cue. The storyboard row may carry the same `delivery` and `voice`. A
+subtitle cue. The storyboard row may carry the same `delivery` and `voice`; a
+row heard over picture has no `speaker` on the storyboard either, because the
+timeline routes any storyboard speaker to a lip-sync take. A
 picture row is clocked by its accepted take (`durationRule: take`, the default)
 or by an authored hold (`holdSeconds` or `holdFrames` on the storyboard row, a
 whole number of frames)
