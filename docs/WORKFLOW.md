@@ -13,6 +13,7 @@ sequences. Choose the amount of process that helps the work.
 | Generate narration or score | `eleven_batch_finite.py`, `kie_music_finite.py` |
 | Run H3 jobs and ingest picture | `h3/stage_finite.py`, `h3/box/finite_client.py`, `h3/ingest_finite.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
+| Look and listen before paying, on any host with ffmpeg | `edit/render_timed_animatic.py --preview`, `edit/prepare_episode_production.py --sheets --preview`, `prepare_dialogue_review.py --preview`, `h3/review_finite.py --preview-sheets`, `--audition` on `music_candidate_ranker.py`, `edit/render_working_music.py` and `edit/build_working_audio.py` |
 | Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
 | Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
@@ -34,6 +35,14 @@ Research, source grounding, animatics, auditions, and reviews are useful when
 they resolve a real uncertainty. They do not need to become rituals. Make an
 initial mix to hear it; refine what matters. Preserve useful source-bound
 observations so unchanged work does not need to be reviewed repeatedly.
+
+Previews and auditions run on the coordinator and are labelled
+`-preview-not-final` or `-audition-not-final`; nothing downstream admits them.
+The timed animatic can be written from the storyboard (`--from-storyboard`,
+using measured narration or an explicit `estimatedSeconds`), can hold a
+wordless beat for authored frames, and can carry one temporary score stem. It
+can therefore preview a cut the measured timeline cannot assemble yet: today
+the timeline clocks every row by its speech.
 
 Check current provider availability and credits before a paid run. Save concrete
 job state so interruption does not create duplicate work. Delivery and publication

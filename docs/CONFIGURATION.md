@@ -38,6 +38,10 @@ SHA-256. Still source roots are `stills.sourceRoots.<provider>`, for example
 glob: the accepted registry and current source-bound decisions define reuse.
 The content corpus is an input, not an implicit local path or dependency.
 
+Review sheets, animatic previews and auditions take a font from `--font`, else
+the profile's `fonts.review`, else the worker's DejaVu path where it exists. The
+font's SHA-256 goes into each preview's audit.
+
 ## Authority
 
 A profile's `authorizer` is a label. Paid execution requires a separate approval

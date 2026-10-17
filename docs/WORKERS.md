@@ -5,7 +5,15 @@ a particular cloud account has running workers. Configure and qualify workers
 before use. Historical instance names and prior receipts are not current inventory.
 
 The Python lockfile covers the coordinator: manifests, HTTP orchestration, and
-lightweight validation. Model runtimes remain separate:
+lightweight validation. Heavy media (H3, upscale, model audio, exact-frame
+extraction, production mixes, qualified typography) runs on workers; review
+media runs anywhere ffmpeg runs, through the explicit `--preview` and
+`--audition` modes, whose outputs are labelled not final and inadmissible.
+Hosted provider calls are HTTP work: `kie_dialogue_finite.py`,
+`kie_music_finite.py` and `eleven_batch_finite.py` are the canonical entry points
+and the `run_*_gpu.py` wrappers a remote convenience, although dialogue
+submission and those wrappers still check for the worker today.
+Model runtimes remain separate:
 
 | Lane | Runtime requirements |
 |---|---|
