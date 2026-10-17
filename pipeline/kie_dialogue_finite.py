@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
-from pipeline._common import canonical_sha256, project_root, sha256_file as sha256
+from pipeline._common import canonical_sha256, image_dimensions, project_root, sha256_file as sha256
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
 EPISODE_CODE = None
@@ -150,6 +150,29 @@ def execution_request(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, An
     }
 
 
+def source_geometry_warnings(rows: list[dict[str, Any]], aspect: float = 16 / 9,
+                             tolerance: float = 0.03) -> list[dict[str, Any]]:
+    """Warn, never refuse, when a first-frame still is far from the sent aspect.
+
+    The runner always sends aspect_ratio 16:9. Whether output geometry follows
+    the still on this route is unqualified, so this stays information until a
+    pilot settles it. Dimensions come from the file header; nothing is decoded.
+    """
+    warnings = []
+    for row in rows:
+        try:
+            _, width, height = image_dimensions(row["sourcePath"])
+        except (OSError, ValueError):
+            continue
+        if height and abs(width / height - aspect) > tolerance:
+            warnings.append({
+                "type": "source-aspect", "jobId": row["id"], "width": width, "height": height,
+                "aspect": round(width / height, 4), "sentAspectRatio": "16:9",
+                "hint": "pipeline/derive_still.py can crop, pad or scale a registered still to 16:9",
+            })
+    return warnings
+
+
 def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]:
     if (isinstance(max_generated_seconds, bool)
             or not isinstance(max_generated_seconds, int)
@@ -274,6 +297,7 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         "totalSeconds": total,
         "maxGeneratedSeconds": max_generated_seconds,
         "maximumCredits": maximum_credits, "pricing": pricing,
+        "geometryWarnings": source_geometry_warnings(normalized),
     }
     for row in normalized:
         row["executionRequestSha256"] = canonical_sha256(execution_request(plan, row))
@@ -511,6 +535,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "financialAuthorized": authorized,
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
             "manifestSha256": plan["manifestSha256"],
+            "geometryWarnings": plan["geometryWarnings"],
         }
     if not authorized:
         raise PlanError("financialApproval is false; submission is gated")

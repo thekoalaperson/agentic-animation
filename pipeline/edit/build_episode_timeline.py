@@ -251,6 +251,37 @@ def _dialogue_entries(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _still_reuse(dialogues: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """List stills that open more than one dialogue job, as information only.
+
+    One still for several lines is a legitimate grammar (a locked composition,
+    a tableau), so nothing here asks for a reason or blocks a build. The
+    ``consecutive`` flag says whether two of the jobs sit next to each other in
+    the dialogue manifest, where identical clip openings meet at a cut.
+    """
+    order = list(dialogues)
+    groups: dict[str, list[str]] = {}
+    sources: dict[str, Any] = {}
+    for job_id, entry in dialogues.items():
+        key = entry.get("sourceSha256") or entry.get("source")
+        if not isinstance(key, str) or not key:
+            continue
+        groups.setdefault(key, []).append(job_id)
+        sources.setdefault(key, entry.get("source"))
+    result = []
+    for key, jobs in groups.items():
+        if len(jobs) < 2:
+            continue
+        positions = [order.index(job) for job in jobs]
+        result.append({
+            "source": sources[key],
+            "sourceSha256": key if key != sources[key] else None,
+            "jobs": jobs,
+            "consecutive": any(b - a == 1 for a, b in zip(positions, positions[1:])),
+        })
+    return result
+
+
 def _narration_entries(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result = {}
     for row in doc.get("items", []):
@@ -1321,6 +1352,9 @@ def build_timeline(
             "path": str(narration_state_path), "sha256": _sha256(narration_state_path)
         }
     readiness["documents"].update(score_documents)
+    still_reuse = _still_reuse(dialogues)
+    if still_reuse:
+        readiness["stillReuse"] = still_reuse
     _atomic_json(readiness_path, readiness)
     if dry_run:
         return readiness, None

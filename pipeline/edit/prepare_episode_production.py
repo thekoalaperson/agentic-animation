@@ -74,23 +74,57 @@ def ingest(job):
     return record
 
 
-def make_sheets(rows, work, clips):
+STAGING_KEYS = ('screen_side', 'gaze', 'attitude', 'reacting', 'line')
+
+
+def staging_summary(staging, limit=60):
+    """One line from a generation-manifest row's optional free-text staging notes.
+
+    The notes are the operator's own blocking reminders; nothing checks them
+    against any rule. Known keys come first, any others follow in their order.
+    """
+    if not isinstance(staging, dict):
+        return ''
+    keys = [k for k in STAGING_KEYS if k in staging] + [k for k in staging if k not in STAGING_KEYS]
+    parts = []
+    for key in keys:
+        value = staging[key]
+        if isinstance(value, dict):
+            value = ' '.join(str(v) for v in value.values() if v not in (None, ''))
+        if value not in (None, ''):
+            parts.append(f"{key.replace('_', ' ')}: {value}")
+    text = ' / '.join(parts)
+    return text if len(text) <= limit else text[:limit - 1] + '\u2026'
+
+
+def sheet_caption(row, staging=None):
+    """Still ID and speaker on the first line, staging summary on the second."""
+    first = row['id'] + (f" | {row['speaker']}" if row['speaker'] else '')
+    return first, staging_summary(staging)
+
+
+def make_sheets(rows, work, clips, staging=None):
     from PIL import Image, ImageDraw, ImageFont
+    staging = staging or {}
     sheets = work / 'sheets'
     sheets.mkdir(parents=True, exist_ok=True)
     font_path = Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
     if not font_path.is_file():
         raise ValueError('GPU worker requires its retained DejaVuSans review font')
     font = ImageFont.truetype(str(font_path), 20)
+    small = ImageFont.truetype(str(font_path), 15)
     for start in range(0, len(rows), 12):
-        page = Image.new('RGB', (1440, 4 * 300), '#111722')
+        page = Image.new('RGB', (1440, 4 * 320), '#111722')
         draw = ImageDraw.Draw(page)
         for i, row in enumerate(rows[start:start+12]):
             im = Image.open(row['still']).convert('RGB')
             im.thumbnail((476, 268))
-            x, y = (i % 3)*480, (i // 3)*300
+            x, y = (i % 3)*480, (i // 3)*320
             page.paste(im, (x, y))
-            draw.text((x+8,y+270), row['id'] + (' DIALOGUE' if row['speaker'] else ''),font=font,fill='white')
+            first, second = sheet_caption(row, staging.get(row['id']))
+            draw.text((x+8,y+270), first, font=font, fill='white')
+            if second:
+                draw.text((x+8,y+296), second, font=small, fill='#c8d0dc')
         page.save(sheets / f'stills-{start+1:03d}-{min(start+12,len(rows)):03d}.jpg',quality=93)
     if clips is None:
         return
@@ -215,7 +249,7 @@ def main():
          route='grok15 / 720p / native Hindi',financialApproval=False,
          promptsRequireSourceInspection=True,items=dialogues))
     if args.sheets:
-        make_sheets(rows,work,sources)
+        make_sheets(rows,work,sources,{key: rec.get('staging') for key, rec in records.items()})
     print(json.dumps(dict(stills=len(rows),silentH3=len(ingested),
         narration=len(narration),dialogue=len(dialogues),characters=sum(len(r['text']) for r in narration))))
 
