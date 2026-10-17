@@ -22,7 +22,6 @@ narration/dialogue generation has happened.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -34,7 +33,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dialogue_provenance import validate_dialogue_request
+from _common import is_below as _is_below, sha256_file as _sha256
+from dialogue_provenance import canonical_sha as _canonical_sha, validate_dialogue_request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from subtitle_manuscript import apply_manuscript
 
@@ -74,21 +74,6 @@ class MediaProbe:
     audio_streams: int
     video_width: int | None = None
     video_height: int | None = None
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_sha(value: Any) -> str:
-    payload = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -340,14 +325,6 @@ def _state_path_matches(recorded: Any, actual: Path, episode: Path,
     except ValueError:
         return False
     return recorded_relative == actual_relative and bool(recorded_relative.parts)
-
-
-def _is_below(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
 
 
 def _read_json_evidence(path: Path, label: str) -> dict[str, Any]:

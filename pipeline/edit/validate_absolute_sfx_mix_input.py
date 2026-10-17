@@ -39,11 +39,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def canonical_sha(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
-                                    separators=(",", ":")).encode()).hexdigest()
-
-
 def read_object(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))

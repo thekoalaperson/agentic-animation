@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any, NoReturn, Iterable
 
 if __package__:
-    from ._common import project_root, profile_value
+    from ._common import project_root, profile_value, sha256_file as sha256
 else:
-    from _common import project_root, profile_value
+    from _common import project_root, profile_value, sha256_file as sha256
 
 
 REGISTERABLE = {"generation_ready", "failed", "needs_changes"}
@@ -32,14 +32,6 @@ REGISTERABLE = {"generation_ready", "failed", "needs_changes"}
 
 def fail(message: str) -> NoReturn:
     raise SystemExit(message)
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class GroundingError(ValueError):

@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -51,6 +52,15 @@ class FiniteKieMusicTest(unittest.TestCase):
     @staticmethod
     def state_for(manifest: Path) -> Path:
         return manifest.with_suffix(".state.json")
+
+    def test_gpu_wrapper_imports_shared_receipt_helpers(self):
+        wrapper = importlib.import_module("run_score_gpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            wrapper._atomic_json(receipt, {"topUpAttempted": False})
+            self.assertEqual(json.loads(receipt.read_text()), {"topUpAttempted": False})
+            self.assertEqual(wrapper._sha_file(receipt),
+                             hashlib.sha256(receipt.read_bytes()).hexdigest())
 
     def test_default_dry_run_is_zero_network_and_writes_no_state(self):
         with tempfile.TemporaryDirectory() as tmp:

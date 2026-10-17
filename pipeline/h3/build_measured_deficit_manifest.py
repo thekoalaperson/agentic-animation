@@ -22,7 +22,6 @@ That is what makes every link a true delivered-pixel continuation.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -32,6 +31,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _common import canonical_sha256 as _canonical_sha, is_below as _is_below, sha256_file as _sha256
 
 
 DELIVERY_FPS = 24
@@ -48,21 +50,6 @@ class DeficitPlanBlocked(RuntimeError):
 class Evidence:
     path: Path
     sha256: str
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_sha(value: Any) -> str:
-    payload = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -107,14 +94,6 @@ def _require_sha(value: Any, label: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise DeficitPlanBlocked(f"{label} is not an explicit SHA-256 digest")
     return digest
-
-
-def _is_below(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
 
 
 def _resolve(episode: Path, repo: Path, owner: Path, raw: str | Path) -> Path:

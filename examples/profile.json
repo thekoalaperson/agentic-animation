@@ -1,5 +1,4 @@
 {
-  "workspaceRoot": "/path/to/private-studio",
   "projectRoot": "/path/to/private-studio/project",
   "authorizer": "Project owner",
   "channel": {

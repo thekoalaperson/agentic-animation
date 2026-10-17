@@ -14,7 +14,7 @@ import hashlib, json, os, pathlib, re, sys, time
 import urllib.parse
 import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from _common import kie, upload_ref, http_json, env_key
+from _common import kie, upload_ref, env_key, canonical_sha256, sha256_file as file_sha256
 
 MODELS = {'grok': 'grok-imagine/image-to-video',
           'grok15': 'grok-imagine-video-1-5-preview',
@@ -44,20 +44,6 @@ def download_public_media(url):
     request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(request, timeout=300) as response:
         return response.read()
-
-
-def canonical_sha256(value):
-    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
-                     separators=(',', ':')).encode('utf-8')
-    return hashlib.sha256(raw).hexdigest()
-
-
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with pathlib.Path(path).open('rb') as source:
-        for block in iter(lambda: source.read(8 * 1024 * 1024), b''):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def fsync_parent(path):

@@ -1,4 +1,5 @@
-"""Small shared configuration and HTTP helpers for the production tools.
+"""Small shared configuration, hashing, atomic-file and HTTP helpers for the
+production tools.
 
 Code, projects and credentials have separate roots. A profile supplies defaults,
 never permission to spend, approve creative work, or publish an artifact.
@@ -41,14 +42,56 @@ def project_root(path=None):
     return result
 
 
-def workspace_root(path=None):
-    value = path or os.environ.get('AGENTIC_WORKSPACE_ROOT') or profile_value('workspaceRoot')
-    if not value:
-        raise ValueError('Provide a workspace path or set AGENTIC_WORKSPACE_ROOT')
-    result = pathlib.Path(value).expanduser().resolve()
-    if not result.is_dir():
-        raise ValueError('Workspace root must be an existing directory')
-    return result
+def is_below(path, root):
+    try:
+        pathlib.Path(path).resolve().relative_to(pathlib.Path(root).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with pathlib.Path(path).open('rb') as source:
+        for block in iter(lambda: source.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def canonical_sha256(value):
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    with tmp.open('w', encoding='utf-8') as f:
+        json.dump(value, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_new_bytes(path, raw):
+    """Publish new bytes atomically without ever replacing an existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.new')
+    try:
+        with tmp.open('xb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        # Linking a complete same-directory temp file makes publication atomic,
+        # while link()'s EEXIST behavior closes the check-then-replace race.
+        os.link(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def env_key(name):

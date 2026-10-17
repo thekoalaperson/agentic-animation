@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import platform
-import hashlib
 import json
 import math
 import os
@@ -24,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
-from pipeline._common import project_root
+from pipeline._common import canonical_sha256, project_root, sha256_file as sha256
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
 EPISODE_CODE = None
@@ -84,20 +83,6 @@ JOB_FIELDS = {
 
 class PlanError(ValueError):
     """The frozen execution plan or local recovery state is unsafe."""
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def canonical_sha256(value: Any) -> str:
-    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
-                     separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def atomic_json(path: Path, value: Any) -> None:

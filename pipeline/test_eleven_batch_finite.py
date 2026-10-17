@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import io
 import json
 from pathlib import Path
@@ -59,6 +60,15 @@ class FiniteElevenBatchTest(unittest.TestCase):
             post.assert_not_called()
             self.assertFalse(state_path.exists())
 
+    def test_gpu_wrapper_imports_shared_receipt_helpers(self):
+        wrapper = importlib.import_module("run_narration_gpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            wrapper._atomic_json(receipt, {"noOverage": True})
+            self.assertEqual(json.loads(receipt.read_text()), {"noOverage": True})
+            self.assertEqual(wrapper._sha256_file(receipt),
+                             hashlib.sha256(receipt.read_bytes()).hexdigest())
+
     def test_default_is_dry_run_with_no_network_or_state_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -103,6 +113,12 @@ class FiniteElevenBatchTest(unittest.TestCase):
             ])
             with self.assertRaises(finite.PlanError):
                 finite.execute(duplicate, self.cap(duplicate), submit=False)
+            case_variant = self.manifest(root, [
+                {"id": "a", "text": "हिंदी पाठ।", "output": "audio/Part-01.mp3"},
+                {"id": "b", "text": "दूसरा पाठ।", "output": "audio/part-01.mp3"}
+            ])
+            with self.assertRaisesRegex(finite.PlanError, "duplicate output path"):
+                finite.execute(case_variant, self.cap(case_variant), submit=False)
             duplicate_id = self.manifest(root, [
                 {"id": "same", "text": "हिंदी पाठ।", "output": "a.mp3"},
                 {"id": "same", "text": "दूसरा पाठ।", "output": "b.mp3"}

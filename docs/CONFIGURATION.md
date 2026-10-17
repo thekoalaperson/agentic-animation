@@ -7,13 +7,12 @@ and the storage holding its media. None must be a sibling of another repository.
 |---|---|
 | `AGENTIC_PROFILE` | Optional private JSON profile; start from `examples/profile.json` |
 | `AGENTIC_PROJECT_ROOT` | Default private project when a tool needs one |
-| `AGENTIC_WORKSPACE_ROOT` | Private root containing projects and shared assets |
 | `AGENTIC_ENV_FILE` | Explicit private env file; never implicitly read checkout secrets |
 | `KIE_KEY` | Kie credential, supplied privately |
 | `ELEVENLABS_API_KEY` | Direct narration credential, supplied privately |
 
-An explicit CLI project path wins over defaults. The two root environment
-variables override their profile values. Channel, authorizer display identity,
+An explicit CLI project path wins over defaults. `AGENTIC_PROJECT_ROOT`
+overrides the profile's `projectRoot`. Channel, authorizer display identity,
 worker paths, and optional tool settings can be read through `profile_value()`
 in `pipeline/_common.py`. Tool-specific CLI parameters remain authoritative.
 Read the relevant command's `--help`; a profile does not override every argument.

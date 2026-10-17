@@ -50,10 +50,16 @@ import urllib.parse
 import urllib.request
 
 if __package__:
-    from ._common import env_key
+    from ._common import (atomic_json as _atomic_json,
+                          atomic_new_bytes as _atomic_new_bytes,
+                          canonical_sha256 as _canonical_sha, env_key,
+                          sha256_file as _sha256_file)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
-    from _common import env_key
+    from _common import (atomic_json as _atomic_json,
+                         atomic_new_bytes as _atomic_new_bytes,
+                         canonical_sha256 as _canonical_sha, env_key,
+                         sha256_file as _sha256_file)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
 
@@ -76,31 +82,6 @@ def _sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def _canonical_sha(value: Any) -> str:
-    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
-                     separators=(",", ":")).encode("utf-8")
-    return _sha256_bytes(raw)
-
-
-def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
 def _atomic_bytes(path: Path, raw: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -109,25 +90,6 @@ def _atomic_bytes(path: Path, raw: bytes) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-
-
-def _atomic_new_bytes(path: Path, raw: bytes) -> None:
-    """Publish new bytes atomically without ever replacing an existing file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
-    try:
-        with tmp.open("xb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        # Linking a complete same-directory temp file makes publication atomic,
-        # while link()'s EEXIST behavior closes the check-then-replace race.
-        os.link(tmp, path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _now() -> float:
@@ -252,7 +214,7 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
     ]
     normalized: list[dict[str, Any]] = []
     ids: set[str] = set()
-    outputs: set[Path] = set()
+    outputs: set[str] = set()
     total = 0
     allowed_item_keys = {"id", "text", "textFile", "output"}
     for pos, item in enumerate(items):
@@ -296,9 +258,12 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
         output = (root / output_rel).resolve()
         if not _is_below(output, episode_root):
             raise PlanError(f"{item_id}: output escapes episodeRoot")
-        if output in outputs:
+        # resolve() keeps case, but macOS volumes usually fold it: two such
+        # names are one file, and the second paid response would collide.
+        output_key = str(output).casefold()
+        if output_key in outputs:
             raise PlanError(f"duplicate output path: {output_value}")
-        outputs.add(output)
+        outputs.add(output_key)
         chars = len(text)
         total += chars
         normalized.append({"id": item_id, "text": text, "textFile":

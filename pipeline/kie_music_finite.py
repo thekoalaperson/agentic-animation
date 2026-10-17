@@ -26,10 +26,14 @@ import urllib.parse
 import urllib.request
 
 if __package__:
-    from ._common import env_key
+    from ._common import (atomic_json as _atomic_json,
+                          atomic_new_bytes as _atomic_bytes_new, env_key,
+                          sha256_file as _sha_file)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
-    from _common import env_key
+    from _common import (atomic_json as _atomic_json,
+                         atomic_new_bytes as _atomic_bytes_new, env_key,
+                         sha256_file as _sha_file)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
 
@@ -58,42 +62,6 @@ def _canonical(value: Any) -> bytes:
 
 def _sha_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
-
-
-def _sha_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, sort_keys=True, indent=2)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def _atomic_bytes_new(path: Path, raw: bytes) -> None:
-    """Atomically publish bytes while refusing every overwrite race."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
-    try:
-        with tmp.open("xb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.link(tmp, path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _now() -> float:
