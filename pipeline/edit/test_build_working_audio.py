@@ -70,6 +70,41 @@ class AuditionTests(unittest.TestCase):
                 short.prepared_audio({'inputs':{}},{'mixAudit':root/'mix.json','voiceAudit':root/'voice.json',
                                                     'sourceVoiceAudit':root/'source.json'},None)
 
+    def test_working_mix_refuses_audition_stems(self):
+        import build_working_audio as working
+        config={'inputs':{k:{'sha256':k[0]*64} for k in ('voice','music','sfx','clock')}}
+        sfx={'workingAudioOnly':True,'finalApproved':False,'sha256':'s'*64,'clockSha256':'c'*64}
+        stems={'kind':'working-audio-stems-not-final','finalApproved':False,
+               'outputs':{'voice':{'sha256':'v'*64},'music':{'sha256':'m'*64}}}
+        working.check_working_receipts(config,stems,sfx)
+        audition=working.label_audition(copy.deepcopy(stems),True,{})
+        with self.assertRaisesRegex(RuntimeError,'Only explicitly working stems'):
+            working.check_working_receipts(config,audition,sfx)
+
+    def test_short_refuses_an_audition_voice_beside_a_real_mix(self):
+        import tempfile, json
+        import build_working_audio as working
+        import short_audio_contract as short
+        mix={'kind':'working-audio-context-not-final','voiceGain':1,'unchangedVoiceRecoveryMaxError':0.0}
+        stems={'kind':'working-audio-stems-not-final','finalApproved':False,'clockSha256':'c'*64,
+               'outputs':{'voice':{'sha256':'v'*64}}}
+        short_voice={'clockSha256':'c'*64,'outputs':{'voice':{'sha256':'v'*64}},'finalApproved':False}
+        audition=working.label_audition(copy.deepcopy(stems),True,{})
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            def call(voice,source):
+                for name,value in (('mix',mix),('voice',voice),('source',source)):
+                    (root/f'{name}.json').write_text(json.dumps(value))
+                return short.prepared_audio({'inputs':{}},{'mixAudit':root/'mix.json','voiceAudit':root/'voice.json',
+                                                           'sourceVoiceAudit':root/'source.json'},None)
+            for voice,source,name in ((audition,stems,'voice'),(short_voice,audition,'source voice')):
+                with self.subTest(name=name),self.assertRaisesRegex(ValueError,f'Short {name} receipt is an audition'):
+                    call(voice,source)
+            # A production pair, including the Short writer's kind-less voice
+            # receipt, gets past the audition check to the binding check.
+            with self.assertRaises(KeyError):
+                call(short_voice,stems)
+
     def test_production_run_keeps_its_gate(self):
         import build_working_audio as working
         with unittest.mock.patch.object(working.sys,'platform','darwin'),self.assertRaisesRegex(RuntimeError,'qualified GPU worker'):

@@ -57,6 +57,18 @@ def validate_working_clock(clock, episode):
         raise RuntimeError('Working speech clock does not end at its declared runtime')
 
 
+def check_working_receipts(config, stem_audit, sfx_audit):
+    """A working mix takes production working stems only, never an audition's."""
+    if (stem_audit.get('kind')!='working-audio-stems-not-final' or stem_audit.get('finalApproved') is not False
+            or sfx_audit.get('workingAudioOnly') is not True or sfx_audit.get('finalApproved') is not False):
+        raise RuntimeError('Only explicitly working stems accepted')
+    for key in ('voice','music'):
+        if stem_audit['outputs'][key]['sha256']!=config['inputs'][key]['sha256']:
+            raise RuntimeError('Working audio stem receipt mismatch')
+    if sfx_audit['sha256']!=config['inputs']['sfx']['sha256'] or sfx_audit['clockSha256']!=config['inputs']['clock']['sha256']:
+        raise RuntimeError('Working effects do not bind the current clock')
+
+
 def mix_working(ep, config_path, config, audition=False, host=None):
     """Use shared mixer DSP without promoting a working clock into picture."""
     import mix_absolute_sfx_longform as mix
@@ -69,14 +81,7 @@ def mix_working(ep, config_path, config, audition=False, host=None):
         assembly.verify_sha(paths[key],spec['sha256'],key)
     clock=json.loads(paths['clock'].read_text())
     validate_working_clock(clock,config['episode'])
-    stem_audit=json.loads(paths['stemAudit'].read_text()); sfx_audit=json.loads(paths['sfxAudit'].read_text())
-    if stem_audit.get('finalApproved') is not False or sfx_audit.get('workingAudioOnly') is not True or sfx_audit.get('finalApproved') is not False:
-        raise RuntimeError('Only explicitly working stems accepted')
-    for key in ('voice','music'):
-        if stem_audit['outputs'][key]['sha256']!=config['inputs'][key]['sha256']:
-            raise RuntimeError('Working audio stem receipt mismatch')
-    if sfx_audit['sha256']!=config['inputs']['sfx']['sha256'] or sfx_audit['clockSha256']!=config['inputs']['clock']['sha256']:
-        raise RuntimeError('Working effects do not bind the current clock')
+    check_working_receipts(config,json.loads(paths['stemAudit'].read_text()),json.loads(paths['sfxAudit'].read_text()))
     runtime=float(clock['runtimeSeconds']); expected=round(runtime*mix.SR)
     for key in ('voice','music','sfx'):
         mix.verify_audio_probe(mix.probe_media(paths[key]),runtime,expected,key,codec='pcm_f32le' if key=='sfx' else 'pcm_s24le')
