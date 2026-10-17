@@ -411,8 +411,9 @@ def _acquire_lock(path: Path) -> int:
 
 def submit(plan: dict[str, Any], state_path: Path, key: str,
            create_fn: Callable[[dict[str, Any], str], dict[str, Any]]) -> dict[str, Any]:
-    if not plan.get("financialAuthorized", plan["doc"].get("financialApproval") is True):
-        raise PlanError("financialApproval is false; submission is gated")
+    if plan.get("financialAuthorized") is not True:
+        raise PlanError("submission requires a current approval record (--approval-admission); "
+                        "the manifest's financialApproval never authorizes spending")
     if plan["doc"].get("currentPriceVerified") is not True:
         raise PlanError("currentPriceVerified is false; credit ceiling is not authorized")
     state = _load_state(plan, state_path, create=True)
@@ -577,6 +578,15 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
             "state": str(state_path)}
 
 
+APPROVAL_LANE = "suno-score"
+
+
+def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite execution limits an approval record must bind exactly."""
+    return {"requests": plan["requestCount"], "credits": plan["expectedCredits"],
+            "sourceSeconds": sum(x["payload"]["duration"] for x in plan["cues"])}
+
+
 def execute(manifest_path: Path, max_requests: int, max_credits: int,
             operation: str = "dry-run", state_path: Path | None = None,
             create_fn: Callable | None = None, record_fn: Callable | None = None,
@@ -585,15 +595,15 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
     plan = load_plan(manifest_path, max_requests, max_credits)
     try:
         approval = validate_paid_approval(
-            approval_admission, episode=plan["doc"].get("episode"), lane="suno-score",
+            approval_admission, episode=plan["doc"].get("episode"), lane=APPROVAL_LANE,
             manifest_path=Path(plan["path"]), manifest_sha256=plan["sha256"],
-            finite_execution={"requests": plan["requestCount"],
-                              "credits": plan["expectedCredits"],
-                              "sourceSeconds": sum(x["payload"]["duration"] for x in plan["cues"])},
+            finite_execution=approval_scope(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
-    plan["financialAuthorized"] = plan["doc"].get("financialApproval") is True or approval is not None
+    # The manifest's financialApproval is reported, never trusted on its own.
+    # Polling needs no new record; it checks the one the batch state recorded.
+    plan["financialAuthorized"] = approval is not None
     plan["approvalAdmissionSha256"] = approval["sha256"] if approval else None
     plan["approvalAuthorizationId"] = approval["authorizationId"] if approval else None
     if operation == "dry-run":
@@ -609,7 +619,8 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
     if operation == "submit" and not plan["financialAuthorized"]:
         # Refuse at the immutable plan gate before looking for a credential,
         # creating state, acquiring a lock, or touching the network.
-        raise PlanError("financialApproval is false; submission is gated")
+        raise PlanError("submission requires a current approval record (--approval-admission); "
+                        "the manifest's financialApproval never authorizes spending")
     if operation == "submit" and plan["doc"].get("currentPriceVerified") is not True:
         raise PlanError("currentPriceVerified is false; credit ceiling is not authorized")
     default_state = Path(plan["path"]).with_suffix(".state.json").resolve()

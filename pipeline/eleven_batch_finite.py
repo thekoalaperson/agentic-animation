@@ -402,6 +402,14 @@ def _verify_resumable(plan: dict[str, Any], state: dict[str, Any]) -> list[dict[
     return pending
 
 
+APPROVAL_LANE = "elevenlabs-narration"
+
+
+def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite execution limits an approval record must bind exactly."""
+    return {"items": len(plan["items"]), "characters": plan["aggregateCharacters"]}
+
+
 def execute(manifest_path: Path, max_characters: int, submit: bool,
             state_path: Path | None = None,
             post_fn: Callable[[str, dict[str, Any], str],
@@ -413,20 +421,18 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
         approval = validate_paid_approval(
             approval_admission,
             episode=plan["episode"],
-            lane="elevenlabs-narration",
+            lane=APPROVAL_LANE,
             manifest_path=Path(plan["manifest"]),
             manifest_sha256=plan["manifestSha256"],
-            finite_execution={
-                "items": len(plan["items"]),
-                "characters": plan["aggregateCharacters"],
-            },
+            finite_execution=approval_scope(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
     plan["approvalAdmission"] = approval
     plan["approvalAdmissionSha256"] = approval["sha256"] if approval else None
     plan["approvalAuthorizationId"] = approval["authorizationId"] if approval else None
-    plan["financialAuthorized"] = plan["financialApproval"] or approval is not None
+    # The manifest's financialApproval is reported, never trusted on its own.
+    plan["financialAuthorized"] = approval is not None
     default_state = Path(plan["manifest"]).with_suffix(".eleven-state.json")
     state_path = (state_path or default_state).resolve()
     if state_path != default_state.resolve():
@@ -448,8 +454,8 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
 
     if not plan["financialAuthorized"]:
         raise PlanError(
-            "financialApproval is false and no current approval admission was supplied; "
-            "submission is gated"
+            "submission requires a current approval record (--approval-admission); "
+            "the manifest's financialApproval never authorizes spending"
         )
 
     # The lock is owned by the immutable manifest, never by a caller-selected

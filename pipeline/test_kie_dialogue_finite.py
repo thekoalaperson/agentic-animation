@@ -7,6 +7,8 @@ import unittest
 from unittest import mock
 
 
+from pipeline.test_paid_approval import write_approval
+
 SPEC = importlib.util.spec_from_file_location('dialogue_finite_target', Path(__file__).with_name('kie_dialogue_finite.py'))
 RUNNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNNER)
@@ -32,7 +34,7 @@ class DialogueFiniteTest(unittest.TestCase):
         self.source = source
         self.doc = dict(version=2,episode='DEMO',provider='kie.ai',route='grok15',
                         model='grok-imagine-video-1-5-preview',resolution='720p',
-                        aspectRatio='16:9',language='hi-IN',financialApproval=True,
+                        aspectRatio='16:9',language='hi-IN',financialApproval=False,
                         financialState='offline fixture',jobCount=1,maximumGeneratedSeconds=7, maximumCredits=35,
                         pricing={'creditsPerSecond':5,'verifiedAtUtc':'2026-01-01T00:00:00Z',
                                  'evidence':'offline test fixture; not a provider quote'})
@@ -54,6 +56,12 @@ class DialogueFiniteTest(unittest.TestCase):
 
     def save(self):
         self.manifest.write_text(json.dumps(self.doc,ensure_ascii=False),encoding='utf-8')
+
+    def approval(self):
+        plan = RUNNER.load_plan(self.manifest, 7)
+        return write_approval(self.ep/'story/approvals/dialogue.json', episode='DEMO',
+                              lane=RUNNER.APPROVAL_LANE, manifest=self.manifest,
+                              scope=RUNNER.approval_scope(plan), project_root=self.ep)
 
     def test_dry_run_is_offline_and_accepts_seven_seconds(self):
         with mock.patch.object(RUNNER.subprocess,'run') as run:
@@ -88,19 +96,51 @@ class DialogueFiniteTest(unittest.TestCase):
         with self.assertRaisesRegex(RUNNER.PlanError,'exactly equal'):
             RUNNER.execute(8,False)
 
-    def test_false_financial_approval_stops_before_compute(self):
-        self.doc['financialApproval'] = False
-        self.save()
-        with mock.patch.object(RUNNER.subprocess,'run') as run:
-            with self.assertRaisesRegex(RUNNER.PlanError,'submission is gated'):
-                RUNNER.execute(7,True)
-        run.assert_not_called()
+    def test_manifest_boolean_alone_never_authorizes(self):
+        for boolean in (False, True):
+            with self.subTest(financialApproval=boolean):
+                self.doc['financialApproval'] = boolean
+                self.save()
+                with mock.patch.object(RUNNER.subprocess,'run') as run:
+                    with self.assertRaisesRegex(RUNNER.PlanError,'requires a current approval record'):
+                        RUNNER.execute(7,True)
+                    dry = RUNNER.execute(7,False)
+                run.assert_not_called()
+                self.assertEqual((dry['financialApproval'], dry['financialAuthorized']), (boolean, False))
+        self.assertTrue(RUNNER.execute(7,False,self.approval())['financialAuthorized'])
 
     def test_mac_submission_refused(self):
+        approval = self.approval()
         with mock.patch.object(RUNNER.platform,'system',return_value='Darwin'), mock.patch.object(RUNNER.subprocess,'run') as run:
             with self.assertRaisesRegex(RUNNER.PlanError,'qualified GPU worker'):
-                RUNNER.execute(7,True)
+                RUNNER.execute(7,True,approval)
         run.assert_not_called()
+
+    def test_reconcile_only_polls_recorded_tasks_without_approval(self):
+        row_ids = []
+        def fake_run(command, **kwargs):
+            if command[0] == 'nvidia-smi':
+                return mock.Mock(returncode=0)
+            row_ids.append(command)
+            return mock.Mock(returncode=0)
+        landed = {'id': 'demo-s1001', 'sha256': 'c' * 64, 'taskId': 'recorded-task'}
+        with mock.patch.object(RUNNER.platform,'system',return_value='Linux'), \
+             mock.patch.object(RUNNER.subprocess,'run',side_effect=fake_run), \
+             mock.patch.object(RUNNER,'validate_completed',return_value=landed), \
+             mock.patch.object(RUNNER,'validate_pending'):
+            nothing = RUNNER.reconcile(7)
+            self.assertEqual((nothing['unsubmitted'], nothing['reconciled']), (['demo-s1001'], []))
+            self.assertEqual(row_ids, [])
+            pending = self.work/'motion/demo-s1001.pending.json'
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.write_text('{}')
+            result = RUNNER.reconcile(7)
+        self.assertEqual(result['generationPosts'], 0)
+        self.assertEqual(result['reconciled'], ['demo-s1001'])
+        self.assertEqual(len(row_ids), 1)
+        self.assertIn('--resume-only', row_ids[0])
+        self.assertFalse((self.work/'execution-authorization.json').exists())
+        self.assertFalse(RUNNER.LOCK.exists())
 
     def test_authority_tamper_refused(self):
         (self.ep/'story/GOAL.md').write_text('changed authority')

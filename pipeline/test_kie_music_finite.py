@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from pipeline import kie_music_finite as finite
+from pipeline.test_paid_approval import write_approval
 
 
 class FiniteKieMusicTest(unittest.TestCase):
@@ -47,7 +48,16 @@ class FiniteKieMusicTest(unittest.TestCase):
             "expectedCandidatesPerRequest": 2,
             "cues": copy.deepcopy(cues)
         }), encoding="utf-8")
+        self.approval_path = self.approve(manifest) if approved else None
         return manifest
+
+    @staticmethod
+    def approve(manifest: Path) -> Path:
+        doc = json.loads(manifest.read_text())
+        plan = finite.load_plan(manifest, doc["maxRequests"], doc["maxCredits"])
+        return write_approval(manifest.parent / "approval.json", episode=doc["episode"],
+                              lane=finite.APPROVAL_LANE, manifest=manifest,
+                              scope=finite.approval_scope(plan))
 
     @staticmethod
     def state_for(manifest: Path) -> Path:
@@ -90,14 +100,28 @@ class FiniteKieMusicTest(unittest.TestCase):
                 finite.execute(manifest, 2, 25)
 
     def test_financial_gate_blocks_before_network(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            manifest = self.fixture(root, approved=False)
-            with mock.patch.object(finite, "_create") as create:
-                with self.assertRaises(finite.PlanError):
-                    finite.execute(manifest, 2, 24, "submit", self.state_for(manifest),
-                                   create_fn=create, api_key="offline-placeholder")
-            create.assert_not_called()
+        for boolean in (False, True):
+            with self.subTest(financialApproval=boolean), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self.fixture(root, approved=False)
+                doc = json.loads(manifest.read_text())
+                doc["financialApproval"] = boolean
+                manifest.write_text(json.dumps(doc), encoding="utf-8")
+                with mock.patch.object(finite, "_create") as create:
+                    with self.assertRaisesRegex(finite.PlanError, "requires a current approval record"):
+                        finite.execute(manifest, 2, 24, "submit", self.state_for(manifest),
+                                       create_fn=create, api_key="offline-placeholder")
+                create.assert_not_called()
+                self.assertFalse(self.state_for(manifest).exists())
+                # Recorded task IDs stay pollable without any new record.
+                state = finite._state_for(finite.load_plan(manifest, 2, 24))
+                for item in state["items"].values():
+                    item.update(status="SUBMITTED", taskId="recorded-task")
+                finite._atomic_json(self.state_for(manifest), state)
+                polled = finite.execute(manifest, 2, 24, "poll",
+                                        record_fn=lambda task, key: {"status": "PENDING"},
+                                        api_key="offline-placeholder")
+                self.assertEqual(polled["recordGets"], 2)
 
     def test_mock_submit_posts_once_per_movement_and_resumes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,11 +135,11 @@ class FiniteKieMusicTest(unittest.TestCase):
 
             state = self.state_for(manifest)
             first = finite.execute(manifest, 2, 24, "submit", state,
-                                   create_fn=create, api_key="offline-placeholder")
+                                   create_fn=create, api_key="offline-placeholder", approval_admission=self.approval_path)
             self.assertEqual(first["generationPosts"], 2)
             self.assertEqual(len(calls), 2)
             second = finite.execute(manifest, 2, 24, "submit", state,
-                                    create_fn=create, api_key="offline-placeholder")
+                                    create_fn=create, api_key="offline-placeholder", approval_admission=self.approval_path)
             self.assertEqual(second["generationPosts"], 0)
             self.assertEqual(len(calls), 2)
 
@@ -126,7 +150,7 @@ class FiniteKieMusicTest(unittest.TestCase):
             state = self.state_for(manifest)
             finite.execute(manifest, 1, 12, "submit", state,
                            create_fn=lambda payload, key: {"taskId": "task-1"},
-                           api_key="offline-placeholder")
+                           api_key="offline-placeholder", approval_admission=self.approval_path)
             tone = root / "tone.mp3"
             subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
                             "sine=frequency=330:duration=6.0", "-c:a", "libmp3lame",
@@ -142,7 +166,7 @@ class FiniteKieMusicTest(unittest.TestCase):
 
             polled = finite.execute(manifest, 1, 12, "poll", state,
                                     record_fn=record, download_fn=lambda url: raw,
-                                    api_key="offline-placeholder")
+                                    api_key="offline-placeholder", approval_admission=self.approval_path)
             self.assertEqual(polled["recordGets"], 1)
             self.assertEqual(polled["candidateDownloads"], 2)
             saved = json.loads(state.read_text())
@@ -161,9 +185,10 @@ class FiniteKieMusicTest(unittest.TestCase):
             doc = json.loads(manifest.read_text())
             doc["currentPriceVerified"] = False
             manifest.write_text(json.dumps(doc), encoding="utf-8")
+            self.approval_path = self.approve(manifest)
             with mock.patch.object(finite, "_create") as create:
                 with self.assertRaisesRegex(finite.PlanError, "currentPriceVerified is false"):
-                    finite.execute(manifest, 1, 12, "submit", api_key="offline-placeholder")
+                    finite.execute(manifest, 1, 12, "submit", api_key="offline-placeholder", approval_admission=self.approval_path)
             create.assert_not_called()
             self.assertFalse(self.state_for(manifest).exists())
 
@@ -173,12 +198,12 @@ class FiniteKieMusicTest(unittest.TestCase):
             state = self.state_for(manifest)
             finite.execute(manifest, 1, 12, "submit", state,
                            create_fn=lambda payload, key: {"taskId": "existing-task"},
-                           api_key="offline-placeholder")
+                           api_key="offline-placeholder", approval_admission=self.approval_path)
             for provider_status in ("TEXT_SUCCESS", "FIRST_SUCCESS"):
                 result = finite.execute(manifest, 1, 12, "poll", state,
                     record_fn=lambda task, key: {"status": provider_status},
                     download_fn=lambda url: self.fail("partial audio must not download"),
-                    api_key="offline-placeholder")
+                    api_key="offline-placeholder", approval_admission=self.approval_path)
                 self.assertEqual(result["candidateDownloads"], 0)
                 saved = json.loads(state.read_text())
                 self.assertEqual(saved["items"]["m1-test"]["status"], "PENDING")
@@ -186,7 +211,7 @@ class FiniteKieMusicTest(unittest.TestCase):
             state.write_text(json.dumps(saved))
             finite.execute(manifest, 1, 12, "poll", state,
                            record_fn=lambda task, key: {"status": "FIRST_SUCCESS"},
-                           api_key="offline-placeholder")
+                           api_key="offline-placeholder", approval_admission=self.approval_path)
             fixed = json.loads(state.read_text())["items"]["m1-test"]
             self.assertEqual(fixed["status"], "PENDING")
             self.assertEqual(fixed["taskId"], "existing-task")
@@ -204,7 +229,7 @@ class FiniteKieMusicTest(unittest.TestCase):
                 finite.execute(
                     manifest, 2, 24, "submit",
                     create_fn=lambda payload, key: calls.append(payload) or {"taskId": "never"},
-                    api_key="offline-placeholder",
+                    api_key="offline-placeholder", approval_admission=self.approval_path,
                 )
             self.assertEqual(calls, [])
 
@@ -214,7 +239,7 @@ class FiniteKieMusicTest(unittest.TestCase):
             manifest = self.fixture(root, approved=True, cue_count=1)
             with self.assertRaisesRegex(finite.PlanError, "custom state paths are forbidden"):
                 finite.execute(manifest, 1, 12, "submit", root / "other-state.json",
-                               api_key="offline-placeholder")
+                               api_key="offline-placeholder", approval_admission=self.approval_path)
 
             override = root / "override.json"
             override.write_text("{}", encoding="utf-8")

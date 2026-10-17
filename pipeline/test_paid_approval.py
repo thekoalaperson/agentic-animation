@@ -1,10 +1,31 @@
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
 from pipeline.paid_approval import PaidApprovalError, sha256_file, validate_paid_approval
+
+
+def write_approval(record: Path, *, episode, lane: str, manifest: Path,
+                   scope: dict, project_root: Path | None = None) -> Path:
+    """Write an offline APPROVED version-2 record for tests; never a real grant."""
+    root = (project_root or record.parent).resolve()
+    manifest = manifest.resolve()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({
+        "schemaVersion": 2, "kind": "paid-generation-authorization",
+        "episode": episode, "status": "APPROVED", "authorizationId": "offline-test",
+        "authorizedBy": "Offline test fixture", "authorizedAtUtc": "2026-01-01T00:00:00Z",
+        "authorizationText": ["Offline fixture; authorizes nothing outside this test."],
+        "budgetPolicy": "explicit-finite-limits",
+        "projectRoot": os.path.relpath(root, record.parent.resolve()),
+        "topUpAuthorized": False, "automaticRetryAuthorized": False,
+        "manifests": [{"lane": lane, "manifestPath": manifest.relative_to(root).as_posix(),
+                       "manifestSha256": sha256_file(manifest), "finiteExecution": scope}],
+    }), encoding="utf-8")
+    return record
 
 
 class PaidApprovalTest(unittest.TestCase):

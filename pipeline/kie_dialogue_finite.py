@@ -486,19 +486,94 @@ def acquire_lock(path: Path, manifest_sha256: str) -> None:
         os.close(descriptor)
 
 
+APPROVAL_LANE = "grok-dialogue"
+
+
+def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite execution limits an approval record must bind exactly."""
+    return {"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
+            "credits": plan["maximumCredits"]}
+
+
+def kie_video_command(plan: dict[str, Any], row: dict[str, Any]) -> list[str]:
+    return [
+        sys.executable,
+        str(ROOT / "pipeline/kie_video.py"),
+        "grok15",
+        str(row["outputPath"]),
+        str(row["promptPath"]),
+        str(row["sourcePath"]),
+        "--res", "720p",
+        "--dur", str(row["durationSeconds"]),
+        "--ar", "16:9",
+        "--job-id", row["id"],
+        "--manifest-sha256", plan["manifestSha256"],
+        "--source-sha256", row["sourceSha256"],
+        "--execution-request-sha256", row["executionRequestSha256"],
+    ]
+
+
+def require_media_host() -> None:
+    if platform.system() != "Linux":
+        raise PlanError("Submission and heavy media validation require the qualified GPU worker")
+    subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], check=True, capture_output=True)
+
+
+def write_progress(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) -> None:
+    atomic_json(HERE / "progress.json", {
+        "manifestSha256": plan["manifestSha256"],
+        "completed": list(completed.values()),
+        "jobCount": len(plan["jobs"]),
+    })
+
+
+def reconcile(max_generated_seconds: int) -> dict[str, Any]:
+    """Finish already-submitted tasks without any new generation POST.
+
+    A batch keeps its recorded task IDs whatever authorized it, so recovery
+    needs no approval record: kie_video.py --resume-only polls a recorded
+    taskId and refuses to create one. Jobs with no recovery record are listed
+    and left alone.
+    """
+    plan = load_plan(MANIFEST, max_generated_seconds)
+    require_media_host()
+    acquire_lock(LOCK, plan["manifestSha256"])
+    try:
+        jobs, completed = preflight(plan)
+        reconciled, unsubmitted, failed = [], [], []
+        for row in jobs:
+            if not row["outputPath"].with_suffix(".pending.json").exists():
+                unsubmitted.append(row["id"])
+                continue
+            result = subprocess.run(kie_video_command(plan, row) + ["--resume-only"], cwd=ROOT)
+            if result.returncode:
+                failed.append(row["id"])
+                continue
+            completed[row["id"]] = {**validate_completed(plan, row), "resumed": True}
+            reconciled.append(row["id"])
+            write_progress(plan, completed)
+        return {"mode": "RECONCILE_ONLY", "generationPosts": 0,
+                "reconciled": reconciled, "unsubmitted": unsubmitted, "failed": failed,
+                "completed": len(completed), "jobCount": len(plan["jobs"]),
+                "manifestSha256": plan["manifestSha256"]}
+    finally:
+        LOCK.unlink(missing_ok=True)
+
+
 def execute(max_generated_seconds: int, submit: bool,
             approval_admission: Path | None = None, concurrency: int = 1) -> dict[str, Any]:
     plan = load_plan(MANIFEST, max_generated_seconds)
     try:
         approval = validate_paid_approval(
-            approval_admission, episode=EPISODE_CODE, lane="grok-dialogue",
+            approval_admission, episode=EPISODE_CODE, lane=APPROVAL_LANE,
             manifest_path=plan["manifestPath"], manifest_sha256=plan["manifestSha256"],
-            finite_execution={"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
-                              "credits": plan["maximumCredits"]},
+            finite_execution=approval_scope(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
-    authorized = plan["financialApproval"] or approval is not None
+    # The manifest's own financialApproval is reported, never trusted: agents
+    # write manifests, so only the separate hash-bound record authorizes.
+    authorized = approval is not None
     if not submit:
         return {
             "mode": "DRY_RUN",
@@ -513,11 +588,10 @@ def execute(max_generated_seconds: int, submit: bool,
             "manifestSha256": plan["manifestSha256"],
         }
     if not authorized:
-        raise PlanError("financialApproval is false; submission is gated")
+        raise PlanError("submission requires a current approval record (--approval-admission); "
+                        "the manifest's financialApproval never authorizes spending")
 
-    if platform.system() != "Linux":
-        raise PlanError("Submission and heavy media validation require the qualified GPU worker")
-    subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], check=True, capture_output=True)
+    require_media_host()
     if concurrency not in (1, 2, 3):
         raise PlanError("concurrency must be 1, 2 or 3")
     acquire_lock(LOCK, plan["manifestSha256"])
@@ -546,22 +620,7 @@ def execute(max_generated_seconds: int, submit: bool,
         })
         def generate_row(row):
             stem = row["outputPath"]
-            command = [
-                sys.executable,
-                str(ROOT / "pipeline/kie_video.py"),
-                "grok15",
-                str(stem),
-                str(row["promptPath"]),
-                str(row["sourcePath"]),
-                "--res", "720p",
-                "--dur", str(row["durationSeconds"]),
-                "--ar", "16:9",
-                "--job-id", row["id"],
-                "--manifest-sha256", plan["manifestSha256"],
-                "--source-sha256", row["sourceSha256"],
-                "--execution-request-sha256", row["executionRequestSha256"],
-            ]
-            result = subprocess.run(command, cwd=ROOT)
+            result = subprocess.run(kie_video_command(plan, row), cwd=ROOT)
             if result.returncode:
                 recovery = stem.with_suffix(".pending.json")
                 state = ("durable recovery state exists" if recovery.exists()
@@ -578,11 +637,7 @@ def execute(max_generated_seconds: int, submit: bool,
                 for row, future in zip(group, futures):
                     try:
                         completed[row["id"]] = future.result()
-                        atomic_json(HERE / "progress.json", {
-                            "manifestSha256": plan["manifestSha256"],
-                            "completed": list(completed.values()),
-                            "jobCount": len(plan["jobs"]),
-                        })
+                        write_progress(plan, completed)
                         print(f"TECHNICAL COMPLETE {len(completed)}/{len(plan['jobs'])}: {row['id']}", flush=True)
                     except Exception as exc:
                         errors.append(f"{row['id']}: {exc}")
@@ -624,19 +679,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--credential-stdin", action="store_true")
     parser.add_argument("--max-generated-seconds", type=int, required=True)
-    parser.add_argument("--submit", action="store_true")
-    parser.add_argument("--approval-admission", type=Path)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--submit", action="store_true",
+                       help="paid run; requires --approval-admission")
+    modes.add_argument("--reconcile-only", action="store_true",
+                       help="poll and land already-submitted tasks; never POSTs and needs no approval")
+    parser.add_argument("--approval-admission", type=Path,
+                        help="hash-bound paid authorization record (paid_approval.py)")
     args = parser.parse_args(argv)
     try:
         configure(args.manifest, args.episode_root, args.production_overrides,
                   args.episode_code, args.authority_file)
-        if args.submit and args.credential_stdin:
+        if (args.submit or args.reconcile_only) and args.credential_stdin:
             credential = json.load(sys.stdin)
             key = credential.get("kieApiKey")
             if not isinstance(key, str) or not key:
                 raise PlanError("Missing Kie credential on stdin")
             os.environ["KIE_KEY"] = key
-        result = execute(args.max_generated_seconds, args.submit, args.approval_admission, args.concurrency)
+        if args.reconcile_only:
+            result = reconcile(args.max_generated_seconds)
+        else:
+            result = execute(args.max_generated_seconds, args.submit,
+                             args.approval_admission, args.concurrency)
     except PlanError as exc:
         raise SystemExit(f"REFUSED: {exc}") from exc
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
