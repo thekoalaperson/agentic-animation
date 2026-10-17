@@ -6,7 +6,15 @@ generation retry; persisted task IDs own recovery. Media decoding stays remote.
 
 Every invocation, --poll-only included, writes a new
 credit-preflight-attempt-NNN.json and execution-receipt-attempt-NNN.json;
-execution-receipt.json lists every attempt's wallet readings.
+execution-receipt.json lists every attempt's wallet readings. A full receipt or
+preflight left by the older single-file wrapper is first kept as an attempt
+marked legacyRecord.
+
+A fresh batch posts one cue, waits for it to land, records the wallet delta
+beside creditsPerRequest (report-only: the Suno poll carries no per-task
+credits), then posts the rest. If this wrapper stops between the two, the
+remainder is posted by kie_music_finite.py --submit (which posts only PLANNED
+cues) and observed with --poll-only here; --poll-only itself never posts.
 """
 import argparse
 import json
@@ -76,22 +84,50 @@ def main():
         "manifestSha256": plan["sha256"], "availableCredits": before,
         "expectedCredits": plan["expectedCredits"], "authoritySha256": doc["authoritySha256"],
         "pollOnly": a.poll_only, "computeHost": platform.node(), "topUpAttempted": False})
+
+    def run(operation):
+        return execute(manifest, a.max_requests, a.max_credits, operation,
+                       api_key=key, approval_admission=a.approval_admission)
+
+    def observe():
+        """Poll until every posted cue has landed; PLANNED cues are not posted yet."""
+        deadline = time.monotonic() + 1200
+        while time.monotonic() < deadline:
+            result = run("poll")
+            state = json.loads(state_path.read_text())
+            statuses = {k: v["status"] for k, v in state["items"].items()}
+            print(json.dumps({"poll": result, "statuses": statuses}), flush=True)
+            if all(s in ("DOWNLOADED", "PLANNED") for s in statuses.values()):
+                return state, statuses
+            time.sleep(15)
+        receipt("DEADLINE", before, wallet())
+        raise SystemExit("Observation deadline reached; recover the same task IDs with --poll-only")
+
     if not a.poll_only:
-        print(json.dumps(execute(manifest, a.max_requests, a.max_credits,
-                                 "submit", api_key=key, approval_admission=a.approval_admission)), flush=True)
-    deadline = time.monotonic() + 1200
-    while time.monotonic() < deadline:
-        result = execute(manifest, a.max_requests, a.max_credits, "poll", api_key=key, approval_admission=a.approval_admission)
-        state = json.loads(state_path.read_text())
-        statuses = {k: v["status"] for k, v in state["items"].items()}
-        print(json.dumps({"poll": result, "statuses": statuses}), flush=True)
-        if all(s == "DOWNLOADED" for s in statuses.values()):
-            receipt("COMPLETED", before, wallet(), requests=len(statuses),
-                    candidates=sum(len(i["candidates"]) for i in state["items"].values()))
-            return
-        time.sleep(15)
-    receipt("DEADLINE", before, wallet())
-    raise SystemExit("Observation deadline reached; recover the same task IDs with --poll-only")
+        print(json.dumps(run("submit")), flush=True)
+    state, statuses = observe()
+    planned = [k for k, s in statuses.items() if s == "PLANNED"]
+    if planned and a.poll_only:
+        receipt("AWAITING_REMAINDER", before, wallet(), notYetPosted=planned)
+        raise SystemExit("Posted cues have landed; post the rest with kie_music_finite.py "
+                         "--submit, then observe them here with --poll-only")
+    if planned:
+        pilot = [k for k, s in statuses.items() if s == "DOWNLOADED"]
+        if not pilot:
+            raise SystemExit("No cue was posted; inspect the batch state before submitting")
+        after_pilot = wallet()
+        rate = doc["creditsPerRequest"]
+        delta = before - after_pilot
+        receipt("FIRST_CUE_LANDED", before, after_pilot, firstCues=pilot,
+                creditsPerRequest=rate, observedCreditsPerLandedCue=delta / len(pilot),
+                comparison="report-only: the Suno poll records no per-task credits; "
+                           "a shared wallet delta is an observation, not a receipt")
+        if after_pilot < rate * len(planned):
+            raise SystemExit("Insufficient existing credits for the remaining cues; no top-up/overage")
+        print(json.dumps(run("submit")), flush=True)
+        state, statuses = observe()
+    receipt("COMPLETED", before, wallet(), requests=len(statuses),
+            candidates=sum(len(i["candidates"]) for i in state["items"].values()))
 
 
 if __name__ == "__main__":

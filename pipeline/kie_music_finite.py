@@ -7,6 +7,11 @@ manifest, and caller-supplied request/credit ceilings.  Each movement receives
 at most one POST.  Ambiguous POSTs and provider failures stop the run and are
 never regenerated automatically.  --poll is a separate, idempotent recovery
 operation for already-persisted task IDs.
+
+--submit is re-entrant. On a fresh batch it posts one cue; once that cue is
+DOWNLOADED, the next --submit posts every cue still PLANNED. While the first
+cue is in flight it posts nothing. A wrong price or payload therefore costs one
+request. run_score_gpu.py does this sequence in one invocation.
 """
 
 from __future__ import annotations
@@ -478,6 +483,12 @@ def submit(plan: dict[str, Any], state_path: Path, key: str,
         raise PlanError("currentPriceVerified is false; credit ceiling is not authorized")
     state = _load_state(plan, state_path, create=True)
     _preflight_output_namespace(plan, state)
+    # One cue goes first and must land before the rest are posted, so a wrong
+    # price or a refused payload costs one request, not the batch.
+    statuses = [state["items"][cue["id"]].get("status") for cue in plan["cues"]]
+    first_landed = "DOWNLOADED" in statuses
+    allowed = len(statuses) if first_landed else 0 if any(
+        status != "PLANNED" for status in statuses) else 1
     calls = 0
     for cue in plan["cues"]:
         record = state["items"][cue["id"]]
@@ -489,6 +500,8 @@ def submit(plan: dict[str, Any], state_path: Path, key: str,
             continue
         if status != "PLANNED":
             raise UncertainRequest(f"{cue['id']}: {status}; generation POST will not be retried")
+        if calls >= allowed:
+            continue
         record.update(status="POSTING_UNCERTAIN", postAttempts=1, postStartedAt=_now())
         _persist(state_path, state)
         calls += 1
@@ -513,8 +526,12 @@ def submit(plan: dict[str, Any], state_path: Path, key: str,
         record.update(status="SUBMITTED", taskId=task_id, postFinishedAt=_now(),
                       providerCreateResponse=response)
         _persist(state_path, state)
-    return {"operation": "SUBMIT", "generationPosts": calls,
-            "state": str(state_path), "expectedCredits": plan["expectedCredits"]}
+    planned = sum(state["items"][cue["id"]].get("status") == "PLANNED" for cue in plan["cues"])
+    result = {"operation": "SUBMIT", "generationPosts": calls, "stillPlanned": planned,
+              "state": str(state_path), "expectedCredits": plan["expectedCredits"]}
+    if planned:
+        result["note"] = "the first cue must land (--poll) before --submit posts the rest"
+    return result
 
 
 def _tracks(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -533,7 +550,7 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
     state = _load_state(plan, state_path, create=False)
     _preflight_output_namespace(plan, state)
     output_root = Path(plan["outputRoot"])
-    polls = downloads = 0
+    polls = downloads = planned = 0
     for cue in plan["cues"]:
         item = state["items"][cue["id"]]
         status = item.get("status")
@@ -546,7 +563,11 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
         if status == "DOWNLOADED":
             _completed_ok(plan, cue["id"], item)
             continue
-        if status in {"PLANNED", "POSTING_UNCERTAIN", "UNCERTAIN_POST",
+        if status == "PLANNED":
+            # Not posted yet: submit posts it once the first cue has landed.
+            planned += 1
+            continue
+        if status in {"POSTING_UNCERTAIN", "UNCERTAIN_POST",
                       "UNCERTAIN_RESPONSE", "UNCERTAIN_HTTP_ERROR",
                       "HTTP_4XX_REFUSED", "GENERATION_FAILED"}:
             raise UncertainRequest(f"{cue['id']}: cannot poll state {status}")
@@ -635,7 +656,7 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
         item["downloadedAt"] = _now()
         _persist(state_path, state)
     return {"operation": "POLL", "recordGets": polls, "candidateDownloads": downloads,
-            "state": str(state_path)}
+            "notYetPosted": planned, "state": str(state_path)}
 
 
 APPROVAL_LANE = "suno-score"

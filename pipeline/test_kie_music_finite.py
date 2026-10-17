@@ -1,6 +1,8 @@
+import contextlib
 import copy
 import hashlib
 import importlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -149,10 +151,25 @@ class FiniteKieMusicTest(unittest.TestCase):
                                         api_key="offline-placeholder")
                 self.assertEqual(polled["recordGets"], 2)
 
-    def test_mock_submit_posts_once_per_movement_and_resumes(self):
+    @staticmethod
+    def tone() -> bytes:
+        with tempfile.TemporaryDirectory() as tmp:
+            tone = Path(tmp) / "tone.mp3"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                            "sine=frequency=330:duration=6.0", "-c:a", "libmp3lame",
+                            str(tone)], check=True)
+            return tone.read_bytes()
+
+    @staticmethod
+    def record(task_id, key):
+        return {"status": "SUCCESS", "response": {"sunoData": [
+            {"audioUrl": f"https://invalid/{task_id}/take1", "id": "a"},
+            {"audioUrl": f"https://invalid/{task_id}/take2", "id": "b"}]}}
+
+    def test_mock_submit_posts_one_cue_first_then_the_rest_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manifest = self.fixture(root, approved=True)
+            manifest = self.fixture(root, approved=True, cue_count=3)
             calls = []
 
             def create(payload, key):
@@ -160,14 +177,77 @@ class FiniteKieMusicTest(unittest.TestCase):
                 return {"taskId": f"task-{len(calls)}"}
 
             state = self.state_for(manifest)
-            first = finite.execute(manifest, 2, 24, "submit", state,
-                                   create_fn=create, api_key="offline-placeholder", approval_admission=self.approval_path)
-            self.assertEqual(first["generationPosts"], 2)
-            self.assertEqual(len(calls), 2)
-            second = finite.execute(manifest, 2, 24, "submit", state,
-                                    create_fn=create, api_key="offline-placeholder", approval_admission=self.approval_path)
-            self.assertEqual(second["generationPosts"], 0)
-            self.assertEqual(len(calls), 2)
+
+            def submit():
+                return finite.execute(manifest, 3, 36, "submit", state, create_fn=create,
+                                      api_key="offline-placeholder",
+                                      approval_admission=self.approval_path)
+
+            first = submit()
+            self.assertEqual((first["generationPosts"], first["stillPlanned"]), (1, 2))
+            # While the first cue is in flight, nothing more is posted.
+            self.assertEqual(submit()["generationPosts"], 0)
+            raw = self.tone()
+            polled = finite.execute(manifest, 3, 36, "poll", state, record_fn=self.record,
+                                    download_fn=lambda url: raw, api_key="offline-placeholder",
+                                    approval_admission=self.approval_path)
+            self.assertEqual((polled["recordGets"], polled["notYetPosted"]), (1, 2))
+            rest = submit()
+            self.assertEqual((rest["generationPosts"], rest["stillPlanned"]), (2, 0))
+            self.assertEqual(submit()["generationPosts"], 0)
+            self.assertEqual([payload["title"] for payload, _ in calls],
+                             ["Test 1", "Test 2", "Test 3"])
+
+    def test_gpu_wrapper_waits_for_the_first_cue_and_keeps_a_legacy_receipt(self):
+        wrapper = importlib.import_module("run_score_gpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self.fixture(root, cue_count=2)
+            (root / "GOAL.md").write_text("demo\n", encoding="utf-8")
+            doc = json.loads(manifest.read_text())
+            doc.update(authority="GOAL.md", authoritySha256=hashlib.sha256(b"demo\n").hexdigest())
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+            approval = self.approve(manifest)
+            legacy = {"status": "COMPLETED", "walletAfter": 70.0}
+            (root / "execution-receipt.json").write_text(json.dumps(legacy))
+            raw, events, wallet = self.tone(), [], iter([100.0, 88.0, 76.0])
+
+            def create(payload, key):
+                events.append(("post", payload["title"]))
+                return {"taskId": f"task-{len(events)}"}
+
+            def real_execute(*args, **kwargs):
+                events.append(("execute", args[3]))
+                return finite.execute(*args, **kwargs, create_fn=create, record_fn=self.record,
+                                      download_fn=lambda url: raw)
+
+            def urlopen(request, timeout):
+                events.append(("wallet",))
+                return io.BytesIO(json.dumps({"code": 200, "data": next(wallet)}).encode())
+
+            argv = ["run_score_gpu.py", str(manifest), "--max-requests", "2",
+                    "--max-credits", "24", "--approval-admission", str(approval)]
+            with mock.patch.object(wrapper, "platform") as host, \
+                 mock.patch.object(wrapper, "subprocess"), \
+                 mock.patch.object(wrapper, "execute", side_effect=real_execute), \
+                 mock.patch.object(wrapper.urllib.request, "urlopen", side_effect=urlopen), \
+                 mock.patch.object(wrapper.time, "sleep"), \
+                 mock.patch.object(wrapper.sys, "argv", argv), \
+                 mock.patch.object(wrapper.sys, "stdin", io.StringIO('{"kieApiKey": "offline"}')), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                host.system.return_value, host.node.return_value = "Linux", "demo-host"
+                wrapper.main()
+            self.assertEqual(events, [
+                ("wallet",), ("execute", "submit"), ("post", "Test 1"), ("execute", "poll"),
+                ("wallet",), ("execute", "submit"), ("post", "Test 2"), ("execute", "poll"),
+                ("wallet",)])
+            index = json.loads((root / "execution-receipt.json").read_text())
+            records = [attempt["record"] for attempt in index["attempts"]]
+            self.assertEqual(records[0], {"legacyRecord": "execution-receipt.json", "record": legacy})
+            self.assertEqual([r.get("status") for r in records[1:]], ["FIRST_CUE_LANDED", "COMPLETED"])
+            self.assertEqual((records[1]["firstCues"], records[1]["observedCreditsPerLandedCue"],
+                              records[1]["creditsPerRequest"]), (["m1-test"], 12.0, 12))
+            self.assertEqual(index["status"], "COMPLETED")
 
     def test_mock_poll_preserves_every_returned_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

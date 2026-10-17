@@ -36,7 +36,10 @@ a receipt's task ID and `creditsConsumed` are the best evidence for the next
 manifest's rate. Never use a test fixture's rate. Worker hours usually cost more
 than API calls. The dialogue runner stops once landed charges pass the
 manifest's `maximumCredits`, and it reports each receipted job's rate in
-`price-variance.json`.
+`price-variance.json`. The score lane posts one cue and waits for it to land
+before posting the rest. Its wrapper records the wallet change beside
+`creditsPerRequest` as an observation only, because the Suno poll reports no
+per-task credits.
 
 A hash-bound old job resumes with its recorded runner and manifest. Use an
 explicit migration record when adapting it; do not change old evidence to make
