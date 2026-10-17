@@ -1213,6 +1213,351 @@ class TimelineBuilderTest(unittest.TestCase):
                 )
         decode.assert_not_called()
 
+    # Wordless picture, voice heard over picture, and the documents they need.
+
+    def ledger(self):
+        path = self.ep / "work/h3-review-ledger-v1.json"
+        return path, json.loads(path.read_text())
+
+    def write_rows(self, rows):
+        self.write_json(self.ep / "story/storyboard_plan.json", {"episode": "DEMO", "stills": rows})
+
+    def make_wordless(self, scene="demo-s002", **fields):
+        rows = [dict(r) for r in self.rows]
+        for row in rows:
+            if row["still_id"] == scene:
+                row.update(delivery="wordless", **fields)
+                row.pop("narration_hi")
+                row.pop("narration_en")
+        self.write_rows(rows)
+        path, ledger = self.ledger()
+        for segment in ledger["entries"][scene]["segments"]:
+            segment["sourceSha256"] = self.sha(self.ep / segment["source"])
+        self.write_json(path, ledger)
+        return rows
+
+    def readiness(self):
+        return json.loads((self.ep / "work/assembly-v1/timeline-readiness.json").read_text())
+
+    def test_films_without_new_markers_gain_no_new_fields(self):
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertNotIn("pictureScenes", ready)
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertNotIn("pictureCount", audit)
+        narration = {"id", "shot", "kind", "speaker", "audio", "picture", "audioSha256", "start",
+                     "duration", "end", "audioSourceStart", "audioSourceDuration", "subtitleAudioAt",
+                     "subtitleAudioDuration", "narrationBreath", "text", "subtitleTextHi", "subtitleTextEn"}
+        for event in plan["events"]:
+            if event["kind"] == "narration":
+                self.assertEqual(set(event), narration)
+            else:
+                self.assertEqual(event["kind"], "dialogue")
+                self.assertNotIn("voice", event)
+                self.assertNotIn("durationRule", event)
+        for block in plan["pictureBlocks"]:
+            for candidate in block["candidates"]:
+                self.assertNotIn("origin", candidate)
+        self.assertEqual(list(ready["documents"])[:4],
+                         ["storyboard", "narrationManifest", "dialogueManifest", "h3ReviewLedger"])
+
+    def test_wordless_row_is_clocked_by_its_accepted_take(self):
+        self.make_wordless()
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual((ready["narrationScenes"], ready["dialogueScenes"], ready["pictureScenes"]), (2, 1, 1))
+        first, picture, dialogue, last = plan["events"]
+        self.assertEqual(picture["kind"], "picture")
+        self.assertIsNone(picture["audio"])
+        self.assertEqual(picture["duration"], 3.0)
+        self.assertEqual(picture["durationRule"]["rule"], "take")
+        self.assertNotIn("narrationBreath", picture)
+        self.assertNotIn("subtitleTextHi", picture)
+        self.assertEqual(first["narrationBreath"]["reason"], "intra-beat")
+        # Picture joins the neighbouring narration run as one fluid block.
+        self.assertEqual(plan["pictureBlocks"][0]["events"], ["demo-s001", "demo-s002"])
+        self.assertEqual([c["frames"] for c in plan["pictureBlocks"][0]["candidates"]], [58, 72])
+        for language in ("hi", "en"):
+            timing = json.loads((self.ep / f"work/assembly-v1/subtitle-{language}-timing.json").read_text())
+            self.assertEqual([s["id"] for s in timing["shots"]], ["demo-s001", "demo-s003", "demo-s004"])
+            self.assertEqual(timing["duration"], plan["runtimeSeconds"])
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertEqual((audit["narrationCount"], audit["pictureCount"]), (2, 1))
+
+    def test_wordless_picture_segment_must_declare_its_bytes(self):
+        self.make_wordless()
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s002"]["segments"][0].pop("sourceSha256")
+        self.write_json(path, ledger)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "picture-segment-hash" for e in ready["errors"]))
+        ledger["entries"]["demo-s002"]["segments"][0]["verdict"] = "rejected"
+        self.write_json(path, ledger)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(m["type"] == "picture-take" for m in ready["missing"]))
+
+    def test_authored_hold_trims_the_take_and_borrows_from_narration(self):
+        self.make_wordless(holdSeconds=1.5)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        picture = plan["events"][1]
+        self.assertEqual((picture["duration"], picture["durationRule"]["rule"]), (1.5, "authored"))
+        self.assertEqual([c["frames"] for c in plan["pictureBlocks"][0]["candidates"]], [58, 36])
+        # A hold longer than the take borrows from the narration neighbour.
+        self.make_wordless(holdSeconds=3.25)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertEqual([(b["donorScene"], b["receiverScene"], b["frames"]) for b in audit["coverageBorrowing"]],
+                         [("demo-s001", "demo-s002", 6)])
+        self.assertEqual(sum(c["frames"] for c in plan["pictureBlocks"][0]["candidates"]), 58 + 78)
+        # A hold no accepted picture can fill is a coverage deficit, as for speech.
+        self.make_wordless(holdSeconds=10)
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any(m["type"] == "h3-coverage-deficit" and m["sceneId"] == "demo-s002"
+                            for m in self.readiness()["missing"]))
+        self.assertTrue((self.ep / "work/assembly-v1/measured-clock.json").is_file())
+
+    def test_narration_borrows_from_a_held_picture_neighbour(self):
+        self.make_wordless(holdFrames=24)
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s001"]["segments"][0].update(out=1.0, speed=1.0)
+        self.write_json(path, ledger)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertEqual([(b["donorScene"], b["receiverScene"], b["frames"]) for b in audit["coverageBorrowing"]],
+                         [("demo-s002", "demo-s001", 34)])
+        self.assertEqual([(c["sceneId"], c["frames"]) for c in plan["pictureBlocks"][0]["candidates"]],
+                         [("demo-s001", 24), ("demo-s002", 58)])
+
+    def test_wordless_row_after_dialogue_forms_its_own_block(self):
+        self.make_wordless("demo-s004")
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual([b["kind"] for b in plan["pictureBlocks"]],
+                         ["narration-fluid-picture", "dialogue-fixed-sync", "narration-fluid-picture"])
+        self.assertEqual(plan["pictureBlocks"][-1]["events"], ["demo-s004"])
+        self.assertEqual(plan["events"][-1]["duration"], 2.0)
+        self.assertEqual(plan["events"][1]["narrationBreath"]["reason"], "dialogue-entry")
+
+    def test_neighbour_may_own_a_held_picture_row(self):
+        self.make_wordless(holdSeconds=1.0)
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s002"].update(pictureRoute="omit", segments=[])
+        ledger["entries"]["demo-s001"]["segments"][0].update(speed=1.0)
+        ledger["pictureOwnershipContracts"] = [dict(ownerSceneId="demo-s001",
+                                                    coveredSceneIds=["demo-s001", "demo-s002"])]
+        self.write_json(path, ledger)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        with mock.patch.object(assembly, "probe_duration", return_value=10.0):
+            segments = assembly.build_picture_segments(self.ep, plan)
+        self.assertEqual([(s["sceneId"], s["frames"]) for s in segments[:1]], [("demo-s001", 58 + 24)])
+        # Without a hold, a picture row whose neighbour owns it has no clock.
+        self.make_wordless()
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s002"].update(pictureRoute="omit", segments=[])
+        self.write_json(path, ledger)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "picture-route" for e in ready["errors"]))
+
+    def test_picture_route_name_is_an_alias_of_h3(self):
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s002"]["pictureRoute"] = "picture"
+        self.write_json(path, ledger)
+        _, renamed = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        ledger["entries"]["demo-s002"]["pictureRoute"] = "h3"
+        self.write_json(path, ledger)
+        _, original = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertEqual(renamed["pictureBlocks"], original["pictureBlocks"])
+
+    def test_voice_over_is_narration_that_names_its_voice(self):
+        rows = [dict(r) for r in self.rows]
+        rows[1].update(delivery="unsynced", voice="Character Two")
+        self.write_rows(rows)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        event = plan["events"][1]
+        self.assertEqual((event["kind"], event["speaker"], event["voice"]), ("narration", None, "Character Two"))
+        self.assertIn("narrationBreath", event)
+        timing = json.loads((self.ep / "work/assembly-v1/subtitle-en-timing.json").read_text())
+        self.assertEqual(timing["shots"][1]["speaker"], "Character Two")
+        self.assertFalse(timing["shots"][1]["dialogue"])
+        # A storyboard speaker always means a lip-sync take; voice-over never hides behind it.
+        rows[2].update(delivery="unsynced")
+        self.write_rows(rows)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "storyboard-delivery" and e["sceneId"] == "demo-s003"
+                            for e in ready["errors"]))
+
+    def test_production_override_may_mark_delivery_but_not_contradict_it(self):
+        override_path = self.ep / "work/script-v1/overrides.json"
+        override_path.parent.mkdir(parents=True)
+        self.write_json(override_path, {"items": {"demo-s002": {
+            "speaker": None, "narration_hi": "", "narration_en": "", "delivery": "wordless", "reason": "picture"}}})
+        config = json.loads(self.config.read_text())
+        config["productionOverrides"] = str(override_path.relative_to(self.ep))
+        self.write_json(self.config, config)
+        self.refresh_provenance()
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s002"]["segments"][0]["sourceSha256"] = self.sha(self.ep / "work/h3/demo-s002.mp4")
+        self.write_json(path, ledger)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(plan["events"][1]["kind"], "picture")
+        rows = [dict(r) for r in self.rows]
+        rows[1]["delivery"] = "unsynced"
+        self.write_rows(rows)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "storyboard-delivery" for e in ready["errors"]))
+
+    def test_invalid_delivery_and_duration_rules_name_the_row(self):
+        for scene, fields in [
+                ("demo-s002", dict(delivery="wordless", holdSeconds=0.01)),
+                ("demo-s002", dict(delivery="wordless", durationRule="take", holdSeconds=1)),
+                ("demo-s002", dict(delivery="wordless", holdSeconds=1, holdFrames=24)),
+                ("demo-s002", dict(delivery="wordless", holdFrames=True)),
+                ("demo-s002", dict(delivery="wordless", durationRule="speech")),
+                ("demo-s002", dict(delivery="wordless", voice="Character Two")),
+                ("demo-s002", dict(delivery="synced")),
+                ("demo-s002", dict(delivery="whispered")),
+                ("demo-s001", dict(holdSeconds=1.0)),
+                ("demo-s003", dict(delivery="wordless"))]:
+            with self.subTest(scene=scene, fields=fields):
+                rows = [dict(r) for r in self.rows]
+                next(r for r in rows if r["still_id"] == scene).update(fields)
+                self.write_rows(rows)
+                ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "storyboard-delivery" and e["sceneId"] == scene
+                                    for e in ready["errors"]), ready["errors"])
+
+    def test_breath_override_cannot_pad_a_wordless_row(self):
+        self.make_wordless()
+        config = json.loads(self.config.read_text())
+        config["narrationBreathOverrides"] = {"demo-s002": {"seconds": 1.0, "reason": "hold"}}
+        self.write_json(self.config, config)
+        with self.assertRaisesRegex(timeline.TimelineIncomplete, "no narration scene"):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+
+    def test_lane_documents_are_required_only_when_rows_need_them(self):
+        self.write_rows([self.rows[2]])
+        config = json.loads(self.config.read_text())
+        config.pop("narrationManifest")
+        config.pop("h3ReviewLedger")
+        self.write_json(self.config, config)
+        self.refresh_provenance()
+        for name in ("manifest.json", "manifest.eleven-state.json"):
+            (self.ep / "work/narration-hi-v1" / name).unlink()
+        (self.ep / "work/h3-review-ledger-v1.json").unlink()
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(set(ready["documents"]), {"storyboard", "dialogueManifest"})
+        self.assertEqual([e["kind"] for e in plan["events"]], ["dialogue"])
+        # Wordless picture needs the ledger but not the narration lane.
+        self.tearDown()
+        self.setUp()
+        self.make_wordless()
+        rows = json.loads((self.ep / "story/storyboard_plan.json").read_text())["stills"]
+        self.write_rows(rows[1:3])
+        config = json.loads(self.config.read_text())
+        config.pop("narrationManifest")
+        self.write_json(self.config, config)
+        self.refresh_provenance()
+        (self.ep / "work/narration-hi-v1/manifest.json").unlink()
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertNotIn("narrationManifest", ready["documents"])
+        self.assertEqual([e["kind"] for e in plan["events"]], ["picture", "dialogue"])
+        # A document the config names explicitly stays required.
+        config = json.loads(self.config.read_text())
+        config["h3ReviewLedger"] = "work/missing-ledger.json"
+        self.write_json(self.config, config)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(m.get("purpose") == "h3ReviewLedger" for m in ready["missing"]))
+
+    def test_string_beats_are_compared_by_identity(self):
+        rows = [dict(r) for r in self.rows]
+        for row, beat in zip(rows, ("opening", "opening", "opening", "ending")):
+            row["beat"] = beat
+        self.write_rows(rows)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        reasons = [e["narrationBreath"]["reason"] for e in plan["events"] if e["kind"] == "narration"]
+        self.assertEqual(reasons, ["intra-beat", "dialogue-entry", "beat-boundary"])
+        self.assertEqual(timeline._beat_identity({"beat": {"number": 3}}), 3)
+        self.assertIsNone(timeline._beat_identity({}))
+
+    def write_origin(self, name, record):
+        path = self.ep / "work/h3" / name
+        self.write_json(path, record)
+        return {"record": str(path.relative_to(self.ep)), "recordSha256": self.sha(path)}
+
+    def test_version_two_ledger_binds_every_segment_to_its_origin(self):
+        path, ledger = self.ledger()
+        ledger["schemaVersion"] = 2
+        self.write_json(path, ledger)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertEqual(sum(e["type"] == "picture-segment-hash" for e in ready["errors"]), 3)
+        sha = {scene: self.sha(self.ep / f"work/h3/{scene}.mp4") for scene in ("demo-s001", "demo-s002", "demo-s004")}
+        origins = {
+            "demo-s001": dict(kind="h3-ingest", **self.write_origin(
+                "ingest-receipt.json", {"items": [{"id": "demo-s001", "silentSha256": sha["demo-s001"]}]})),
+            "demo-s002": dict(kind="derivative", **self.write_origin(
+                "demo-s002.derive.json", {"sourceSha256": "b" * 64, "outputSha256": sha["demo-s002"],
+                                          "parameters": {"audio": "removed", "fps": 24}})),
+            "demo-s004": dict(kind="kie-video", **self.write_origin(
+                "demo-s004.vid.json", {"sha256": sha["demo-s004"], "outputSha256": sha["demo-s004"],
+                                       "taskId": "offline-task"})),
+        }
+        for scene, origin in origins.items():
+            segment = ledger["entries"][scene]["segments"][0]
+            segment.update(sourceSha256=sha[scene], origin=origin)
+        self.write_json(path, ledger)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        kinds = [c["origin"]["kind"] for b in plan["pictureBlocks"] if b["kind"] != "dialogue-fixed-sync"
+                 for c in b["candidates"]]
+        self.assertEqual(kinds, ["h3-ingest", "derivative", "kie-video"])
+        supplied = self.write_origin("demo-s004.supplied.json", {"fileSha256": sha["demo-s004"]})
+        ledger["entries"]["demo-s004"]["segments"][0]["origin"] = dict(kind="supplied", **supplied)
+        self.write_json(path, ledger)
+        self.assertTrue(timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)[0]["ready"])
+        import copy
+        bad = []
+        changed = copy.deepcopy(ledger)
+        changed["entries"]["demo-s002"]["segments"][0]["origin"]["recordSha256"] = "0" * 64
+        bad.append(changed)
+        changed = copy.deepcopy(ledger)
+        changed["entries"]["demo-s002"]["segments"][0]["origin"].update(self.write_origin(
+            "empty.derive.json", {"sourceSha256": "b" * 64, "outputSha256": sha["demo-s002"], "parameters": {}}))
+        bad.append(changed)
+        changed = copy.deepcopy(ledger)
+        changed["entries"]["demo-s001"]["segments"][0]["origin"]["kind"] = "guess"
+        bad.append(changed)
+        changed = copy.deepcopy(ledger)
+        changed["entries"]["demo-s004"]["segments"][0]["origin"].update(self.write_origin(
+            "other.supplied.json", {"fileSha256": sha["demo-s001"]}))
+        bad.append(changed)
+        for changed in bad:
+            with self.subTest(origin=changed["entries"]):
+                self.write_json(path, changed)
+                ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "picture-origin" for e in ready["errors"]), ready["errors"])
+
+    def test_assembler_keeps_picture_events_silent_and_listed(self):
+        self.make_wordless()
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        import numpy as np
+        work = self.ep / "work/assembly-v1"
+        with mock.patch.object(assembly, "audio", side_effect=lambda *_: np.full((480, 2), 0.1, np.float32)), \
+                mock.patch.object(assembly, "write_audio"):
+            assembly.build_voice(self.ep, work, plan)
+        levels = json.loads((work / "voice-levels.json").read_text())
+        self.assertEqual([row["event"] for row in levels], [e["id"] for e in plan["events"]])
+        self.assertEqual(levels[1], {"event": "demo-s002", "kind": "picture", "voice": None})
+        plan["events"] = [dict(plan["events"][1], audio=plan["events"][0]["audio"])]
+        with mock.patch.object(assembly, "audio") as decode, mock.patch.object(assembly, "write_audio"):
+            with self.assertRaisesRegex(RuntimeError, "must not carry voice"):
+                assembly.build_voice(self.ep, work, plan)
+        decode.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

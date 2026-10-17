@@ -311,6 +311,39 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.SubtitleExportError,'Unbound authored subtitle'):
             self.export()
 
+    def make_picture_event(self, index: int = 5) -> str:
+        """Turn one scene into wordless picture: no voice, no cue, no sync row."""
+        plan = read_json(self.plan_path)
+        event = plan["events"][index]
+        for key in ("subtitleAudioAt", "subtitleAudioDuration", "subtitleTextHi", "subtitleTextEn"):
+            event.pop(key)
+        event.update(kind="picture", audio=None, text="")
+        write_json(self.plan_path, plan)
+        for path in (self.hi_path, self.en_path):
+            timing = read_json(path)
+            timing["shots"] = [s for s in timing["shots"] if s["id"] != event["id"]]
+            write_json(path, timing)
+        sync = read_json(self.sync_path)
+        sync["results"] = [r for r in sync["results"] if r["event"] != event["id"]]
+        sync.update(events=len(sync["results"]), planSha256=exporter.sha256_file(self.plan_path))
+        write_json(self.sync_path, sync)
+        return event["id"]
+
+    def test_wordless_picture_event_produces_no_cue(self) -> None:
+        scene_id = self.make_picture_event()
+        audit = self.export()
+        self.assertEqual(audit["sceneCount"], 144)
+        self.assertEqual(audit["cueCount"], 143)
+        self.assertNotIn(scene_id, json.dumps(audit["coverage"]))
+
+    def test_picture_event_cannot_carry_words(self) -> None:
+        self.make_picture_event()
+        plan = read_json(self.plan_path)
+        plan["events"][5]["subtitleTextEn"] = "Words on a wordless shot."
+        write_json(self.plan_path, plan)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "no voice or subtitle text"):
+            self.export()
+
 
 if __name__ == "__main__":
     unittest.main()

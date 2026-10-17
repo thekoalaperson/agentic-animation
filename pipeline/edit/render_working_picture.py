@@ -31,6 +31,16 @@ def validate(readiness, clock, clock_sha):
         raise RuntimeError('Picture clock does not cover all speech')
 
 
+def ownership_contracts(ep, readiness):
+    """A film whose every row is a lip-sync take needs no picture ledger."""
+    doc=readiness['documents'].get('h3ReviewLedger')
+    if doc is None:
+        return []
+    lp=bound_path(ep,doc['path'],'picture ledger')
+    verify_sha(lp,doc['sha256'],'picture ledger')
+    return json.loads(lp.read_text()).get('pictureOwnershipContracts',[])
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('episode',type=Path);p.add_argument('clock',type=Path)
@@ -39,9 +49,7 @@ def main():
     if platform.system()!='Linux':raise RuntimeError('Rendering belongs on GCP')
     c=json.loads(a.clock.read_text());r=json.loads(a.readiness.read_text())
     ch=sha(a.clock);rh=sha(a.readiness);validate(r,c,ch)
-    doc=r['documents']['h3ReviewLedger'];lp=bound_path(ep,doc['path'],'picture ledger')
-    verify_sha(lp,doc['sha256'],'picture ledger');ledger=json.loads(lp.read_text())
-    plan=dict(c,pictureBlocks=r['pictureBlocks'],pictureOwnershipContracts=ledger.get('pictureOwnershipContracts',[]))
+    plan=dict(c,pictureBlocks=r['pictureBlocks'],pictureOwnershipContracts=ownership_contracts(ep,r))
     out=a.output.resolve()
     if not out.is_relative_to(ep/'work'):raise RuntimeError('Work-only output required')
     out.mkdir(parents=True,exist_ok=False)

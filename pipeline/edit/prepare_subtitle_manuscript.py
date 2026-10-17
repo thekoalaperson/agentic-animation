@@ -15,11 +15,13 @@ def prepare(episode, overrides_path, edits_path, output):
     source = json.loads(overrides_path.read_text())
     edits = json.loads(edits_path.read_text())
     rows = _production_overrides(source)
-    if set(edits) - set(rows):
-        raise ValueError('Unknown scene in translation edits')
+    if set(edits) - {sid for sid, row in rows.items() if row.get('delivery') != 'wordless'}:
+        raise ValueError('Unknown or wordless scene in translation edits')
     effective = {}
     items = []
     for sid, row in rows.items():
+        if row.get('delivery') == 'wordless':
+            continue  # picture only: no words, so nothing to translate or cue
         original = {'hi': row['narration_hi'], 'en': row['narration_en']}
         if row.get('speaker'):
             original = _dialogue_subtitle_text(original['hi'], original['en'], 'spoken-only')

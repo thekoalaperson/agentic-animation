@@ -83,8 +83,9 @@ def main():
     require(append['sha256'] == ref['masterSha256'] == clock['finalSha256'], 'Reference final identity mismatch')
     require(append['bodyAudioPacketsUnchanged'] and append['bodyPicturePacketsUnchanged'] and
             append['decode'] == 'passed' and clock['passed'], 'Reference append was not verified')
-    require(ref['events'] == len(plan['events']) == len(ref['results']), 'Incomplete reference scene coverage')
-    require([r['event'] for r in ref['results']] == [e['id'] for e in plan['events']], 'Scene order changed')
+    voiced = [e for e in plan['events'] if e.get('kind') != 'picture']  # wordless picture has no voice
+    require(ref['events'] == len(voiced) == len(ref['results']), 'Incomplete reference scene coverage')
+    require([r['event'] for r in ref['results']] == [e['id'] for e in voiced], 'Scene order changed')
     shifts = {}
     for stream in ('v:0','a:0'):
         shifts[stream] = uniform_shift(packet_times(a.source_body,stream), packet_times(a.master,stream))

@@ -189,7 +189,8 @@ def _verify_current_timeline(
         raise DeficitPlanBlocked("Not every current Hindi narration line has been measured")
     if int(readiness.get("measuredDialogue", -1)) != dialogue_count:
         raise DeficitPlanBlocked("Not every current approved Grok dialogue take has been measured")
-    if int(readiness.get("storyboardScenes", -1)) != narration_count + dialogue_count:
+    picture_count = int(readiness.get("pictureScenes", 0))
+    if int(readiness.get("storyboardScenes", -1)) != narration_count + dialogue_count + picture_count:
         raise DeficitPlanBlocked("Timeline scene counts are internally inconsistent")
 
     missing = readiness.get("missing")
@@ -227,6 +228,8 @@ def _verify_current_timeline(
         raise DeficitPlanBlocked("Measured clock event count is stale")
     if sum(row.get("kind") == "narration" for row in events) != narration_count:
         raise DeficitPlanBlocked("Measured clock narration count differs from readiness")
+    if sum(row.get("kind") == "picture" for row in events) != picture_count:
+        raise DeficitPlanBlocked("Measured clock picture count differs from readiness")
     if sum(row.get("kind") == "dialogue" for row in events) != dialogue_count:
         raise DeficitPlanBlocked("Measured clock dialogue count differs from readiness")
 
@@ -288,6 +291,10 @@ def _verify_current_timeline(
         if scene_id in event_by_id:
             raise DeficitPlanBlocked(f"Duplicate measured clock scene: {scene_id}")
         event_by_id[scene_id] = event
+        if event.get("kind") == "picture":
+            if event.get("audio") is not None:
+                raise DeficitPlanBlocked(f"Wordless picture event carries voice audio: {scene_id}")
+            continue  # no voice to bind; its picture is checked through the ledger
         media_path = _resolve(episode, repo, clock_path, event.get("audio", ""))
         row = media_evidence.get(str(media_path))
         if row is None or row.get("sha256") != event.get("audioSha256"):

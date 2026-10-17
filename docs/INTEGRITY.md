@@ -10,6 +10,13 @@ parameters. Resolve accepted/current material from recorded decisions rather
 than guessing from filenames. When a source changes, identify dependent outputs
 so an old cache does not masquerade as an updated result.
 
+A picture review ledger at `schemaVersion` 2 admits a segment only when it
+declares its `sourceSha256` and an `origin` (`h3-ingest`, `kie-video`,
+`derivative` or `supplied`) whose hash-bound record names those bytes; a
+derivative record also names its parent hash and parameters. A version-1
+ledger keeps its recorded behaviour. A wordless picture row needs a declared
+`sourceSha256` under either version.
+
 Describe evidence honestly: generated, downloaded, technically checked, sampled,
 watched, and approved mean different things. An optional review record describes
 what was actually reviewed; its absence need not block making an audition.

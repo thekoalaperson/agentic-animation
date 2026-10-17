@@ -147,7 +147,7 @@ def main():
     for row in board['stills']:
         key=row['still_id']
         change = overrides.get(key, {})
-        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason'}:
+        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason', 'delivery', 'voice'}:
             raise ValueError('Unsupported override fields: ' + key)
         row = {**row, **change}
         rec=records[key]
@@ -160,6 +160,15 @@ def main():
         if not recorded_still or recorded_still != sha(still):
             raise ValueError('Still bytes do not match registered sidecar: ' + key)
         speaker=row.get('speaker') or ''
+        if row.get('delivery') == 'wordless':
+            if speaker:
+                raise ValueError('A wordless row cannot name a lip-sync speaker: ' + key)
+            # Picture only: no narration item and no dialogue job.
+            rows.append(dict(id=key, speaker='', delivery='wordless', still=str(still),
+                stillSha256=sha(still), stillSidecar=str(provenance), stillSidecarSha256=sha(provenance),
+                beat=row.get('beat'), historicalH3InputByteBinding='unavailable in original sidecar',
+                status='candidate; no human motion verdict found'))
+            continue
         display=row['narration_hi']
         text=display
         # The speaker column identifies the performer. The authored text is
@@ -173,8 +182,11 @@ def main():
         if speaker:
             dialogues.append(r)
         else:
+            if row.get('voice'):
+                r['voice']=row['voice']
             narration.append(dict(id=key+'-hi',shotId=key,language='hi',
                 displayText=text,text=text,role='narration',
+                **({'speaker':row['voice']} if row.get('voice') else {}),
                 output=f'audio/narration-v1/{key}-hi.mp3'))
     sources=args.h3_sources.resolve() if args.h3_sources else None
     if sources is not None and not sources.is_dir():
@@ -203,6 +215,8 @@ def main():
     save(work/'inventory.json',dict(episode=manifest['episode'],
          boardSha256=sha(board_path),manifestSha256=sha(manifest_path),
          count=len(rows),narrationCount=len(narration),dialogueCount=len(dialogues),
+         **({'wordlessCount':sum(r.get('delivery')=='wordless' for r in rows)}
+            if any(r.get('delivery')=='wordless' for r in rows) else {}),
          historicalH3Count=len(available),missingH3Count=len(rows)-len(available),
          inventoryOnly=args.inventory_only,
          overridesPath=str(args.overrides.resolve()) if args.overrides else None,

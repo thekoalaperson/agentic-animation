@@ -111,8 +111,8 @@ def validate_picture_ownership(plan: dict, segments: list[dict]) -> None:
         if (not owner or not ids or len(set(ids))!=len(ids) or len(positions)!=len(ids)
                 or positions!=list(range(positions[0],positions[0]+len(ids)))
                 or [events[i]['id'] for i in positions]!=ids
-                or any(events[i]['kind']!='narration' for i in positions)):
-            raise RuntimeError('Picture ownership must cover ordered contiguous narration events')
+                or any(events[i]['kind'] not in ('narration','picture') for i in positions)):
+            raise RuntimeError('Picture ownership must cover ordered contiguous narration or picture events')
         start=round(events[positions[0]]['start']*FPS)
         end=round(events[positions[-1]]['end']*FPS)
         owned=[s for s in segments if s.get('sceneId')==owner]
@@ -340,6 +340,13 @@ def build_voice(ep: Path, work: Path, plan: dict) -> Path:
     stem = np.zeros((total, 2), np.float32)
     levels = []
     for event in plan["events"]:
+        if event.get("kind") == "picture":
+            # Wordless picture carries no voice. Keep its row so the level audit
+            # still lists every event in clock order; the stem stays silent here.
+            if event.get("audio") is not None:
+                raise RuntimeError(f"picture event {event['id']} must not carry voice audio")
+            levels.append({"event": event["id"], "kind": "picture", "voice": None})
+            continue
         source = bound_path(ep, event["audio"], f"voice source {event['id']}")
         verify_sha(source, event.get("audioSha256", ""), f"voice source {event['id']}")
         admission = event.get("admission")

@@ -314,6 +314,37 @@ class MeasuredDeficitManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "contains audio"):
             measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
 
+    def add_picture_event(self, **fields):
+        clock = json.loads(self.clock.read_text())
+        event = {"id": "demo-s004", "kind": "picture", "speaker": None, "audio": None,
+                 "picture": None, "start": 7, "duration": 1, "end": 8, **fields}
+        clock["events"].append(event)
+        clock["inputEvidence"]["events"] = clock["events"]
+        clock.update(eventCount=4, runtimeSeconds=8)
+        self.write_json(self.clock, clock)
+        readiness = json.loads(self.readiness.read_text())
+        readiness.update(storyboardScenes=4, pictureScenes=1)
+        readiness["measuredClock"]["sha256"] = self.sha(self.clock)
+        self.write_json(self.readiness, readiness)
+        return readiness
+
+    def test_wordless_picture_event_needs_no_voice_binding(self):
+        self.add_picture_event()
+        result = measured_deficit.build(self.ep, self.config, wave=1, extractor=self.fake_extract)
+        self.assertTrue(result["readyForH100"])
+        self.assertEqual(result["exactDeficitFrames"], 24)
+
+    def test_picture_event_counts_and_silence_are_checked(self):
+        readiness = self.add_picture_event(audio="audio/narration-v1/s001.mp3")
+        with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "carries voice"):
+            measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
+        self._make_fixture()
+        readiness = self.add_picture_event()
+        readiness.update(pictureScenes=0, storyboardScenes=3)
+        self.write_json(self.readiness, readiness)
+        with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "complete storyboard"):
+            measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
+
 
 if __name__ == "__main__":
     unittest.main()

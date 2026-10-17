@@ -304,6 +304,129 @@ def _production_overrides(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+DELIVERIES = {"synced", "unsynced", "wordless"}
+PICTURE_ROUTES = {"h3", "picture"}  # "h3" is the historical name of the silent picture route
+ORIGIN_KINDS = {"h3-ingest", "kie-video", "derivative", "supplied"}
+
+
+def _beat_identity(row: dict[str, Any] | None) -> Any:
+    """A beat may be authored as an object with a number or as a bare scalar."""
+    beat = row.get("beat") if isinstance(row, dict) else None
+    return beat.get("number") if isinstance(beat, dict) else beat
+
+
+def _row_delivery(row: dict[str, Any], override: dict[str, Any]) -> tuple[str, str | None]:
+    """Classify one storyboard row as dialogue, narration or picture.
+
+    Routing still follows the storyboard ``speaker``: any truthy speaker is a
+    lip-sync take. ``delivery`` and ``voice`` may come from the storyboard row
+    or from the frozen production override; when both carry one they must agree.
+    Returns ``(kind, voice)``; raises ValueError naming the row.
+    """
+    scene_id = row.get("still_id")
+    values = {}
+    for key in ("delivery", "voice"):
+        own, frozen = row.get(key), override.get(key)
+        if own is not None and frozen is not None and own != frozen:
+            raise ValueError(f"{scene_id}: storyboard {key} {own!r} differs from production override {frozen!r}")
+        values[key] = own if own is not None else frozen
+    delivery, voice = values["delivery"], values["voice"]
+    if delivery is not None and delivery not in DELIVERIES:
+        raise ValueError(f"{scene_id}: unknown delivery {delivery!r}; use synced, unsynced or wordless")
+    if voice is not None and (not isinstance(voice, str) or not voice.strip()):
+        raise ValueError(f"{scene_id}: voice must name who is heard")
+    if row.get("speaker"):
+        if delivery not in (None, "synced") or voice is not None:
+            raise ValueError(
+                f"{scene_id}: a storyboard speaker always routes to a lip-sync take; "
+                "a voice heard over picture is written as delivery 'unsynced' with 'voice' and no speaker")
+        return "dialogue", None
+    if delivery == "synced":
+        raise ValueError(f"{scene_id}: synced delivery needs a storyboard speaker")
+    if delivery == "wordless":
+        if voice is not None:
+            raise ValueError(f"{scene_id}: a wordless row has no voice")
+        return "picture", None
+    return "narration", voice
+
+
+def _picture_rule(row: dict[str, Any]) -> tuple[str, int | None]:
+    """Return a picture row's duration rule and, for an authored hold, its frames."""
+    scene_id = row.get("still_id")
+    rule = row.get("durationRule")
+    seconds, frames = row.get("holdSeconds"), row.get("holdFrames")
+    if seconds is not None and frames is not None:
+        raise ValueError(f"{scene_id}: give holdSeconds or holdFrames, not both")
+    held = seconds is not None or frames is not None
+    if rule is None:
+        rule = "authored" if held else "take"
+    if rule == "take":
+        if held:
+            raise ValueError(f"{scene_id}: a take-clocked picture row takes its length from the accepted take; remove the hold")
+        return "take", None
+    if rule != "authored":
+        raise ValueError(f"{scene_id}: a picture row is clocked by 'take' or 'authored', not {rule!r}")
+    if frames is not None:
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames <= 0:
+            raise ValueError(f"{scene_id}: holdFrames must be a positive integer")
+        return "authored", frames
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
+        raise ValueError(f"{scene_id}: an authored hold needs positive finite holdSeconds or holdFrames")
+    exact = seconds * DELIVERY_FPS
+    if abs(exact - round(exact)) > 1e-6:
+        raise ValueError(f"{scene_id}: holdSeconds {seconds} is not a whole number of {DELIVERY_FPS} fps frames")
+    return "authored", round(exact)
+
+
+def _speech_rule(row: dict[str, Any]) -> None:
+    scene_id = row.get("still_id")
+    if row.get("durationRule") not in (None, "speech") or any(
+            row.get(key) is not None for key in ("holdSeconds", "holdFrames")):
+        raise ValueError(f"{scene_id}: a speech row is clocked by its measured audio; durationRule must be 'speech' with no hold")
+
+
+def _peek_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _verify_segment_origin(episode: Path, repo: Path, ledger_path: Path,
+                           segment: dict[str, Any], source_sha: str) -> dict[str, Any]:
+    """Bind a version-2 ledger segment to the record that produced its bytes."""
+    origin = segment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") not in ORIGIN_KINDS:
+        raise ValueError(f"segment must record its origin as one of {sorted(ORIGIN_KINDS)}")
+    record_path = _resolve_path(episode, repo, ledger_path, origin.get("record") or "")
+    if not origin.get("record") or not _is_below(record_path, episode):
+        raise ValueError("origin record must be ingested below the episode root")
+    record_sha = _require_hex_sha(origin.get("recordSha256"), "origin recordSha256")
+    if not record_path.is_file() or _sha256(record_path) != record_sha:
+        raise ValueError(f"origin record is missing or its hash changed: {record_path}")
+    record = _read_json_evidence(record_path, "picture origin record")
+    kind = origin["kind"]
+    if kind == "h3-ingest":
+        items = record.get("items")
+        bound = record.get("sha256") == source_sha or (isinstance(items, list) and any(
+            isinstance(item, dict) and item.get("silentSha256") == source_sha for item in items))
+    elif kind == "kie-video":
+        bound = (record.get("outputSha256") == source_sha and record.get("sha256") == source_sha
+                 and isinstance(record.get("taskId"), str) and bool(record["taskId"]))
+    elif kind == "derivative":
+        parent = str(record.get("sourceSha256") or "")
+        bound = (record.get("outputSha256") == source_sha
+                 and re.fullmatch(r"[0-9a-f]{64}", parent) is not None and parent != source_sha
+                 and isinstance(record.get("parameters"), dict) and bool(record["parameters"]))
+    else:
+        bound = source_sha in (record.get("sha256"), record.get("fileSha256"))
+    if not bound:
+        raise ValueError(f"{kind} origin record does not name this source hash")
+    return {"kind": kind, "record": _portable_path(record_path, episode), "recordSha256": record_sha}
+
+
 def _state_path_matches(recorded: Any, actual: Path, episode: Path,
                         original_episode_root: Any = None) -> bool:
     """Retain immutable worker receipts across an explicitly declared relocation.
@@ -501,12 +624,16 @@ def _candidate_output(row: dict[str, Any], episode: Path) -> dict[str, Any]:
         result["microCutJustification"] = row["microCutJustification"]
     if row.get("continuationOf"):
         result["continuationOf"] = row["continuationOf"]
+    if row.get("origin"):
+        result["origin"] = row["origin"]
     return result
 
 
 def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str) -> dict[str, Any]:
     shots = []
     for event in events:
+        if event["kind"] == "picture":
+            continue  # wordless picture produces no cue
         text = event["subtitleTextHi" if language == "hi" else "subtitleTextEn"]
         shots.append(
             {
@@ -516,7 +643,7 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
                 "audioAt": event["subtitleAudioAt"],
                 "audioDuration": event["subtitleAudioDuration"],
                 "dialogue": event["kind"] == "dialogue",
-                "speaker": event.get("speaker"),
+                "speaker": event.get("speaker") or event.get("voice"),
                 "text": text,
                 "sourceLanguage": "hi",
             }
@@ -589,16 +716,37 @@ def build_timeline(
         }
         return value
 
-    required_docs = {
-        "storyboard": config.get("storyboard", "story/storyboard_plan.json"),
-        "narrationManifest": config.get(
+    # Which lane documents a film needs depends on what its rows are. Peek at
+    # the storyboard and override first; the loop below still reports them.
+    storyboard_raw = config.get("storyboard", "story/storyboard_plan.json")
+    peek_rows = _peek_json(_resolve_path(episode, repo, config_path, storyboard_raw)).get("stills")
+    peek_overrides: dict[str, dict[str, Any]] = {}
+    if config.get("productionOverrides"):
+        try:
+            peek_overrides = _production_overrides(_peek_json(
+                _resolve_path(episode, repo, config_path, config["productionOverrides"])))
+        except ValueError:
+            peek_overrides = {}
+    peek_kinds = set()
+    for row in peek_rows if isinstance(peek_rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            peek_kinds.add(_row_delivery(row, peek_overrides.get(str(row.get("still_id")), {}))[0])
+        except ValueError:
+            peek_kinds.add("dialogue" if row.get("speaker") else "narration")
+    if not isinstance(peek_rows, list) or not peek_rows:
+        peek_kinds = {"narration", "dialogue"}  # unreadable board: keep every lane required
+    required_docs = {"storyboard": storyboard_raw}
+    if "narration" in peek_kinds or "narrationManifest" in config:
+        required_docs["narrationManifest"] = config.get(
             "narrationManifest", "work/narration-hi-v1/manifest.json"
-        ),
-        "dialogueManifest": config.get(
-            "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
-        ),
-        "h3ReviewLedger": config.get("h3ReviewLedger", "work/h3-review-ledger-v1.json"),
-    }
+        )
+    required_docs["dialogueManifest"] = config.get(
+        "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
+    )
+    if peek_kinds & {"narration", "picture"} or "h3ReviewLedger" in config:
+        required_docs["h3ReviewLedger"] = config.get("h3ReviewLedger", "work/h3-review-ledger-v1.json")
     if config.get("productionOverrides"):
         required_docs["productionOverrides"] = config["productionOverrides"]
     if config.get('subtitleManuscript'):
@@ -635,10 +783,10 @@ def build_timeline(
         raise TimelineIncomplete("Required timeline documents are missing or invalid")
 
     storyboard_path, storyboard = docs["storyboard"]
-    narration_path, narration_doc = docs["narrationManifest"]
+    narration_path, narration_doc = docs.get("narrationManifest", (None, {}))
     dialogue_path, dialogue_doc = docs["dialogueManifest"]
-    ledger_path, ledger_doc = docs["h3ReviewLedger"]
-    ledger_available = ledger_path.is_file()
+    ledger_path, ledger_doc = docs.get("h3ReviewLedger", (None, {}))
+    ledger_available = ledger_path is not None and ledger_path.is_file()
     try:
         overrides = _production_overrides(docs.get("productionOverrides", (config_path, {}))[1])
     except ValueError as exc:
@@ -650,6 +798,32 @@ def build_timeline(
     scene_ids = [str(row.get("still_id", "")) for row in rows]
     if len(scene_ids) != len(set(scene_ids)) or any(not item for item in scene_ids):
         errors.append({"type": "storyboard", "error": "Scene IDs are empty or duplicated"})
+
+    # One classification for every later branch: dialogue (a lip-sync take),
+    # narration (speech heard over picture, any voice) or picture (wordless).
+    row_kind: dict[str, str] = {}
+    row_voice: dict[str, str] = {}
+    picture_rule: dict[str, tuple[str, int | None]] = {}
+    for row in rows:
+        scene_id = str(row.get("still_id", ""))
+        try:
+            kind, voice = _row_delivery(row, overrides.get(scene_id, {}))
+            if kind == "picture":
+                picture_rule[scene_id] = _picture_rule(row)
+            else:
+                _speech_rule(row)
+        except ValueError as exc:
+            errors.append({"type": "storyboard-delivery", "sceneId": scene_id, "error": str(exc)})
+            kind, voice = ("dialogue" if row.get("speaker") else "narration"), None
+            if kind == "narration" and "narration_hi" not in row:
+                kind = "invalid"
+        row_kind[scene_id] = kind
+        if voice:
+            row_voice[scene_id] = voice
+    ledger_version = ledger_doc.get("schemaVersion", 1) if ledger_available else 1
+    if isinstance(ledger_version, bool) or not isinstance(ledger_version, int) or ledger_version < 1:
+        errors.append({"type": "h3-ledger", "error": "ledger schemaVersion must be a positive integer"})
+        ledger_version = 2  # unknown versions get the stricter origin rule
 
     narration = _narration_entries(narration_doc)
     dialogues = _dialogue_entries(dialogue_doc)
@@ -679,17 +853,14 @@ def build_timeline(
                 "actual": production_sha,
             })
 
-    narration_state_path = _resolve_path(
-        episode,
-        repo,
-        config_path,
-        config.get(
-            "narrationState",
-            str(narration_path.with_suffix(".eleven-state.json")),
-        ),
+    narration_state_raw = config.get(
+        "narrationState",
+        str(narration_path.with_suffix(".eleven-state.json")) if narration_path else None,
     )
+    narration_state_path = (_resolve_path(episode, repo, config_path, narration_state_raw)
+                            if narration_state_raw else None)
     narration_state: dict[str, Any] | None = None
-    if narration_state_path.is_file():
+    if narration_state_path is not None and narration_state_path.is_file():
         try:
             narration_state = _read_json_evidence(narration_state_path, "narration finite state")
             if narration_state.get("manifestSha256") != _sha256(narration_path):
@@ -702,7 +873,7 @@ def build_timeline(
     for row in rows:
         scene_id = str(row["still_id"])
         override = overrides.get(scene_id, {})
-        if row.get("speaker"):
+        if row_kind[scene_id] == "dialogue":
             effective_hi = str(override.get("narration_hi") or row["narration_hi"])
             source_scene_id = dialogue_outputs.get(scene_id, {}).get("sourceSceneId", scene_id) if isinstance(dialogue_outputs.get(scene_id), dict) else scene_id
             dialogue_row = dialogues.get(source_scene_id, {})
@@ -722,6 +893,8 @@ def build_timeline(
                 effective_hi, str(override.get("narration_en") or row["narration_en"]),
                 config.get('dialogueSubtitleMode', 'source'))
             continue
+        if row_kind[scene_id] != "narration":
+            continue  # picture rows carry no words and produce no subtitle
         narration_row = narration.get(scene_id, {})
         submitted_hi = str(narration_row.get("text") or row["narration_hi"])
         if override.get("narration_hi") and override["narration_hi"] != submitted_hi:
@@ -759,9 +932,14 @@ def build_timeline(
         route = str(entry.get("pictureRoute", "")).strip().lower()
         routes[scene_id] = route
         expected_route = "grok-dialogue" if row.get("speaker") else "h3"
-        if route not in {"h3", "grok-dialogue", "omit"}:
+        if route not in PICTURE_ROUTES | {"grok-dialogue", "omit"}:
             errors.append({"type": "h3-route", "sceneId": scene_id, "route": route})
             continue
+        if (row_kind[scene_id] == "picture" and route == "omit"
+                and picture_rule.get(scene_id, ("take",))[0] == "take"):
+            errors.append({"type": "picture-route", "sceneId": scene_id,
+                           "error": "a take-clocked picture row needs its own accepted segment; "
+                                    "a row whose picture a neighbour owns needs an authored hold"})
         if row.get("speaker") and route != "grok-dialogue":
             errors.append(
                 {
@@ -808,6 +986,20 @@ def build_timeline(
                     }
                 )
                 continue
+            origin = None
+            if (ledger_version >= 2 or row_kind[scene_id] == "picture") and not declared_sha:
+                # A version-2 ledger, and every wordless picture row, admits
+                # only segments whose bytes the ledger itself names.
+                errors.append({"type": "picture-segment-hash", "sceneId": scene_id, "index": index,
+                               "error": "accepted segment must declare its sourceSha256"})
+                continue
+            if ledger_version >= 2:
+                try:
+                    origin = _verify_segment_origin(episode, repo, ledger_path, segment, actual_sha)
+                except ValueError as exc:
+                    errors.append({"type": "picture-origin", "sceneId": scene_id, "index": index,
+                                   "source": str(source), "error": str(exc)})
+                    continue
             if info.video_streams != 1 or info.audio_streams != 0:
                 errors.append(
                     {
@@ -887,6 +1079,8 @@ def build_timeline(
                 "role": role,
                 "verdict": verdict,
             }
+            if origin is not None:
+                candidate["origin"] = origin
             if segment.get("continuationOf") is not None:
                 try:
                     link = segment['continuationOf']
@@ -947,7 +1141,11 @@ def build_timeline(
                     )
             candidates.append(candidate)
         h3_by_scene[scene_id] = candidates
-        if route == "h3" and not candidates and dry_run:
+        if (row_kind[scene_id] == "picture" and route in PICTURE_ROUTES and not candidates
+                and picture_rule.get(scene_id, ("take",))[0] == "take"):
+            # The take is this row's clock; without one there is nothing to measure.
+            missing.append({"type": "picture-take", "sceneId": scene_id})
+        elif route in PICTURE_ROUTES and not candidates and dry_run:
             missing.append({"type": "approved-h3-coverage", "sceneId": scene_id})
 
     # Resolve and measure the complete speech inventory before writing timings.
@@ -955,7 +1153,9 @@ def build_timeline(
     dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]] = {}
     for row in rows:
         scene_id = str(row["still_id"])
-        if row.get("speaker"):
+        if row_kind[scene_id] in ("picture", "invalid"):
+            continue  # wordless picture needs no speech admission
+        if row_kind[scene_id] == "dialogue":
             selection = dialogue_outputs.get(scene_id)
             source_scene_id = selection.get("sourceSceneId", scene_id) if isinstance(selection, dict) else scene_id
             entry = dialogues.get(source_scene_id)
@@ -1269,7 +1469,8 @@ def build_timeline(
                 ]
                 if state_item.get("status") != "DOWNLOADED" or len(state_matches) != 1:
                     raise ValueError(f"{movement}: score finite state does not admit this candidate")
-                required_bindings = [score_manifest_path, narration_path, dialogue_path]
+                required_bindings = [path for path in (score_manifest_path, narration_path, dialogue_path)
+                                     if path is not None]
                 if production_path:
                     required_bindings.append(production_path)
                 review = _review_approval(
@@ -1298,8 +1499,10 @@ def build_timeline(
         "ready": not missing and not errors,
         "dryRun": dry_run,
         "storyboardScenes": len(rows),
-        "narrationScenes": sum(not bool(row.get("speaker")) for row in rows),
-        "dialogueScenes": sum(bool(row.get("speaker")) for row in rows),
+        "narrationScenes": sum(kind == "narration" for kind in row_kind.values()),
+        "dialogueScenes": sum(kind == "dialogue" for kind in row_kind.values()),
+        **({"pictureScenes": sum(kind == "picture" for kind in row_kind.values())}
+           if "picture" in row_kind.values() else {}),
         "measuredNarration": len(narration_media),
         "measuredDialogue": len(dialogue_media),
         "approvedH3Scenes": sum(bool(value) for value in h3_by_scene.values()),
@@ -1316,7 +1519,7 @@ def build_timeline(
         "media": measured,
         "outputsWritten": [str(readiness_path)],
     }
-    if narration_state_path.is_file():
+    if narration_state_path is not None and narration_state_path.is_file():
         readiness["documents"]["narrationState"] = {
             "path": str(narration_state_path), "sha256": _sha256(narration_state_path)
         }
@@ -1340,7 +1543,7 @@ def build_timeline(
     breath_overrides = config.get("narrationBreathOverrides", {})
     if not isinstance(breath_overrides, dict):
         raise TimelineIncomplete("narrationBreathOverrides must map scene IDs to seconds and reason")
-    narration_ids = {str(row['still_id']) for row in rows if not row.get('speaker')}
+    narration_ids = {scene_id for scene_id, kind in row_kind.items() if kind == 'narration'}
     for scene_id, override in breath_overrides.items():
         if scene_id not in narration_ids or not isinstance(override, dict):
             raise TimelineIncomplete(f"Narration breath override has no narration scene: {scene_id}")
@@ -1453,11 +1656,39 @@ def build_timeline(
                 "subtitleTextEn": effective_text[scene_id]["en"],
             }
             cursor_frames += duration_frames
+        elif row_kind[scene_id] == "picture":
+            rule, hold_frames = picture_rule[scene_id]
+            if rule == "take":
+                duration_frames = sum(int(c["availableFrames"]) for c in h3_by_scene.get(scene_id, []))
+            else:
+                duration_frames = hold_frames
+            if not duration_frames:
+                raise TimelineIncomplete(f"Picture row {scene_id} has no accepted take to clock it")
+            duration = duration_frames / DELIVERY_FPS
+            # Wordless picture: no voice, no subtitle cue, no narration breath.
+            event = {
+                "id": scene_id,
+                "shot": _scene_number(scene_id),
+                "kind": "picture",
+                "speaker": None,
+                "audio": None,
+                "picture": None,
+                "start": round(start, 6),
+                "duration": round(duration, 6),
+                "end": round(start + duration, 6),
+                "durationRule": {"rule": rule, "frames": duration_frames,
+                                 "basis": ("measured accepted take at its authored speed" if rule == "take"
+                                           else "authored frame-aligned hold filled from accepted segments")},
+                "text": "",
+            }
+            cursor_frames += duration_frames
+            events.append(event)
+            continue
         else:
             source, info = narration_media[scene_id]
             audio_duration = info.audio_duration or info.duration
             next_row = rows[index + 1] if index + 1 < len(rows) else None
-            if next_row is None or next_row.get("beat", {}).get("number") != row.get("beat", {}).get("number"):
+            if next_row is None or _beat_identity(next_row) != _beat_identity(row):
                 breath_target = beat_end_target
                 breath_reason = "beat-boundary"
             elif next_row.get("speaker"):
@@ -1483,6 +1714,7 @@ def build_timeline(
                 "shot": _scene_number(scene_id),
                 "kind": "narration",
                 "speaker": None,
+                **({"voice": row_voice[scene_id]} if scene_id in row_voice else {}),
                 "audio": _portable_path(source, episode),
                 "picture": None,
                 "audioSha256": measured[str(source)]["sha256"],
@@ -1571,7 +1803,10 @@ def build_timeline(
             continue
 
         end_index = index
-        while end_index < len(events) and events[end_index]["kind"] == "narration":
+        # Wordless picture joins the neighbouring narration run, so an authored
+        # hold is filled by trimming accepted takes and causal borrowing works
+        # across it exactly as it does between narration events.
+        while end_index < len(events) and events[end_index]["kind"] in ("narration", "picture"):
             end_index += 1
         block_events = events[index:end_index]
         target_by_scene = {
@@ -1818,6 +2053,8 @@ def build_timeline(
         "eventCount": len(events),
         "narrationCount": sum(row["kind"] == "narration" for row in events),
         "dialogueCount": sum(row["kind"] == "dialogue" for row in events),
+        **({"pictureCount": sum(row["kind"] == "picture" for row in events)}
+           if any(row["kind"] == "picture" for row in events) else {}),
         "pictureBlockCount": len(blocks),
         "coverageBorrowing": coverage_borrowing,
         "explicitH3Retimes": explicit_retimes,

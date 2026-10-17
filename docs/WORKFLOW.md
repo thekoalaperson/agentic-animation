@@ -29,6 +29,25 @@ narration, Suno/Kie score, and self-hosted effects. The current packaging/subtit
 preset supports Hindi performance and Hindi/English subtitles. That describes
 what has been implemented and exercised, not what every film should be.
 
+A row of the film can be spoken on camera, heard over picture, or wordless, and
+the pipe script's optional fifth column, `delivery`, says which. `synced` (the
+default for a named speaker) routes the line to a lip-sync take. `unsynced`
+keeps the speaker's name as `voice` and sends the line through the narration
+lane, clocked by its measured file, with subtitles that name that voice;
+`Narrator` is shorthand for this. A `wordless` row is written with the speaker
+`-` and empty text and becomes a picture event with no voice, no breath and no
+subtitle cue. The storyboard row may carry the same `delivery` and `voice`. A
+picture row is clocked by its accepted take (`durationRule: take`, the default)
+or by an authored hold (`holdSeconds` or `holdFrames` on the storyboard row, a
+whole number of frames)
+that the timeline fills by trimming accepted, hash-bound segments; a shortfall
+is reported like any other coverage deficit. One cost to know before choosing:
+an `unsynced` line in the ElevenLabs lane is a second voice for that character
+and will not match the same character's on-camera Grok voice. The other way to
+put a character's voice over other picture, a Grok take of that speaker used
+for its audio only, needs picture windows the timeline does not have yet, and
+carries its own identity trade-offs.
+
 Research, source grounding, animatics, auditions, and reviews are useful when
 they resolve a real uncertainty. They do not need to become rituals. Make an
 initial mix to hear it; refine what matters. Preserve useful source-bound

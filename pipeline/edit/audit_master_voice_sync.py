@@ -66,7 +66,11 @@ def main():
         raise RuntimeError("Master audio ends before the authored voice timeline")
     rows = []
     radius = round(.15 * SR)
+    skipped = []
     for event in plan["events"]:
+        if event.get("kind") == "picture":
+            skipped.append(event["id"])  # wordless picture has no voice to align
+            continue
         lo,hi=event['start'],event['end']
         if args.measured_speech_window:
             lo=event['start']+event['subtitleAudioAt']
@@ -99,6 +103,8 @@ def main():
               "timingPassed": all(abs(x["lagSeconds"]) <= args.max_lag for x in rows),
               "voicePresencePassed": all(x["correlation"] >= args.min_correlation for x in rows),
               "passed": all(x["pass"] for x in rows), "results": rows}
+    if skipped:
+        result["pictureEventsWithoutVoice"] = skipped
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k:v for k,v in result.items() if k != "results"}, indent=2))
     if not result["passed"]:
