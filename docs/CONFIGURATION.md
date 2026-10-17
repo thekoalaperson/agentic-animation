@@ -20,8 +20,10 @@ Read the relevant command's `--help`; a profile does not override every argument
 `providers.kie.usdPerCredit` is the operator's own reading of the Kie price.
 Dry runs and sidecars use it to show dollars beside credits. It has no default,
 and without it the tools show credits only. `AGENTIC_UPLOAD_LOG` names the file
-where `_common.upload_ref` appends one line per upload. The paid runners point
-it at the project's `work/upload-log.jsonl`.
+where `_common.upload_ref` appends one line per upload, and `upload_ref` refuses
+to upload without a log. The paid runners point it at the project's
+`work/upload-log.jsonl`. Run directly with the variable unset, `kie_video.py`
+writes `upload-log.jsonl` beside its output stem.
 
 Project structure remains small:
 

@@ -132,6 +132,27 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             upload.assert_not_called()
             self.assertEqual(len(creates), 1)
 
+    def test_direct_upload_is_logged_beside_the_output_without_configuration(self):
+        common = sys.modules[VIDEO.upload_ref.__module__]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, frame, stem, argv, source_sha, *_ = self.fixture(Path(tmp))
+
+            def kie(route, payload=None):
+                if route == "chat/credit":
+                    return 1000
+                raise RuntimeError("offline: stop before any generation request")
+
+            reply = {"data": {"downloadUrl": "https://files.invalid/frame.png"}}
+            with mock.patch.dict(VIDEO.os.environ), \
+                 mock.patch.object(common, "http_json", return_value=reply), \
+                 mock.patch.object(common, "env_key", return_value="offline"), \
+                 mock.patch.object(VIDEO, "kie", side_effect=kie):
+                VIDEO.os.environ.pop("AGENTIC_UPLOAD_LOG", None)
+                with self.assertRaises(RuntimeError):
+                    VIDEO.main(argv)
+            lines = (stem.parent / "upload-log.jsonl").read_text().splitlines()
+            self.assertEqual([json.loads(line)["sha256"] for line in lines], [source_sha])
+
     def test_incomplete_landed_pair_refuses_before_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, stem, argv, *_ = self.fixture(Path(tmp))
@@ -145,7 +166,8 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             kie.assert_not_called()
 
     def test_recorded_pending_task_is_polled_without_a_second_generation_post(self):
-        for extra, receipt in (([], 27), (["--resume-only"], 27), ([], None)):
+        for extra, receipt in (([], 27), (["--resume-only"], 27), ([], None),
+                               (["--resume-only"], None)):
             with self.subTest(extra=extra, receipt=receipt):
                 self.recover_recorded_pending_task(extra, receipt)
 
@@ -220,7 +242,10 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
                 upload.assert_not_called()
                 self.assertNotIn("chat/credit", calls)
             meta = json.loads(stem.with_suffix(".vid.json").read_text(encoding="utf-8"))
-            if receipt is None:
+            if receipt is None and extra:
+                # Resume-only reads no wallet: without a receipt the charge is unknown.
+                self.assertEqual((meta["credits"], meta["creditsSource"]), (None, None))
+            elif receipt is None:
                 # Wallet deltas can overlap concurrent jobs; they are labelled.
                 self.assertEqual((meta["credits"], meta["creditsSource"]), (20.0, "wallet-delta"))
             else:

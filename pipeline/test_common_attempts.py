@@ -59,6 +59,17 @@ class UploadLogTest(unittest.TestCase):
             self.assertEqual(lines[0]["providerHost"], "kieai.redpandaai.co")
             self.assertTrue(lines[0]["remoteName"].endswith("_demo-s001.png"))
 
+    def test_nothing_is_uploaded_without_a_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            still = Path(tmp) / "demo-s001.png"
+            still.write_bytes(b"offline still")
+            with mock.patch.dict(_common.os.environ), \
+                 mock.patch.object(_common, "http_json") as post:
+                _common.os.environ.pop("AGENTIC_UPLOAD_LOG", None)
+                with self.assertRaisesRegex(ValueError, "without an upload log"):
+                    _common.upload_ref(still)
+            post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

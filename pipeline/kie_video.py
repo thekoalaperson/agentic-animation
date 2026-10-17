@@ -15,7 +15,12 @@ clips carry embedded audio.
 
 --print-request shows the provider body with placeholder URLs and never
 uploads, reads a credential or wallet, or touches a recovery record.
---resume-only polls an already-recorded task and refuses to create one."""
+--resume-only polls an already-recorded task and refuses to create one. It
+never uploads or reads a wallet, so a landed task without a provider receipt
+records credits and creditsSource as null.
+
+Every upload is appended to AGENTIC_UPLOAD_LOG, or, when that is unset, to
+upload-log.jsonl beside the output stem."""
 import argparse, hashlib, json, os, pathlib, re, sys, time
 import urllib.parse
 import urllib.request
@@ -515,15 +520,29 @@ def main(argv=None):
         sys.exit(f'no recorded paid task to resume at {landed_pending}; '
                  'resume-only never creates a generation request')
     # Read before any paid call so a malformed profile cannot fail after one.
-    usd_rate = usd_per_credit()
+    # Recovery of an already-paid task must not be blocked by it.
+    try:
+        usd_rate = usd_per_credit()
+    except ValueError as exc:
+        if not resume_only:
+            sys.exit(str(exc))
+        print(f'{exc}; recovering without a USD figure', file=sys.stderr)
+        usd_rate = None
     t0 = time.time()
     if resume_only:
         # Recovery polls a recorded taskId; it never uploads or reads a wallet.
         inp = wallet_before = None
     else:
-        url = upload_ref(frame)
+        # The log records which bytes left the machine and where they went.
+        upload_log = (os.environ.get('AGENTIC_UPLOAD_LOG')
+                      or str(landed.resolve().parent / 'upload-log.jsonl'))
+
+        def upload(path):
+            return upload_ref(path, upload_log)
+
+        url = upload(frame)
         wallet_before = kie('chat/credit')
-        inp = build_input(model, prompt, url, upload_ref, **input_options)
+        inp = build_input(model, prompt, url, upload, **input_options)
     # Persist uncertainty *before* the paid POST.  A crash in the small interval
     # between provider acceptance and receiving a taskId must block, never turn
     # into a second automatic generation.
@@ -630,7 +649,7 @@ def main(argv=None):
     # other tasks running at the same time, so it is labelled as such.
     credits = rec.get('creditsConsumed')
     credits_source = 'receipt' if credits is not None else None
-    if credits is None:
+    if credits is None and not resume_only:
         saved = read_json(pending, 'pending recovery record')
         before = saved.get('walletBefore', wallet_before)
         if before is not None:
@@ -678,7 +697,8 @@ def main(argv=None):
                   sidecarSha256=file_sha256(landed_meta), landedAt=time.time())
     atomic_json(pending, orphan, replace=True)
     pending.unlink()
-    cost = f'${meta["cost_usd"]}' if meta['cost_usd'] is not None else f'{credits} credits'
+    cost = (f'${meta["cost_usd"]}' if meta['cost_usd'] is not None
+            else f'{credits} credits' if credits is not None else 'credits not reported')
     print(f'{landed}  {cost}  {meta["secs"]}s  {model} {res}')
 
 if __name__ == '__main__':

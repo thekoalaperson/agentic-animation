@@ -301,9 +301,14 @@ def upload_ref(p, log=None):
     """Upload one file to Kie's file host and return its URL.
 
     Each upload is appended to ``log`` (or ``AGENTIC_UPLOAD_LOG``), a
-    project-local record of which bytes left the machine and where.
+    project-local record of which bytes left the machine and where. With
+    neither, nothing is uploaded.
     """
     p = pathlib.Path(p)
+    log = log or os.environ.get('AGENTIC_UPLOAD_LOG')
+    if not log:
+        raise ValueError(f'refusing to upload {p.name} without an upload log: '
+                         'pass a log path or set AGENTIC_UPLOAD_LOG')
     mime = mimetypes.guess_type(p.name)[0] or 'image/png'
     raw = p.read_bytes()
     data = f'data:{mime};base64,' + base64.b64encode(raw).decode()
@@ -318,10 +323,6 @@ def upload_ref(p, log=None):
     url = d.get('downloadUrl') or d.get('fileUrl') or d.get('url')
     if not url:
         sys.exit('upload gave no URL: ' + json.dumps(r)[:400])
-    log = log or os.environ.get('AGENTIC_UPLOAD_LOG')
-    if log:
-        log_upload(log, raw, urllib.parse.urlsplit(UPLOAD).hostname, remote_name)
-    else:
-        print(f'upload of {p.name} not logged: set AGENTIC_UPLOAD_LOG', file=sys.stderr)
+    log_upload(log, raw, urllib.parse.urlsplit(UPLOAD).hostname, remote_name)
     return url
 
