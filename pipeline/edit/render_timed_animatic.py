@@ -20,7 +20,9 @@ available, and --no-cards renders the stills with no text at all.
 
 --from-storyboard writes a plan instead of rendering: measured narration
 where the file exists, an explicit estimatedSeconds where authored, and a
-refusal naming the row otherwise.
+refusal naming the row otherwise. The one font it finds (--font, else the
+profile's) is written as both the latin and hi roles, so a plan that the worker
+will render needs a font that covers every script its cards use.
 """
 import argparse
 import hashlib
@@ -39,6 +41,7 @@ import _common
 
 MODES = ('narration', 'scratch-dialogue', 'hold')
 PREVIEW = '-preview-not-final'
+WORKER_ENCODER = 'libx264 on qualified GPU worker; no Mac processing'
 
 
 def sha(path):
@@ -134,6 +137,22 @@ def _font_families(fonts, font_dir):
     return families
 
 
+def segment_identity(row, tool, fonts, preview=None):
+    """A segment's cache identity: the worker's three keys, plus a preview's own."""
+    identity = {'scene': row, 'tool': tool, 'fonts': {k: sha(v) for k, v in fonts.items()}}
+    if preview is not None:
+        identity.update(preview=True, **preview)
+    return identity
+
+
+def segment_receipt(row, output, source_card, preview=False):
+    record = {'id': row['id'], 'sha256': sha(output), 'frames': row['frames'],
+              'plannedAudioSamples': row['frames'] * 2000, 'sourceCardSha256': sha(source_card), 'finalApproved': False}
+    if preview:
+        record['preview'] = True
+    return record
+
+
 def card_label(row):
     return row['id'] + ' | ' + row['mode'].upper() + ' | ' + row['sourceStatus']
 
@@ -192,14 +211,19 @@ Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackC
             'attempts': attempts}
 
 
+def complex_refusal(row, reason):
+    return ValueError('Card text for ' + row['id'] + ' needs complex shaping, and ' + reason
+                      + '; pass --no-cards, or --font with a font that covers it on a host whose ffmpeg '
+                      'has libass with HarfBuzz and fontconfig')
+
+
 def _plain_raster(row, fonts, raster):
     """Card text drawn glyph by glyph with Pillow; refused for complex scripts."""
     from PIL import Image, ImageDraw, ImageFont
     label = card_label(row)
     text = row.get('text') or ''
     if _common.needs_complex_shaping(label + text):
-        raise ValueError('Card text for ' + row['id'] + ' needs complex shaping, and this ffmpeg has '
-                         'no libass; pass --no-cards, or render on a host whose ffmpeg has libass with HarfBuzz')
+        raise complex_refusal(row, 'this ffmpeg has no libass or no font was given')
     font_path = (fonts or {}).get('hi') or (fonts or {}).get('latin')
 
     def face(size):
@@ -244,7 +268,14 @@ def card(still, row, destination, fonts, preview=False, no_cards=False):
             and fonts and 'ass' in _common.ffmpeg_capabilities()['filters']):
         # Complex scripts off the worker still go through libass and its
         # HarfBuzz verification; anything else uses the plain path below.
-        record = _ass_raster(row, destination, fonts, raster)
+        try:
+            record = _ass_raster(row, destination, fonts, raster)
+        except FileNotFoundError as exc:
+            raise complex_refusal(row, 'this host has no fontconfig fc-scan') from exc
+        except ValueError as exc:
+            if not str(exc).startswith('Complex shaping/font coverage not verified'):
+                raise
+            raise complex_refusal(row, 'libass did not verify HarfBuzz shaping and font coverage') from exc
         record['typography'] = 'unqualified; libass on a preview host'
     else:
         record = _plain_raster(row, fonts, raster)
@@ -443,9 +474,8 @@ def main(argv=None):
     try:
         outputs = []
         for row, (still, audio) in zip(plan['scenes'], inputs):
-            identity = {'scene': row, 'tool': args.reuse_picture_tool or sha(__file__), 'fonts': {k: sha(v) for k,v in fonts.items()}}
-            if preview:
-                identity.update(preview=True, noCards=args.no_cards, ffmpeg=host['ffmpeg'])
+            identity = segment_identity(row, args.reuse_picture_tool or sha(__file__), fonts,
+                                        {'noCards': args.no_cards, 'ffmpeg': host['ffmpeg']} if preview else None)
             key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
             output = cache / (row['id'] + '-' + key + '.mov')
             receipt = output.with_suffix('.json')
@@ -469,10 +499,7 @@ def main(argv=None):
                 cmd += ['-filter_complex', graph, '-map', '0:v:0', '-map', '[a]', '-frames:v', row['frames'], '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-threads', '4', '-pix_fmt', 'yuv420p', '-video_track_timescale', '24000', '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2', '-t', f"{row['frames']/24:.9f}", temp]
                 run(cmd)
                 temp.replace(output)
-                record = {'id': row['id'], 'sha256': sha(output), 'frames': row['frames'], 'plannedAudioSamples': samples, 'sourceCardSha256': sha(source_card), 'finalApproved': False}
-                if preview:
-                    record['preview'] = True
-                save(receipt, record)
+                save(receipt, segment_receipt(row, output, source_card, preview))
             outputs.append(output)
             print(json.dumps({'id': row['id'], 'status': 'COMPLETED'}), flush=True)
         listing = root / labelled('segments.ffconcat', preview)
@@ -541,7 +568,7 @@ def main(argv=None):
         if preview:
             encoder = f"libx264 via {host['ffmpeg']} on {host['computeHost']} ({host['platform']}); preview, not the qualified worker"
         else:
-            encoder = 'libx264 on qualified GPU worker; no Mac processing'
+            encoder = WORKER_ENCODER
         audit = {'kind': plan['kind'], 'finalApproved': False, 'manifestSha256': plan_hash, 'toolSha256': sha(__file__), 'host': platform.node(), 'encoder': encoder, 'output': str(final), 'sha256': sha(final), 'scenes': len(outputs), 'frames': frames, 'durationSeconds': frames/24, 'fullDecode': 'passed', 'narrationCount': sum(s['mode']=='narration' for s in plan['scenes']), 'scratchDialogueCount': sum(s['mode']=='scratch-dialogue' for s in plan['scenes']), 'limitations': 'Silent dialogue slots use authored temporary timings. Still holds and known source defects are labeled. This is not final motion or a hearing/temporal approval.'}
         audit.update(reusedPictureToolSha256=args.reuse_picture_tool, voiceClockAuditSha256=sha(voice_audit))
         if any(s['mode'] == 'hold' for s in plan['scenes']):

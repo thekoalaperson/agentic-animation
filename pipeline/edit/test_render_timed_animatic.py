@@ -228,10 +228,58 @@ class GateAndTypographyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '--no-cards'):
                 animatic._plain_raster(row, {}, Path(temporary) / 'type.png')
 
+    def test_libass_preview_failures_name_the_way_out(self):
+        row = {'id': 'demo-s001', 'mode': 'narration', 'sourceStatus': 'candidate',
+               'text': '\u0915\u094d\u0937'}
+        failures = (FileNotFoundError('fc-scan'),
+                    ValueError('Complex shaping/font coverage not verified: demo-s001'))
+        with tempfile.TemporaryDirectory() as temporary:
+            dest = Path(temporary) / 'card.png'
+            fonts = {'latin': 'demo.ttf', 'hi': 'demo.ttf'}
+            with mock.patch.object(animatic._common, 'ffmpeg_capabilities', return_value={'filters': {'ass'}}):
+                for failure in failures:
+                    with self.subTest(failure=type(failure).__name__), \
+                            mock.patch.object(animatic, '_ass_raster', side_effect=failure), \
+                            self.assertRaisesRegex(ValueError, '--no-cards, or --font'):
+                        animatic.card('still.png', row, dest, fonts, preview=True)
+                with mock.patch.object(animatic, '_ass_raster', side_effect=ValueError('Caption exceeds animatic card: demo-s001')), \
+                        self.assertRaisesRegex(ValueError, '^Caption exceeds'):
+                    animatic.card('still.png', row, dest, fonts, preview=True)
+
     def test_complex_script_detection(self):
         self.assertTrue(_common.needs_complex_shaping('demo \u0915'))
         self.assertFalse(_common.needs_complex_shaping('demo line, caf\u00e9'))
         self.assertFalse(_common.needs_complex_shaping(''))
+
+
+class WorkerRecordsUnchangedTests(unittest.TestCase):
+    """An existing plan rendered on the worker keeps its cache key, receipts and audit wording."""
+
+    def test_legacy_plan_keeps_the_worker_records(self):
+        plan = {'kind': 'timed-still-animatic-not-final', 'finalApproved': False, 'fps': 24, 'scenes': [
+            {'id': 'demo-s001', 'mode': 'narration', 'frames': 48, 'text': 'demo line', 'sourceStatus': 'candidate',
+             'audio': {'durationSeconds': 1.5}},
+            {'id': 'demo-s002', 'mode': 'scratch-dialogue', 'frames': 36, 'text': 'demo reply',
+             'sourceStatus': 'candidate'}]}
+        validate(copy.deepcopy(plan))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ('latin.ttf', 'hi.ttf', 'seg.mov', 'seg.png'):
+                (root / name).write_bytes(name.encode())
+            fonts = {'latin': str(root / 'latin.ttf'), 'hi': str(root / 'hi.ttf')}
+            row, tool = plan['scenes'][0], 'f' * 64
+            identity = animatic.segment_identity(row, tool, fonts)
+            self.assertEqual(identity, {'scene': row, 'tool': tool,
+                                        'fonts': {k: digest(v) for k, v in fonts.items()}})
+            self.assertNotEqual(animatic.segment_identity(row, tool, fonts, {'noCards': False, 'ffmpeg': 'x'}), identity)
+            receipt = animatic.segment_receipt(row, root / 'seg.mov', root / 'seg.png')
+            self.assertEqual(receipt, {'id': 'demo-s001', 'sha256': digest(root / 'seg.mov'), 'frames': 48,
+                                       'plannedAudioSamples': 96000, 'sourceCardSha256': digest(root / 'seg.png'),
+                                       'finalApproved': False})
+        for name in ('segments', 'segments.ffconcat', 'timed-animatic-v1.mp4', 'complete-narration-clock.wav',
+                     'voice-clock-audit.json', 'render-audit.json'):
+            self.assertEqual(animatic.labelled(name, False), name)
+        self.assertEqual(animatic.WORKER_ENCODER, 'libx264 on qualified GPU worker; no Mac processing')
 
 
 @unittest.skipUnless(FFMPEG, 'ffmpeg is not installed')
