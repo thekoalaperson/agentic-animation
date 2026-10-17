@@ -164,6 +164,17 @@ class SuppliedOriginTests(Project):
         self.assertEqual(asset_registry.downstream(assets, "art/canon/demo-table.png"),
                          ["art/stills/demo-s001.png"])
 
+    def test_imagegen_refs_rows_keep_their_registry_edge(self) -> None:
+        self.imagegen_register("demo-table", "--no-visible-identity")
+        doc = json.loads(self.manifest.read_text())
+        doc["stills"][2]["imagegen_refs"] = ["art/canon/demo-table.png"]
+        self.manifest.write_text(json.dumps(doc))
+        self.supplied("demo-s002", png(self.root / "incoming/demo-s002.png"), "--no-visible-identity")
+        self.assertEqual(self.sidecar("demo-s002")["refs"], ["art/canon/demo-table.png"])
+        assets = asset_registry.load_registry(self.root)
+        self.assertEqual(asset_registry.downstream(assets, "art/canon/demo-table.png"),
+                         ["art/stills/demo-s002.png"])
+
     def test_required_supplied_fields(self) -> None:
         source = png(self.root / "incoming/demo-s002.png")
         with self.assertRaisesRegex(SystemExit, "--maker or --supplied-by"):
@@ -191,7 +202,7 @@ class SuppliedOriginTests(Project):
         self.run_cli(*args, "--source-root", str(self.outside))
         sidecar = self.sidecar("demo-s002")
         self.assertEqual(sidecar["provider"], "demo-painter-app")
-        self.assertEqual(sidecar["source_root"], "stills.sourceRoots.demo-painter-app")
+        self.assertEqual(sidecar["source_root"], "--source-root")
         self.assertEqual(sidecar["source_image"], "demo-s002.png")
 
     def test_bad_origin_is_refused(self) -> None:

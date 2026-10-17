@@ -48,6 +48,13 @@ class GeometryWarningTests(unittest.TestCase):
         self.assertEqual([w["jobId"] for w in warnings], ["demo-s002"])
         self.assertIn("derive_still.py", warnings[0]["hint"])
 
+    def test_warnings_do_not_enter_the_hashed_execution_request(self):
+        plan = {"manifestSha256": "a" * 64, "geometryWarnings": [{"type": "source-aspect"}]}
+        row = dict(id="demo-s001", sourceSha256="b" * 64, promptSha256="c" * 64,
+                   durationSeconds=7, outputStem="motion/demo-s001")
+        bare = {key: value for key, value in plan.items() if key != "geometryWarnings"}
+        self.assertEqual(DIALOGUE.execution_request(plan, row), DIALOGUE.execution_request(bare, row))
+
     def test_stage_prints_warnings_without_changing_the_manifest(self):
         root = self.base / "project"
         root.mkdir()

@@ -700,7 +700,8 @@ def register(
             "episode": manifest.get("episode"),
             "registered_at": now,
             "registered_by": "pipeline/register_builtin_imagegen.py",
-            "source_root": f"stills.sourceRoots.{root_key}" if declared_root else "project",
+            "source_root": (("--source-root" if source_root else f"stills.sourceRoots.{root_key}")
+                            if declared_root else "project"),
             "source_image": located(source, root, declared_root, "source image"),
             "source_sha256": source_digest,
             "target_output_path": target.relative_to(root).as_posix(),
@@ -712,7 +713,7 @@ def register(
             "source_fingerprint": record.get("source_fingerprint"),
             "prompt_sha256": prompt_digest if str(execution_prompt) else None,
             "requested_size": record.get("size"),
-            "refs": record.get("refs", {}).get("all", []),
+            "refs": execution_refs,
             "reference_hashes": reference_hashes(root, execution_refs, canon_root),
             "rights": rights,
             "exact_identity_claims": grounding_evidence["exact_identity_claims"],

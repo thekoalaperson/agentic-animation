@@ -86,7 +86,8 @@ The source must sit under the origin's root (`--source-root`, or the profile's
 supplied still with no declared root must be inside the project. The registered
 target is always a PNG. If the image started as a JPEG, WebP, TIFF or other
 file, convert it and pass the unconverted file as `--original`, which records
-its hash and header dimensions. The grounding guard runs the same way for every
+its hash and header dimensions. The original follows the same rule as the
+source: under the declared root, or else inside the project. The grounding guard runs the same way for every
 origin.
 
 `--retake` moves a registered still and its sidecar to
