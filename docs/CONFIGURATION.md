@@ -29,7 +29,12 @@ project/
 ```
 
 Use stable shot and asset IDs across these directories. Cross-project references
-must resolve explicitly, with content hashes. Never discover accepted media by
+must resolve explicitly, with content hashes. Shared series canon is one such
+reference: the profile's `stills.canonRoot` (or `--canon-root`) names a
+read-only root, rows cite `canon:<path>`, and each sidecar records the file's
+SHA-256. Still source roots are `stills.sourceRoots.<provider>`, for example
+`stills.sourceRoots.imagegen`. `imagegen.outputRoot` is still read when no
+`stills.sourceRoots.imagegen` key is set. Never discover accepted media by
 glob: the accepted registry and current source-bound decisions define reuse.
 The content corpus is an input, not an implicit local path or dependency.
 

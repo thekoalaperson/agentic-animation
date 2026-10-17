@@ -7,6 +7,10 @@
     "id": "configure-your-channel",
     "language": "hi"
   },
+  "stills": {
+    "sourceRoots": {"imagegen": "/path/to/imagegen/output"},
+    "canonRoot": "/path/to/private-studio/series-canon"
+  },
   "workers": {
     "h3": {"root": "/srv/animation", "python": "/srv/animation/venv/bin/python"},
     "audio": {"root": "/srv/animation", "python": "/srv/animation/audio/bin/python"},
