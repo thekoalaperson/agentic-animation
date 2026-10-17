@@ -426,7 +426,8 @@ def main(argv=None):
             raise ValueError('Plan fonts need latin and hi roles')
         for font in fonts.values():
             if not Path(font).is_file():
-                raise ValueError('Missing retained font: ' + font)
+                raise ValueError('Missing retained font: ' + font
+                                 + ('; pass --font or --no-cards for a preview' if preview else ''))
     if preview:
         host['font'] = {k: {'path': v, 'sha256': sha(v)} for k, v in fonts.items()} or None
     inputs = []

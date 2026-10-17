@@ -11,8 +11,10 @@ media runs anywhere ffmpeg runs, through the explicit `--preview` and
 `--audition` modes, whose outputs are labelled not final and inadmissible.
 Hosted provider calls are HTTP work: `kie_dialogue_finite.py`,
 `kie_music_finite.py` and `eleven_batch_finite.py` are the canonical entry points
-and the `run_*_gpu.py` wrappers a remote convenience, although dialogue
-submission and those wrappers still check for the worker today.
+and the `run_*_gpu.py` wrappers a remote convenience. Today dialogue submission
+and those wrappers still check for the worker, and the narration and score
+wrappers alone check the authority hash and write the credit preflight and
+execution receipts.
 Model runtimes remain separate:
 
 | Lane | Runtime requirements |
