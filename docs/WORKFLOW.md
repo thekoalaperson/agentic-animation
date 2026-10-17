@@ -12,6 +12,7 @@ sequences. Choose the amount of process that helps the work.
 | Generate hosted motion/dialogue | `kie_video.py`, `kie_dialogue_finite.py` |
 | Generate narration or score | `eleven_batch_finite.py`, `kie_music_finite.py` |
 | Run H3 jobs and ingest picture | `h3/stage_finite.py`, `h3/box/finite_client.py`, `h3/ingest_finite.py` |
+| Read a screenplay into source units | `edit/read_screenplay.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
 | Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
 | Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
@@ -49,6 +50,13 @@ and will not match the same character's on-camera Grok voice. The other way to
 put a character's voice over other picture, a Grok take of that speaker used
 for its audio only, needs picture windows the timeline does not have yet, and
 carries its own identity trade-offs.
+
+The screenplay reader lists what the source contains and chooses no shots; how
+rows divide it is the director's call. A storyboard row may cite the units it
+draws on in `source_units`, and a row that continues the speech of the row
+before it may name that row in `passage`, each half keeping its own words. The
+reader's `--units` report then shows reorderings, cuts, merges and changed
+lines as choices to see, not faults.
 
 Research, source grounding, animatics, auditions, and reviews are useful when
 they resolve a real uncertainty. They do not need to become rituals. Make an
