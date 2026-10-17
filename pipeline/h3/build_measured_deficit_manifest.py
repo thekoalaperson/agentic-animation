@@ -26,7 +26,6 @@ import json
 import math
 import re
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +33,7 @@ from typing import Any, Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import canonical_sha256 as _canonical_sha, is_below as _is_below, sha256_file as _sha256
+from _common import MediaWorkerRequired as _MediaWorkerRequired, extract_exact_frame as _extract_exact_frame
 
 
 DELIVERY_FPS = 24
@@ -454,23 +454,12 @@ def _verify_exhausted_accepted_windows(
 
 
 def _default_extract_frame(source: Path, frame_index: int, destination: Path) -> None:
-    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
-        raise DeficitPlanBlocked("Media extraction must run on the qualified GPU worker, not the Mac")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.stem + ".partial.png")
-    if temporary.exists():
-        temporary.unlink()
-    subprocess.run(
-        [
-            "ffmpeg", "-v", "error", "-y", "-i", str(source),
-            "-map", "0:v:0", "-vf", f"select=eq(n\\,{frame_index})",
-            "-frames:v", "1", "-vsync", "0", str(temporary),
-        ],
-        check=True,
-    )
-    if not temporary.is_file() or temporary.stat().st_size == 0:
-        raise DeficitPlanBlocked(f"Exact anchor extraction produced no frame: {source} n={frame_index}")
-    temporary.replace(destination)
+    try:
+        _extract_exact_frame(source, frame_index, destination)
+    except _MediaWorkerRequired as exc:
+        raise DeficitPlanBlocked(str(exc)) from exc
+    except ValueError as exc:
+        raise DeficitPlanBlocked(f"Exact anchor extraction produced no frame: {source} n={frame_index}") from exc
 
 
 def _action_rows(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:

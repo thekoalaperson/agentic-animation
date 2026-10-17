@@ -154,3 +154,81 @@ def upload_ref(p):
         sys.exit('upload gave no URL: ' + json.dumps(r)[:400])
     return url
 
+
+
+def image_dimensions(path):
+    """Return (format, width, height) read from a PNG, JPEG or WebP header.
+
+    No pixels are decoded, so this runs on any host. An unknown or truncated
+    header raises ValueError naming the file.
+    """
+    path = pathlib.Path(path)
+    with path.open('rb') as source:
+        head = source.read(64)
+        if head[:8] == b'\x89PNG\r\n\x1a\n' and head[12:16] == b'IHDR' and len(head) >= 24:
+            return 'png', int.from_bytes(head[16:20], 'big'), int.from_bytes(head[20:24], 'big')
+        if head[:4] == b'RIFF' and head[8:12] == b'WEBP' and len(head) >= 30:
+            chunk = head[12:16]
+            if chunk == b'VP8X':
+                return ('webp', 1 + int.from_bytes(head[24:27], 'little'),
+                        1 + int.from_bytes(head[27:30], 'little'))
+            if chunk == b'VP8 ' and head[23:26] == b'\x9d\x01\x2a':
+                return ('webp', int.from_bytes(head[26:28], 'little') & 0x3FFF,
+                        int.from_bytes(head[28:30], 'little') & 0x3FFF)
+            if chunk == b'VP8L' and head[20] == 0x2F:
+                bits = int.from_bytes(head[21:25], 'little')
+                return 'webp', (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if head[:2] == b'\xff\xd8':
+            source.seek(2)
+            while True:
+                byte = source.read(1)
+                while byte and byte != b'\xff':
+                    byte = source.read(1)
+                while byte == b'\xff':
+                    byte = source.read(1)
+                if not byte:
+                    break
+                marker = byte[0]
+                if marker in (0x01, *range(0xD0, 0xD8)):
+                    continue
+                length = int.from_bytes(source.read(2), 'big')
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    frame = source.read(5)
+                    if len(frame) == 5:
+                        return ('jpeg', int.from_bytes(frame[3:5], 'big'),
+                                int.from_bytes(frame[1:3], 'big'))
+                    break
+                if length < 2:
+                    break
+                source.seek(length - 2, 1)
+    raise ValueError(f'not a readable PNG, JPEG or WebP header: {path}')
+
+
+class MediaWorkerRequired(RuntimeError):
+    """Raised when exact media decoding is attempted off the qualified worker."""
+
+
+def extract_exact_frame(source, frame_index, destination):
+    """Decode one exact frame by index on the qualified GPU worker.
+
+    This is the extractor the measured-deficit builder has always used. It
+    writes a temporary file and publishes it only once a frame exists.
+    """
+    import shutil, subprocess
+    if sys.platform != 'linux' or not shutil.which('nvidia-smi'):
+        raise MediaWorkerRequired('Media extraction must run on the qualified GPU worker, not the Mac')
+    destination = pathlib.Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.stem + '.partial.png')
+    if temporary.exists():
+        temporary.unlink()
+    subprocess.run(
+        ['ffmpeg', '-v', 'error', '-y', '-i', str(source),
+         '-map', '0:v:0', '-vf', f'select=eq(n\\,{frame_index})',
+         '-frames:v', '1', '-vsync', '0', str(temporary)],
+        check=True,
+    )
+    if not temporary.is_file() or temporary.stat().st_size == 0:
+        raise ValueError(f'Exact frame extraction produced no frame: {source} n={frame_index}')
+    temporary.replace(destination)
