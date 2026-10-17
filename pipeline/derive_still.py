@@ -178,6 +178,8 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
     parent_digest = sha256(parent)
     parent_row = registered_parent(root, parent, parent_digest)
     parent_value = parent.relative_to(root).as_posix()
+    parent_record = {"path": parent_row["sidecar"], "sha256": sha256(root / parent_row["sidecar"])}
+    carried = inherited(root, parent_row["sidecar"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     record = manifest_record(manifest, still_id)
     if record.get("status") not in REGISTERABLE:
@@ -240,10 +242,8 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
         "still_id": still_id,
         "episode": manifest.get("episode"),
         "derived_at": now,
-        "parent": {"path": parent_value, "sha256": parent_digest,
-                   "sidecar": {"path": parent_row["sidecar"],
-                               "sha256": sha256(root / parent_row["sidecar"])}},
-        **inherited(root, parent_row["sidecar"]),
+        "parent": {"path": parent_value, "sha256": parent_digest, "sidecar": parent_record},
+        **carried,
         "operation": {"name": operation, **params},
         "tool": tool_record(operation),
         "target_output_path": target.relative_to(root).as_posix(),
