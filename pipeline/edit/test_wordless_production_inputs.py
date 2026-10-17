@@ -47,6 +47,32 @@ class WordlessProductionInputsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'wordless'):
             manuscript.prepare(self.ep, self.overrides, edits, self.ep / 'work/review/manuscript-2.json')
 
+    def write_board(self, name='story/storyboard_plan.json'):
+        stills, records = [], []
+        for scene in ITEMS:
+            image = self.ep / f'art/{scene}.png'
+            image.parent.mkdir(exist_ok=True)
+            image.write_bytes(scene.encode())
+            sidecar = image.with_suffix('.json')
+            sidecar.write_text(json.dumps({'target_sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
+            stills.append({'still_id': scene, 'beat': 'b', 'speaker': ITEMS[scene]['speaker'],
+                           'narration_hi': 'पुराना।', 'narration_en': 'Old.'})
+            records.append({'still_id': scene, 'target_output_path': str(image.relative_to(self.ep)),
+                            'provenance_sidecar': str(sidecar.relative_to(self.ep))})
+        (self.ep / name).write_text(json.dumps({'episode': 'demo', 'stills': stills}))
+        (self.ep / 'story/generation_manifest.json').write_text(json.dumps({'episode': 'demo', 'stills': records}))
+
+    def test_alternate_storyboard_is_read_and_recorded(self):
+        self.write_board('story/storyboard-alt.json')
+        argv = ['prepare', str(self.ep), '--inventory-only', '--voice-id', 'demo-voice', '--work', 'work/alt',
+                '--overrides', str(self.overrides), '--storyboard', 'story/storyboard-alt.json']
+        with mock.patch.object(sys, 'argv', argv), mock.patch('builtins.print'):
+            production.main()
+        inventory = json.loads((self.ep / 'work/alt/inventory.json').read_text())
+        self.assertEqual(inventory['storyboard'], 'story/storyboard-alt.json')
+        self.assertEqual(inventory['boardSha256'],
+                         hashlib.sha256((self.ep / 'story/storyboard-alt.json').read_bytes()).hexdigest())
+
     def test_inventory_routes_each_delivery(self):
         stills, records = [], []
         for scene in ITEMS:
@@ -74,6 +100,7 @@ class WordlessProductionInputsTest(unittest.TestCase):
         inventory = json.loads((work / 'inventory.json').read_text())
         self.assertEqual((inventory['count'], inventory['wordlessCount']), (4, 1))
         self.assertEqual(inventory['items'][1]['delivery'], 'wordless')
+        self.assertNotIn('storyboard', inventory)
 
     def test_working_picture_needs_no_ledger_for_an_all_dialogue_film(self):
         self.assertEqual(ownership_contracts(self.ep, {'documents': {}}), [])

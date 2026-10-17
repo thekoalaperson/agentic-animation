@@ -121,6 +121,8 @@ def main():
                     help='Metadata/hash pass only; no media decode, processing or sheets')
     ap.add_argument('--overrides', type=Path,
                     help='Versioned episode-owned text/speaker corrections; originals survive')
+    ap.add_argument('--storyboard', type=Path, default=Path('story/storyboard_plan.json'),
+                    help='Storyboard inside the episode, for an alternate cut; default story/storyboard_plan.json')
     args=ap.parse_args()
     if args.inventory_only and args.sheets:
         ap.error('--inventory-only cannot render sheets')
@@ -131,7 +133,10 @@ def main():
     ep=args.episode.resolve()
     repo=args.source_root.resolve() if args.source_root else ep
     work=ep/args.work
-    board_path=ep/'story/storyboard_plan.json'
+    board_path=(ep/args.storyboard).resolve()
+    if not board_path.is_relative_to(ep):
+        ap.error('--storyboard must be inside the episode')
+    alternate_board=board_path!=(ep/'story/storyboard_plan.json').resolve()
     manifest_path=ep/'story/generation_manifest.json'
     board=json.loads(board_path.read_text())
     manifest=json.loads(manifest_path.read_text())
@@ -213,6 +218,7 @@ def main():
             row['silentH3']=ingested[row['id']]
         row['eligibleForProductionPicture']=not bool(row['speaker'])
     save(work/'inventory.json',dict(episode=manifest['episode'],
+         **({'storyboard':str(board_path.relative_to(ep))} if alternate_board else {}),
          boardSha256=sha(board_path),manifestSha256=sha(manifest_path),
          count=len(rows),narrationCount=len(narration),dialogueCount=len(dialogues),
          **({'wordlessCount':sum(r.get('delivery')=='wordless' for r in rows)}
