@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -80,6 +82,65 @@ class PaidApprovalTest(unittest.TestCase):
             plan["approvalAdmissionSha256"] = "b" * 64
             with self.assertRaisesRegex(eleven.PlanError, "approvalAdmissionSha256"):
                 eleven._load_or_create_state(plan, state_path)
+
+
+class PaidApprovalCommandTest(unittest.TestCase):
+    def test_describe_lists_every_runner_scope(self):
+        from pipeline import paid_approval
+        from pipeline import eleven_batch_finite, kie_music_finite, observe_media_finite
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(paid_approval.main(["describe"]), 0)
+        lanes = json.loads(out.getvalue())["lanes"]
+        self.assertEqual(set(lanes["suno-score"]["finiteExecution"]),
+                         {"requests", "credits", "sourceSeconds"})
+        for module in (eleven_batch_finite, kie_music_finite, observe_media_finite):
+            self.assertIn(module.APPROVAL_LANE, lanes)
+
+    def test_draft_is_refused_until_a_person_grants_it_and_check_names_stale_scope(self):
+        from pipeline import paid_approval
+        from pipeline import eleven_batch_finite as eleven
+        from pipeline.test_eleven_batch_finite import FiniteElevenBatchTest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            work = root / "work/narration-v1"
+            work.mkdir(parents=True)
+            manifest = FiniteElevenBatchTest().manifest(work)
+            record = root / "story/approvals/narration.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(paid_approval.main(
+                    ["draft", eleven.APPROVAL_LANE, str(manifest), "--out", str(record),
+                     "--project", str(root)]), 0)
+            drafted = json.loads(record.read_text())
+            self.assertEqual(drafted["status"], "DRAFT")
+            self.assertEqual([drafted[k] for k in paid_approval.GRANT_FIELDS], ["", "", [], ""])
+            with self.assertRaisesRegex(PaidApprovalError, "status must be 'APPROVED'"):
+                paid_approval.check_record(record, manifest, eleven.APPROVAL_LANE, root)
+            with self.assertRaisesRegex(PaidApprovalError, "overwrite"):
+                paid_approval.draft_record(eleven.APPROVAL_LANE, manifest, record, root)
+            drafted.update(status="APPROVED", authorizedBy="Offline test fixture",
+                           authorizedAtUtc="2026-01-01T00:00:00Z", authorizationId="offline",
+                           authorizationText=["Offline fixture wording."])
+            record.write_text(json.dumps(drafted))
+            self.assertEqual(paid_approval.check_record(
+                record, manifest, eleven.APPROVAL_LANE, root)["lane"], eleven.APPROVAL_LANE)
+            drafted["manifests"][0]["finiteExecution"]["characters"] += 1
+            record.write_text(json.dumps(drafted))
+            with self.assertRaisesRegex(PaidApprovalError, "finiteExecution.characters"):
+                paid_approval.check_record(record, manifest, eleven.APPROVAL_LANE, root)
+
+    def test_dialogue_draft_matches_the_runner_scope(self):
+        from pipeline import paid_approval
+        from pipeline.test_kie_dialogue_finite import DialogueFiniteTest
+        fixture = DialogueFiniteTest("test_dry_run_is_offline_and_accepts_seven_seconds")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        record = fixture.ep / "story/approvals/draft.json"
+        drafted = paid_approval.draft_record("grok-dialogue", fixture.manifest, record, fixture.ep)
+        self.assertEqual(drafted["manifests"][0]["finiteExecution"],
+                         {"jobs": 1, "generatedSeconds": 7, "credits": 35})
+        self.assertEqual(drafted["manifests"][0]["manifestPath"],
+                         "work/dialogue/execution-manifest.json")
 
 
 if __name__ == "__main__":
