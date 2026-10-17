@@ -34,5 +34,39 @@ class VoiceSyncPictureEventTest(unittest.TestCase):
             self.assertTrue(result['passed'])
 
 
+class ProcessedFidelityPictureEventTest(unittest.TestCase):
+    def test_wordless_picture_events_have_no_window_to_compare(self):
+        import audit_processed_audio_fidelity as fidelity
+        with tempfile.TemporaryDirectory() as temp:
+            ep = Path(temp) / 'demo-project'
+            (ep / 'work/master').mkdir(parents=True)
+            master = ep / 'work/master/final.mp4'
+            master.write_bytes(b'master')
+            master.with_suffix('.controlled.wav').write_bytes(b'controlled')
+            receipt = ep / 'work/master/receipt.json'
+            receipt.write_text(json.dumps({
+                'output': 'work/master/final.mp4', 'outputSha256': sync.sha(master),
+                'socialCompression': {'controlledSha256': sync.sha(master.with_suffix('.controlled.wav'))},
+                'normalizer': 'anull', 'encodedCorrections': [{'filter': 'anull'}], 'runtimeSeconds': 6.0}))
+            plan = ep / 'work/master/edit-plan.json'
+            plan.write_text(json.dumps({'events': [
+                {'id': 'demo-s001', 'kind': 'narration', 'start': 0.0, 'subtitleAudioAt': 0.0,
+                 'subtitleAudioDuration': 3.0},
+                {'id': 'demo-s002', 'kind': 'picture', 'start': 3.0, 'audio': None}]}))
+            signal = np.random.default_rng(3).standard_normal(6 * 8000).astype(np.float32)
+
+            def fake_run(command, **_):
+                if command[0] == 'ffmpeg':
+                    Path(command[-1]).write_bytes(b'expected')
+            argv = ['fidelity', str(ep), 'work/master/receipt.json', 'work/master/edit-plan.json', 'work/fidelity-v1']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(fidelity.platform, 'system', return_value='Linux'), \
+                    mock.patch.object(fidelity.subprocess, 'run', side_effect=fake_run), \
+                    mock.patch.object(sync, 'load', return_value=signal), mock.patch('builtins.print'):
+                fidelity.main()
+            audit = json.loads((ep / 'work/fidelity-v1/audit.json').read_text())
+            self.assertEqual([row['event'] for row in audit['results']], ['demo-s001'])
+            self.assertTrue(audit['passed'])
+
+
 if __name__ == '__main__':
     unittest.main()
