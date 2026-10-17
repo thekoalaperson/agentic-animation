@@ -1510,6 +1510,57 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertEqual(timeline._beat_identity({"beat": {"number": 3}}), 3)
         self.assertIsNone(timeline._beat_identity({}))
 
+    def test_passage_links_two_halves_of_one_speech(self):
+        rows = [dict(r) for r in self.rows]
+        rows[1]["passage"] = "demo-s001"
+        self.write_rows(rows)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        first, second = plan["events"][:2]
+        self.assertNotIn("passage", first)
+        self.assertEqual(second["passage"], "demo-s001")
+        # Each half keeps its own words and its own measured clip.
+        self.assertEqual((first["subtitleTextHi"], second["subtitleTextHi"]), ("हिन्दी demo-s001", "हिन्दी demo-s002"))
+        self.assertNotEqual(first["audio"], second["audio"])
+        for language in ("hi", "en"):
+            timing = json.loads((self.ep / f"work/assembly-v1/subtitle-{language}-timing.json").read_text())
+            self.assertEqual([s.get("passage") for s in timing["shots"]], [None, "demo-s001", None, None])
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertEqual((audit["narrationCount"], audit["dialogueCount"]), (3, 1))
+
+    def test_passage_must_continue_the_row_before_it_in_the_same_voice(self):
+        cases = [
+            (3, "demo-s001", "directly before"),
+            (2, "demo-s002", "spoken the same way"),
+            (0, "demo-s000", "directly before"),
+        ]
+        for index, link, message in cases:
+            with self.subTest(index=index):
+                rows = [dict(r) for r in self.rows]
+                rows[index]["passage"] = link
+                self.write_rows(rows)
+                ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "storyboard-passage" and e["sceneId"] == rows[index]["still_id"]
+                                    and message in e["error"] for e in ready["errors"]), ready["errors"])
+        rows = [dict(r) for r in self.rows]
+        rows[1].update(passage="demo-s001", delivery="unsynced", voice="Character Two")
+        self.write_rows(rows)
+        ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "storyboard-passage" and "same speaker" in e["error"]
+                            for e in ready["errors"]), ready["errors"])
+
+    def test_passage_halves_of_dialogue_share_a_speaker(self):
+        rows = [{"still_id": "a", "speaker": "One"}, {"still_id": "b", "speaker": "One", "passage": "a"},
+                {"still_id": "c", "speaker": "Two", "passage": "b"}]
+        kinds = {"a": "dialogue", "b": "dialogue", "c": "dialogue"}
+        errors = []
+        links = timeline._passages(rows, {"b": {"passage": "a"}}, kinds, {}, errors)
+        self.assertEqual(links, {"b": "a"})
+        self.assertEqual([(e["sceneId"], "same speaker" in e["error"]) for e in errors], [("c", True)])
+        errors = []
+        timeline._passages(rows[:2], {"b": {"passage": "x"}}, kinds, {}, errors)
+        self.assertIn("differs from production override", errors[0]["error"])
+
     def write_origin(self, name, record):
         path = self.ep / "work/h3" / name
         self.write_json(path, record)

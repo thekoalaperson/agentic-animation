@@ -11,8 +11,10 @@ optional fifth column ``delivery``:
   empty text columns.
 
 ``Narrator`` stays shorthand for unsynced narrator speech. The existing board
-supplies only IDs/beat membership. ``--storyboard`` selects an alternate cut of
-the same project. Outputs are immutable.
+supplies only IDs/beat membership, plus an optional ``passage`` on a row that
+continues the row before it: the two halves of one split speech, each carrying
+only its own words, then count as one utterance. ``--storyboard`` selects an
+alternate cut of the same project. Outputs are immutable.
 
 Optional reports, never gates:
 
@@ -179,7 +181,7 @@ def main():
         raise ScriptError(f'Every original slot must have an explicit authored decision: '
                           f'{len(lines)} script rows for {len(source)} storyboard stills')
     overrides={};changes=[];hi=[];en=[];narration_chars=0
-    wordless=0;voice_over=0;marked=False
+    wordless=0;voice_over=0;marked=False;passages=[]
     for index,(line,old) in enumerate(zip(lines,source),1):
         key=old['still_id']
         role,voice,delivery,hindi,english,explicit=parse_row(index,line,key)
@@ -194,6 +196,15 @@ def main():
             item['delivery']='wordless';wordless+=1
         elif voice:
             item.update(delivery='unsynced',voice=voice);voice_over+=1
+        if old.get('passage') is not None:
+            previous=source[index-2] if index>1 else None
+            prior=overrides.get(previous['still_id']) if previous else None
+            if (prior is None or old['passage']!=previous['still_id'] or delivery=='wordless'
+                    or prior.get('delivery')=='wordless' or prior['speaker']!=role
+                    or prior.get('voice')!=voice or prior.get('delivery')!=item.get('delivery')):
+                raise ScriptError(f'row {index} ({key}): passage must name the row directly before it, '
+                                  'spoken by the same speaker with the same delivery')
+            item['passage']=old['passage'];passages.append([old['passage'],key])
         overrides[key]=item
         if role!=old.get('speaker'):changes.append({'id':key,'before':old.get('speaker'),'after':role})
         if delivery!='wordless':
@@ -206,12 +217,15 @@ def main():
     save(out/'overrides.json',json.dumps(payload,ensure_ascii=False,indent=2)+'\n')
     for lang,rows in [('hi',hi),('en',en)]:
         save(out/f'performed-{lang}.md','\n\n'.join(rows)+'\n')
+    # The second half of a split passage continues an utterance; it is not a new one.
     summary={'episode':board['episode'],'sceneCount':len(source),
-             'dialogueCount':sum(bool(x['speaker']) for x in overrides.values()),
+             'dialogueCount':sum(bool(x['speaker']) and not x.get('passage') for x in overrides.values()),
              'narrationCharacters':narration_chars,'roleChanges':changes,'sourceSha256':digest(script),
              'overridesSha256':digest(out/'overrides.json'),'mediaGenerationPerformed':False,'visualApprovalClaimed':False}
     if marked:
         summary.update(wordlessCount=wordless,voiceOverCount=voice_over)
+    if passages:
+        summary['passages']=passages
     if a.source_script:
         source_path=a.source_script.resolve()
         text=source_text(source_path)

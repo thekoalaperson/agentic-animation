@@ -351,6 +351,40 @@ def _row_delivery(row: dict[str, Any], override: dict[str, Any]) -> tuple[str, s
     return "narration", voice
 
 
+def _passages(rows: list[dict[str, Any]], overrides: dict[str, dict[str, Any]], row_kind: dict[str, str],
+              row_voice: dict[str, str], errors: list[dict[str, Any]]) -> dict[str, str]:
+    """Read optional ``passage`` links: a row continuing the speech of the row before it.
+
+    Both halves keep their own words and their own clip; the link only says
+    they are one utterance. It must name the directly preceding row, spoken
+    by the same speaker or voice in the same way.
+    """
+    links: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        scene_id = str(row.get("still_id", ""))
+        own, frozen = row.get("passage"), overrides.get(scene_id, {}).get("passage")
+        if own is None and frozen is None:
+            continue
+        previous = rows[index - 1] if index else None
+        prior_id = str(previous.get("still_id", "")) if previous else None
+        prior_kind = row_kind.get(prior_id) if prior_id else None
+        link = own if own is not None else frozen
+        if own is not None and frozen is not None and own != frozen:
+            problem = f"storyboard passage {own!r} differs from production override {frozen!r}"
+        elif link != prior_id:
+            problem = "passage must name the row directly before it"
+        elif row_kind[scene_id] not in ("dialogue", "narration") or prior_kind != row_kind[scene_id]:
+            problem = "both halves of a passage must be spoken the same way"
+        elif (row_kind[scene_id] == "dialogue" and row.get("speaker") != previous.get("speaker")
+              or row_voice.get(scene_id) != row_voice.get(prior_id)):
+            problem = "both halves of a passage must have the same speaker"
+        else:
+            links[scene_id] = link
+            continue
+        errors.append({"type": "storyboard-passage", "sceneId": scene_id, "error": f"{scene_id}: {problem}"})
+    return links
+
+
 def _picture_rule(row: dict[str, Any]) -> tuple[str, int | None]:
     """Return a picture row's duration rule and, for an authored hold, its frames."""
     scene_id = row.get("still_id")
@@ -653,6 +687,8 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
         if event.get('subtitleCuePairs'):
             shots[-1].update(cueParts=[p[language] for p in event['subtitleCuePairs']],
                              cueWeights=event['subtitleCueWeights'])
+        if event.get('passage'):
+            shots[-1]['passage'] = event['passage']  # continues the previous shot's utterance
     return {
         "schemaVersion": 1,
         "kind": "hindi-master-subtitle-timing-input",
@@ -832,6 +868,7 @@ def build_timeline(
         row_kind[scene_id] = kind
         if voice:
             row_voice[scene_id] = voice
+    row_passage = _passages(rows, overrides, row_kind, row_voice, errors)
     ledger_version = ledger_doc.get("schemaVersion", 1) if ledger_available else 1
     if isinstance(ledger_version, bool) or not isinstance(ledger_version, int) or ledger_version < 1:
         errors.append({"type": "h3-ledger", "error": "ledger schemaVersion must be a positive integer"})
@@ -1749,6 +1786,8 @@ def build_timeline(
                 "subtitleTextEn": effective_text[scene_id]["en"],
             }
             cursor_frames += duration_frames
+        if scene_id in row_passage:
+            event['passage'] = row_passage[scene_id]
         if effective_text[scene_id].get('cuePairs'):
             event['subtitleCuePairs'] = effective_text[scene_id]['cuePairs']
             event['subtitleCueWeights'] = effective_text[scene_id]['cueWeights']
@@ -2066,7 +2105,8 @@ def build_timeline(
         "runtimeSeconds": edit_plan["runtimeSeconds"],
         "eventCount": len(events),
         "narrationCount": sum(row["kind"] == "narration" for row in events),
-        "dialogueCount": sum(row["kind"] == "dialogue" for row in events),
+        # A passage's second half continues an utterance rather than starting one.
+        "dialogueCount": sum(row["kind"] == "dialogue" and not row.get("passage") for row in events),
         **({"pictureCount": sum(row["kind"] == "picture" for row in events)}
            if any(row["kind"] == "picture" for row in events) else {}),
         "pictureBlockCount": len(blocks),

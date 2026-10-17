@@ -344,6 +344,36 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.SubtitleExportError, "no voice or subtitle text"):
             self.export()
 
+    def link_passage(self, *, timing: bool = True) -> None:
+        plan = read_json(self.plan_path)
+        plan["events"][2]["passage"] = "demo-s002"
+        write_json(self.plan_path, plan)
+        if timing:
+            for path in (self.hi_path, self.en_path):
+                doc = read_json(path)
+                doc["shots"][2]["passage"] = "demo-s002"
+                write_json(path, doc)
+        sync = read_json(self.sync_path)
+        sync["planSha256"] = exporter.sha256_file(self.plan_path)
+        write_json(self.sync_path, sync)
+
+    def test_passage_halves_keep_their_own_cues_and_are_recorded(self) -> None:
+        self.link_passage()
+        audit = self.export()
+        rows = {row["id"]: row for row in audit["coverage"]}
+        self.assertEqual(rows["demo-s003"]["passage"], "demo-s002")
+        self.assertNotIn("passage", rows["demo-s002"])
+        self.assertEqual(audit["cueCount"], 144)
+        [english] = self.output.glob("*-en.srt")
+        cues = english.read_text().split("\n\n")
+        self.assertTrue(any("This is scene number 3." in cue for cue in cues))
+        self.assertFalse(any("number 2." in cue and "number 3." in cue for cue in cues))
+
+    def test_timing_document_must_carry_the_plans_passage(self) -> None:
+        self.link_passage(timing=False)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "demo-s003.passage"):
+            self.export()
+
 
 if __name__ == "__main__":
     unittest.main()

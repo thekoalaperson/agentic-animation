@@ -62,8 +62,11 @@ class WordlessProductionInputsTest(unittest.TestCase):
         (self.ep / name).write_text(json.dumps({'episode': 'demo', 'stills': stills}))
         (self.ep / 'story/generation_manifest.json').write_text(json.dumps({'episode': 'demo', 'stills': records}))
 
-    def test_alternate_storyboard_is_read_and_recorded(self):
+    def test_alternate_storyboard_and_passage_links_are_read(self):
         self.write_board('story/storyboard-alt.json')
+        items = json.loads(self.overrides.read_text())
+        items['items']['demo-s004'] = dict(items['items']['demo-s004'], passage='demo-s003')
+        self.overrides.write_text(json.dumps(items, ensure_ascii=False))
         argv = ['prepare', str(self.ep), '--inventory-only', '--voice-id', 'demo-voice', '--work', 'work/alt',
                 '--overrides', str(self.overrides), '--storyboard', 'story/storyboard-alt.json']
         with mock.patch.object(sys, 'argv', argv), mock.patch('builtins.print'):
@@ -72,6 +75,8 @@ class WordlessProductionInputsTest(unittest.TestCase):
         self.assertEqual(inventory['storyboard'], 'story/storyboard-alt.json')
         self.assertEqual(inventory['boardSha256'],
                          hashlib.sha256((self.ep / 'story/storyboard-alt.json').read_bytes()).hexdigest())
+        draft = json.loads((self.ep / 'work/alt/dialogue-draft.json').read_text())['items']
+        self.assertNotIn('passage', draft[0])  # the paid draft shape is unchanged
 
     def test_inventory_routes_each_delivery(self):
         stills, records = [], []

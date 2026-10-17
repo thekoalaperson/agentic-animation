@@ -152,7 +152,7 @@ def main():
     for row in board['stills']:
         key=row['still_id']
         change = overrides.get(key, {})
-        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason', 'delivery', 'voice'}:
+        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason', 'delivery', 'voice', 'passage'}:
             raise ValueError('Unsupported override fields: ' + key)
         row = {**row, **change}
         rec=records[key]

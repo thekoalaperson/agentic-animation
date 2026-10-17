@@ -147,6 +147,21 @@ class CompileProductionScriptTest(unittest.TestCase):
         for row in rows:
             self.assertFalse({'suggestedClipSeconds', 'split', 'suggestedSplit'} & set(row))
 
+    def test_passage_counts_two_halves_as_one_utterance(self):
+        lines = ['1 | DEMO ONE | मैं यहाँ हूँ। | I am here.', '2 | DEMO ONE | दीपक जलता है। | The lamp burns.']
+        overrides, audit, _ = self.compile(lines, ['DEMO ONE', 'DEMO ONE'], rows={2: {'passage': 'demo-s001'}})
+        self.assertEqual(overrides['items']['demo-s002']['passage'], 'demo-s001')
+        self.assertNotIn('passage', overrides['items']['demo-s001'])
+        self.assertEqual((audit['dialogueCount'], audit['passages']), (1, [['demo-s001', 'demo-s002']]))
+        other = [lines[0], '2 | DEMO TWO | दीपक जलता है। | The lamp burns.']
+        voiced = [lines[0], '2 | DEMO ONE | दीपक जलता है। | The lamp burns. | unsynced']
+        for index, (passage, script) in enumerate([('demo-s001', other), ('demo-s001', voiced),
+                                                   ('demo-s000', lines)]):
+            with self.subTest(passage=passage, index=index):
+                with self.assertRaisesRegex(compiler.ScriptError, 'row 2 .*passage'):
+                    self.compile(script, ['DEMO ONE', 'DEMO ONE'], out=f'work/passage-{index}',
+                                 rows={2: {'passage': passage}})
+
     def test_ordinals_compare_as_integers(self):
         overrides, _, _ = self.compile(['1 | Narrator | दीपक। | Lamp.', '02 | Narrator | रात। | Night.'])
         self.assertEqual(list(overrides['items']), ['demo-s001', 'demo-s002'])

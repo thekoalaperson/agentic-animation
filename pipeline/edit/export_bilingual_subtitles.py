@@ -203,6 +203,8 @@ def _validate_timing_document(
                 raise SubtitleExportError(f"{language} timing changed {scene_id}.{key}")
         if shot.get("dialogue") is not (event.get("kind") == "dialogue"):
             raise SubtitleExportError(f"{language} timing changed {scene_id}.dialogue")
+        if shot.get("passage") != event.get("passage"):
+            raise SubtitleExportError(f"{language} timing changed {scene_id}.passage")
         expected_text = event.get("subtitleTextHi" if language == "hi" else "subtitleTextEn")
         text = shot.get("text")
         if not isinstance(text, str) or not text.strip() or text != expected_text:
@@ -431,6 +433,8 @@ def build_synchronized_cues(
                 "cueCount": count,
                 "partitionPolicy": 'authored-paired-clauses' if authored else 'balanced-word-partition',
                 "timingPolicy": 'proportional-within-complete-utterance; not forced alignment',
+                # One utterance split across two clips: each half's cues carry only its own words.
+                **({"passage": hi_shot["passage"]} if hi_shot.get("passage") else {}),
             }
         )
     validate_cues(result["hi"], "hi")
