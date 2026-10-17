@@ -15,6 +15,10 @@ except ImportError:
     import package_hindi_delivery as delivery
 
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     for name in ('episode','config','support','receipt'):ap.add_argument(name,type=Path)

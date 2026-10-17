@@ -12,6 +12,10 @@ import re
 import numpy as np
 
 SR = 48000
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def sha(p):
     h=hashlib.sha256()
     with Path(p).open('rb') as f:

@@ -11,31 +11,46 @@ import platform
 import shutil
 import subprocess
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
+class ReconcileError(ValueError):
+    """The retained take or its recorded state does not match the stated contract."""
+
+
+def require(condition, message):
+    if not condition:
+        raise ReconcileError(message)
+
+
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 def run(source, destination, key, attempt_number, frames):
-    assert platform.system() == 'Linux'
+    require(platform.system() == 'Linux', 'reconciliation runs on the qualified Linux GPU worker')
     subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], check=True, capture_output=True)
     original = source / 'state.json'
     state = json.loads(original.read_text())
-    assert state.get('finishedAt'), 'Source batch must be terminal'
+    require(state.get('finishedAt'), f'source batch must be terminal: {original} finishedAt')
     repaired = copy.deepcopy(state)
     job = repaired['jobs'][key]
     attempt = job['attempts'][attempt_number - 1]
-    assert attempt['number'] == attempt_number
-    assert attempt['completedResponse']['status'] == 'completed'
+    require(attempt['number'] == attempt_number, f'{key}: attempt {attempt_number} is recorded as {attempt["number"]}')
+    require(attempt['completedResponse']['status'] == 'completed',
+            f'{key} attempt {attempt_number}: completedResponse.status is not completed')
     raw = source / f'{key}.attempt{attempt_number}.mp4'
-    assert sha(raw) == attempt['downloadSha256']
+    require(sha(raw) == attempt['downloadSha256'], f'{raw}: bytes differ from downloadSha256')
     probe = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-count_frames', '-show_streams', '-of', 'json', str(raw)], check=True, capture_output=True, text=True, timeout=120).stdout)
     video = [s for s in probe['streams'] if s['codec_type'] == 'video']
-    assert len(video) == 1
+    require(len(video) == 1, f'{raw}: expected one video stream, found {len(video)}')
     v = video[0]
-    assert (v['width'], v['height'], v['r_frame_rate']) == (1344, 768, '24/1')
-    assert int(v['nb_read_frames']) == frames
-    assert abs(float(v['duration']) - frames / 24) < .002
+    require((v['width'], v['height'], v['r_frame_rate']) == (1344, 768, '24/1'),
+            f'{raw}: geometry {v["width"]}x{v["height"]} at {v["r_frame_rate"]} is not 1344x768 at 24/1')
+    require(int(v['nb_read_frames']) == frames, f'{raw}: {v["nb_read_frames"]} frames, expected {frames}')
+    require(abs(float(v['duration']) - frames / 24) < .002, f'{raw}: duration {v["duration"]} does not match {frames} frames')
     decoded = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(raw), '-f', 'null', '-'], check=True, capture_output=True, timeout=180)
-    assert not decoded.stderr
+    require(not decoded.stderr, f'{raw}: decode reported errors')
     job.update(status='complete', output=raw.name, sha256=sha(raw), creativeVerdict='pending-independent-review')
     repaired['completeCount'] = sum(j.get('status') == 'complete' for j in repaired['jobs'].values())
     repaired['reconciliation'] = dict(originalStateSha256=sha(original), job=key, selectedAttempt=attempt_number, correctedExpectedFrames=frames, probe=probe, reason='Original expected-frame assertion was incorrect; existing downloaded take passes corrected explicit contract. Original attempts and errors preserved.')
@@ -44,16 +59,16 @@ def run(source, destination, key, attempt_number, frames):
         if j.get('status') != 'complete':
             continue
         src = source / j['output']
-        assert src.parent == source and sha(src) == j['sha256']
+        require(src.parent == source and sha(src) == j['sha256'], f'{src}: output escapes the batch or its sha256 changed')
         dst = destination / src.name
         if dst.exists():
-            assert sha(dst) == sha(src)
+            require(sha(dst) == sha(src), f'{dst}: existing destination differs from {src}')
         else:
             shutil.copy2(src, dst)
     target = destination / 'state.json'
     payload = json.dumps(repaired, indent=2) + '\n'
     if target.exists():
-        assert target.read_text() == payload
+        require(target.read_text() == payload, f'{target}: existing reconciled state differs')
     else:
         with target.open('x') as out:
             out.write(payload)
@@ -67,4 +82,7 @@ if __name__ == '__main__':
     p.add_argument('--attempt', type=int, required=True)
     p.add_argument('--frames', type=int, required=True)
     a = p.parse_args()
-    run(a.source.resolve(), a.destination.resolve(), a.key, a.attempt, a.frames)
+    try:
+        run(a.source.resolve(), a.destination.resolve(), a.key, a.attempt, a.frames)
+    except ReconcileError as exc:
+        raise SystemExit(f'REFUSED: {exc}') from exc

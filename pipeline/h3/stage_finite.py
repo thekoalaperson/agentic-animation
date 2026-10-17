@@ -5,6 +5,13 @@ import json
 from pathlib import Path
 import shutil
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
+class StageError(ValueError):
+    """The authored plan cannot be staged without breaking its source binding."""
+
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -23,11 +30,13 @@ def stage(plan_path, target):
             if source_field not in item:
                 continue
             source = (root / item[source_field]).resolve()
-            assert source.is_relative_to(root)
+            if not source.is_relative_to(root):
+                raise StageError(f"{item.get('id')}: {source_field} escapes sourceRoot: {source}")
             destination = target / "stills" / source.name
             digest = sha(source)
             if destination.exists():
-                assert sha(destination) == digest, "Staged source name collision"
+                if sha(destination) != digest:
+                    raise StageError(f"{item.get('id')}: staged still name collision at {destination}")
             else:
                 shutil.copy2(source, destination)
             item[name_field] = source.name
@@ -35,7 +44,8 @@ def stage(plan_path, target):
     path = target / "manifest.json"
     text = json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
     if path.exists():
-        assert path.read_text() == text, "Immutable staged manifest changed"
+        if path.read_text() != text:
+            raise StageError(f"immutable staged manifest changed: {path}")
     else:
         path.write_text(text)
     print(json.dumps(dict(manifest=str(path), jobs=len(plan["items"]),
@@ -43,9 +53,12 @@ def stage(plan_path, target):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("plan", type=Path)
     ap.add_argument("target", type=Path)
     args = ap.parse_args()
-    stage(args.plan.resolve(), args.target.resolve())
+    try:
+        stage(args.plan.resolve(), args.target.resolve())
+    except StageError as exc:
+        raise SystemExit(f"REFUSED: {exc}") from exc
 

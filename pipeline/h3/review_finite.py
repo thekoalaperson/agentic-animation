@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "edit"))
 from prepare_episode_production import ingest, probe
 
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
