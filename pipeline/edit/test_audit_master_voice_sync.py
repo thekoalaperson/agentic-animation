@@ -68,5 +68,20 @@ class ProcessedFidelityPictureEventTest(unittest.TestCase):
             self.assertTrue(audit['passed'])
 
 
+class ReelsMasteringPictureEventTest(unittest.TestCase):
+    def test_wordless_picture_events_have_no_window_to_compare(self):
+        import master_reels_fixed_gain as reels
+        plan = {'events': [
+            {'id': 'demo-s001', 'kind': 'narration', 'start': 0.0, 'subtitleAudioAt': 0.0,
+             'subtitleAudioDuration': 3.0},
+            {'id': 'demo-s002', 'kind': 'picture', 'start': 3.0, 'audio': None},
+            {'id': 'demo-s003', 'kind': 'dialogue', 'start': 4.0, 'subtitleAudioAt': 0.2,
+             'subtitleAudioDuration': 1.6}]}
+        signal = np.random.default_rng(5).standard_normal(6 * sync.SR).astype(np.float32)
+        rows = reels.voice_rows(signal, signal, plan)
+        self.assertEqual([row['event'] for row in rows], ['demo-s001', 'demo-s003'])
+        self.assertTrue(all(row['passed'] for row in rows))
+
+
 if __name__ == '__main__':
     unittest.main()
