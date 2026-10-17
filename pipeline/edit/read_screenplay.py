@@ -447,7 +447,9 @@ def read_mode(project, screenplay, output):
     previous = versions[-1][1] if versions else None
     if previous is not None:
         old = json.loads(previous.read_text(encoding='utf-8'))
-        if old.get('sourceSha256') == sha256_bytes(raw) and output is None:
+        reader_sha = sha256_bytes(Path(__file__).read_bytes())
+        if (old.get('sourceSha256') == sha256_bytes(raw) and old.get('readerSha256') == reader_sha
+                and output is None):
             print(json.dumps(dict(unchanged=str(previous), sourceSha256=old['sourceSha256'])))
             return previous
     version = versions[-1][0] + 1 if versions else 1

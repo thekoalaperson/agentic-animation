@@ -124,6 +124,15 @@ class ReadScreenplayTest(unittest.TestCase):
         self.read()
         self.assertEqual(sorted(p.name for p in (self.project / 'story').iterdir()), before)
 
+    def test_a_changed_reader_reads_the_same_file_again(self):
+        self.read()
+        doc = self.units()
+        doc['readerSha256'] = '0' * 64
+        (self.project / 'story/source-units-v1.json').write_text(json.dumps(doc), encoding='utf-8')
+        self.read()
+        diff = json.loads((self.project / 'story/source-units-v2.diff.json').read_text(encoding='utf-8'))
+        self.assertEqual([diff[k] for k in ('moved', 'changed', 'added', 'removed', 'renumbered')], [[]] * 5)
+
     def test_a_revision_is_a_new_version_with_a_diff(self):
         self.read()
         v1 = (self.project / 'story/source-units-v1.json').read_bytes()
