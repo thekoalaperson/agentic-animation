@@ -110,6 +110,19 @@ class DialogueFiniteTest(unittest.TestCase):
                 self.assertEqual((dry['financialApproval'], dry['financialAuthorized']), (boolean, False))
         self.assertTrue(RUNNER.execute(7,False,self.approval())['financialAuthorized'])
 
+    def test_batch_started_on_the_boolean_names_its_recorded_runner(self):
+        approval = self.approval()
+        (self.work/'execution-authorization.json').write_text(json.dumps({
+            'executionManifestSha256': RUNNER.load_plan(self.manifest, 7)['manifestSha256'],
+            'approval': None}))
+        with mock.patch.object(RUNNER.platform,'system',return_value='Linux'), \
+             mock.patch.object(RUNNER.subprocess,'run',return_value=mock.Mock(returncode=0)):
+            with self.assertRaisesRegex(RUNNER.PlanError,
+                                        '--reconcile-only.*runner that started it'):
+                RUNNER.execute(7,True,approval)
+        self.assertEqual(RUNNER.attempt_records(self.work, 'credit-preflight'), [])
+        self.assertFalse(RUNNER.LOCK.exists())
+
     def test_mac_submission_refused(self):
         approval = self.approval()
         with mock.patch.object(RUNNER.platform,'system',return_value='Darwin'), mock.patch.object(RUNNER.subprocess,'run') as run:

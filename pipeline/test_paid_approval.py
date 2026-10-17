@@ -97,6 +97,28 @@ class PaidApprovalCommandTest(unittest.TestCase):
         for module in (eleven_batch_finite, kie_music_finite, observe_media_finite):
             self.assertIn(module.APPROVAL_LANE, lanes)
 
+    def test_described_keys_are_each_runners_own_scope(self):
+        import importlib.util
+        from pipeline import paid_approval
+        from pipeline import eleven_batch_finite, kie_music_finite, observe_media_finite
+        spec = importlib.util.spec_from_file_location(
+            "dialogue_scope_target", Path(paid_approval.__file__).with_name("kie_dialogue_finite.py"))
+        dialogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dialogue)
+        # Each runner's approval_scope reads only these plan fields.
+        plans = {
+            dialogue: {"jobs": [], "totalSeconds": 0, "maximumCredits": 0},
+            eleven_batch_finite: {"items": [], "aggregateCharacters": 0},
+            kie_music_finite: {"requestCount": 1, "expectedCredits": 1,
+                               "cues": [{"payload": {"duration": 1}}]},
+            observe_media_finite: {"jobs": [], "maxCredits": 1},
+        }
+        self.assertEqual({module.APPROVAL_LANE for module in plans}, set(paid_approval.LANES))
+        for module, plan in plans.items():
+            with self.subTest(lane=module.APPROVAL_LANE):
+                self.assertEqual(set(paid_approval.LANES[module.APPROVAL_LANE]["finiteExecution"]),
+                                 set(module.approval_scope(plan)))
+
     def test_draft_is_refused_until_a_person_grants_it_and_check_names_stale_scope(self):
         from pipeline import paid_approval
         from pipeline import eleven_batch_finite as eleven

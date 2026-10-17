@@ -738,7 +738,13 @@ def execute(max_generated_seconds: int, submit: bool,
         authorization_path = HERE / "execution-authorization.json"
         evidence = {"executionManifestSha256": plan["manifestSha256"], "approval": approval}
         if authorization_path.exists():
-            if read_object(authorization_path, "execution authorization") != evidence:
+            recorded = read_object(authorization_path, "execution authorization")
+            if recorded != evidence:
+                if recorded.get("approval") is None:
+                    raise PlanError(
+                        "this batch was started on the manifest's financialApproval with no "
+                        "approval record; land its posted tasks with --reconcile-only, and "
+                        "submit the remainder only with the runner that started it")
                 raise PlanError("execution authorization differs from the existing batch")
         else:
             atomic_json(authorization_path, evidence)

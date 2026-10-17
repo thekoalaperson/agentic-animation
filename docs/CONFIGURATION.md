@@ -76,6 +76,10 @@ the record binds.
 Recovery needs no new record. `kie_music_finite.py --poll` and
 `kie_dialogue_finite.py --reconcile-only` poll and land task IDs that are
 already recorded, and never post a new generation request.
+`kie_video.py --resume-only` reads no wallet either. A dialogue batch that was
+started on the manifest's `financialApproval` alone has no record behind it,
+so the current runner can only reconcile what that batch already posted. Its
+unsubmitted jobs resume with the runner that started the batch.
 
 Old grants and receipts retain their original schema and runner. Migrate paths
 with an external relocation map, not by editing recorded source hashes or
