@@ -1510,6 +1510,14 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertEqual(timeline._beat_identity({"beat": {"number": 3}}), 3)
         self.assertIsNone(timeline._beat_identity({}))
 
+    def test_source_unit_citations_change_no_event(self):
+        _, plain = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        rows = [dict(r, source_units=[f"s001.e00{i}"]) for i, r in enumerate(self.rows, 1)]
+        self.write_rows(rows)
+        ready, cited = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(cited["events"], plain["events"])
+
     def test_passage_links_two_halves_of_one_speech(self):
         rows = [dict(r) for r in self.rows]
         rows[1]["passage"] = "demo-s001"
