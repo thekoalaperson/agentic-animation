@@ -26,9 +26,11 @@ def main():
     for line in script.read_text().splitlines():
         if not line.strip():
             continue
-        number, speaker, hindi, english = line.split('|', 3)
+        parts = line.split('|')  # an optional fifth column carries delivery
+        number, speaker, hindi, english = parts[:4]
+        delivery = parts[4].strip() if len(parts) > 4 else ''
         rows.append(dict(shot=number, speaker=speaker, hindi=hindi, english=english,
-                         candidates=[]))
+                         **({'delivery': delivery} if delivery else {}), candidates=[]))
     board_path = root / 'story/storyboard_plan.json'
     board = json.loads(board_path.read_text()) if board_path.is_file() else {}
     for row in rows:
@@ -83,7 +85,8 @@ def main():
     missing = []
     absent = []
     for row in rows:
-        lane = 'h3-base' if row['speaker'] == 'Narrator' else 'grok-dialogue'
+        heard_over_picture = row['speaker'] in ('Narrator', '-') or row.get('delivery') in ('unsynced', 'wordless')
+        lane = 'h3-base' if heard_over_picture else 'grok-dialogue'
         row['requiredLane'] = lane
         row['hasVerifiedBaseCandidate'] = any(
             c['kind'] == lane and c['hashVerified'] for c in row['candidates'])
