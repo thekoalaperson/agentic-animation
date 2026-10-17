@@ -164,11 +164,8 @@ def _resolve_path(
     return (base / path).resolve()
 
 
-def _portable_path(path: Path, episode: Path) -> str:
-    try:
-        return str(path.resolve().relative_to(episode.resolve()))
-    except ValueError:
-        return str(path.resolve())
+# Shared with the subtitle exporter and other tools that accept a moved project.
+from _common import portable_path as _portable_path
 
 
 def _scene_number(scene_id: str) -> int:
@@ -304,27 +301,7 @@ def _production_overrides(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _state_path_matches(recorded: Any, actual: Path, episode: Path,
-                        original_episode_root: Any = None) -> bool:
-    """Retain immutable worker receipts across an explicitly declared relocation.
-
-    Callers separately verify the media/sidecar digest and completed state. This
-    checks exact episode-relative identity, not a permissive basename match.
-    """
-    raw = Path(str(recorded or ""))
-    if raw.resolve() == actual.resolve():
-        return True
-    if not original_episode_root or not raw.is_absolute() or ".." in raw.parts:
-        return False
-    root = Path(str(original_episode_root))
-    if (not root.is_absolute() or ".." in root.parts or root.name != episode.name):
-        return False
-    try:
-        recorded_relative = raw.relative_to(root)
-        actual_relative = actual.resolve().relative_to(episode.resolve())
-    except ValueError:
-        return False
-    return recorded_relative == actual_relative and bool(recorded_relative.parts)
+from _common import state_path_matches as _state_path_matches
 
 
 def _read_json_evidence(path: Path, label: str) -> dict[str, Any]:

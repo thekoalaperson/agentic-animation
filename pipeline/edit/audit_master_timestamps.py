@@ -10,6 +10,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("master", type=Path)
 ap.add_argument("output", type=Path)
 ap.add_argument("--gpu-finishing-probe", action="store_true", help="Strict H.264 packet clock plus complete decode/count on the GPU worker; no decoded-frame timestamp claim")
+ap.add_argument("--episode", type=Path, help="Project root; also records the master's project-relative path so the audit survives a move")
 a = ap.parse_args()
 data = json.loads(subprocess.check_output([
     "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_packets",
@@ -37,6 +38,8 @@ result = {"master": str(a.master.resolve()), "sha256": h.hexdigest(),
           "maxPresentationClockErrorSeconds": error, "decodeTimestampsStrictlyIncreasing": True,
           "decode": "passed with empty error log, fixed filter graph, passthrough frames and source encoder time base",
           "passed": True}
+if a.episode is not None:
+    result["masterEpisodeRelative"] = a.master.resolve().relative_to(a.episode.resolve()).as_posix()
 if gpu_decode is not None:
     result.update(decode="GCP GPU-worker H.264 complete decode passed; exact decoded count, no dropped/duplicated frames",
                   frameTimingBasis="packet presentation timestamps; not decoded-frame timestamps",

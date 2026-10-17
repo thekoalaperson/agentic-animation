@@ -29,8 +29,12 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 import textwrap
 from typing import Any, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _common import load_relocation_map, relocated_path_matches
 
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -243,6 +247,21 @@ def _evidence_master_path(evidence: dict[str, Any], key: str) -> Path:
     return Path(value).resolve()
 
 
+def _names_master(evidence: dict[str, Any], master: Path, episode: Path | None,
+                  relocation: dict[str, Any] | None) -> bool:
+    """The audit names this master, here or in the project before a move.
+
+    A moved master matches through the episode-relative path new audits record
+    beside the absolute one, or through an explicit relocation map. The master
+    hash comparison that follows is unchanged in every case.
+    """
+    recorded = _evidence_master_path(evidence, "master")
+    if recorded == master or episode is None:
+        return recorded == master
+    return relocated_path_matches(evidence["master"], master, episode, relocation,
+                                  evidence.get("masterEpisodeRelative"))
+
+
 def validate_master_evidence(
     master: Path,
     clock: dict[str, Any],
@@ -252,6 +271,8 @@ def validate_master_evidence(
     runtime: float,
     fps: float,
     max_master_tail_seconds: float,
+    episode: Path | None = None,
+    relocation: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     if not master.is_file() or master.stat().st_size <= 0:
         raise SubtitleExportError(f"Missing or empty final master: {master}")
@@ -261,7 +282,7 @@ def validate_master_evidence(
 
     if clock.get("passed") is not True or clock.get("decodeTimestampsStrictlyIncreasing") is not True:
         raise SubtitleExportError("Final master packet-clock audit has not passed")
-    if _evidence_master_path(clock, "master") != master:
+    if not _names_master(clock, master, episode, relocation):
         raise SubtitleExportError("Packet-clock audit names a different final master")
     if clock.get("sha256") != master_sha:
         raise SubtitleExportError("Final master hash differs from packet-clock evidence")
@@ -280,7 +301,7 @@ def validate_master_evidence(
 
     if sync.get("passed") is not True or sync.get("timingPassed") is not True or sync.get("voicePresencePassed") is not True:
         raise SubtitleExportError("Final master voice-sync evidence has not passed")
-    if _evidence_master_path(sync, "master") != master:
+    if not _names_master(sync, master, episode, relocation):
         raise SubtitleExportError("Voice-sync audit names a different final master")
     if sync.get("masterSha256") != master_sha:
         raise SubtitleExportError("Final master hash differs from voice-sync evidence")
@@ -494,6 +515,7 @@ def export_subtitles(
     expected_scenes: int | None = None,
     max_master_tail_seconds: float = 30.0,
     basename: str | None = None,
+    relocation_map: Path | None = None,
 ) -> dict[str, Any]:
     episode = episode.resolve()
     if not episode.is_dir():
@@ -532,6 +554,8 @@ def export_subtitles(
         runtime,
         fps,
         max_master_tail_seconds,
+        episode=episode,
+        relocation=load_relocation_map(relocation_map),
     )
     hi_cues, en_cues, coverage = build_synchronized_cues(hi_shots, en_shots)
     if hi_cues[-1].end > master_duration + 1.01 / fps:
@@ -624,6 +648,8 @@ def main() -> None:
     parser.add_argument("--expected-scenes", type=int, help="Optional explicit scene-count cross-check")
     parser.add_argument("--max-master-tail-seconds", type=float, default=30.0)
     parser.add_argument("--basename")
+    parser.add_argument("--relocation-map", type=Path,
+                        help="explicit map for a moved project: originalEpisodeRoot and/or paths")
     args = parser.parse_args()
     audit = export_subtitles(
         args.episode,
@@ -637,6 +663,7 @@ def main() -> None:
         expected_scenes=args.expected_scenes,
         max_master_tail_seconds=args.max_master_tail_seconds,
         basename=args.basename,
+        relocation_map=args.relocation_map,
     )
     print(
         json.dumps(

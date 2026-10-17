@@ -240,6 +240,30 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.SubtitleExportError, "ends before"):
             self.export()
 
+    def test_moved_master_needs_relative_identity_or_relocation_map(self) -> None:
+        old_master = "/old/studio/demo-fixture/work/final-master-v1/final-720p.mp4"
+        for path in (self.clock_path, self.sync_path):
+            evidence = read_json(path)
+            evidence["master"] = old_master
+            write_json(path, evidence)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "names a different final master"):
+            self.export()
+        wrong_root = self.episode.parent / "wrong-root.json"
+        write_json(wrong_root, {"originalEpisodeRoot": "/old/studio/other-project"})
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "names a different final master"):
+            self.export(relocation_map=wrong_root)
+        relocation = self.episode.parent / "relocation.json"
+        write_json(relocation, {"originalEpisodeRoot": "/old/studio/demo-fixture"})
+        self.assertEqual(self.export(relocation_map=relocation)["sceneCount"], 144)
+        for path in (self.clock_path, self.sync_path):
+            evidence = read_json(path)
+            evidence["masterEpisodeRelative"] = "work/final-master-v1/final-720p.mp4"
+            write_json(path, evidence)
+        self.assertEqual(self.export()["sceneCount"], 144)
+        self.master.write_bytes(b"a different master at the same relative path")
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "hash differs"):
+            self.export()
+
     def test_requires_passed_voice_sync_bound_to_exact_plan(self) -> None:
         sync = read_json(self.sync_path)
         sync["planSha256"] = "f" * 64

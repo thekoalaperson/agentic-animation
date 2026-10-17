@@ -626,6 +626,11 @@ def kie_video_command(plan: dict[str, Any], row: dict[str, Any]) -> list[str]:
     ]
 
 
+def upload_env() -> dict[str, str]:
+    """kie_video.py logs every upload to this project's work/upload-log.jsonl."""
+    return {**os.environ, "AGENTIC_UPLOAD_LOG": str(EPISODE / "work/upload-log.jsonl")}
+
+
 def require_media_host() -> None:
     if platform.system() != "Linux":
         raise PlanError("Submission and heavy media validation require the qualified GPU worker")
@@ -672,7 +677,8 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
             if not row["outputPath"].with_suffix(".pending.json").exists():
                 unsubmitted.append(row["id"])
                 continue
-            result = subprocess.run(kie_video_command(plan, row) + ["--resume-only"], cwd=ROOT)
+            result = subprocess.run(kie_video_command(plan, row) + ["--resume-only"], cwd=ROOT,
+                                    env=upload_env())
             if result.returncode:
                 failed.append(row["id"])
                 continue
@@ -752,7 +758,7 @@ def execute(max_generated_seconds: int, submit: bool,
         })
         def generate_row(row):
             stem = row["outputPath"]
-            result = subprocess.run(kie_video_command(plan, row), cwd=ROOT)
+            result = subprocess.run(kie_video_command(plan, row), cwd=ROOT, env=upload_env())
             if result.returncode:
                 recovery = stem.with_suffix(".pending.json")
                 state = ("durable recovery state exists" if recovery.exists()

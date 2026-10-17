@@ -122,7 +122,7 @@ def run(path: Path, count: int, submit: bool, approval_admission: Path | None = 
             sources = []
             for index, media in enumerate(job["media"], 1):
                 source = root / media["path"]
-                url = media.get("url") or upload_ref(source)
+                url = media.get("url") or upload_ref(source, root / "work/upload-log.jsonl")
                 parts += [{"type": "text", "text": f"Media {index}:"},
                           {"type": "image_url", "image_url": {"url": url}}]
                 sources.append({**media, "url": url})

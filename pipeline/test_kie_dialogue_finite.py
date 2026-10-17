@@ -175,6 +175,7 @@ class DialogueFiniteTest(unittest.TestCase):
             if command[0] == 'nvidia-smi':
                 return mock.Mock(returncode=0)
             row_ids.append(command)
+            self.assertEqual(kwargs['env']['AGENTIC_UPLOAD_LOG'], str(self.ep/'work/upload-log.jsonl'))
             return mock.Mock(returncode=0)
         landed = {'id': 'demo-s1001', 'sha256': 'c' * 64, 'taskId': 'recorded-task'}
         with mock.patch.object(RUNNER.platform,'system',return_value='Linux'), \
