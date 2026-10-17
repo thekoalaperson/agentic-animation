@@ -12,9 +12,9 @@ media runs anywhere ffmpeg runs, through the explicit `--preview` and
 Hosted provider calls are HTTP work: `kie_dialogue_finite.py`,
 `kie_music_finite.py` and `eleven_batch_finite.py` are the canonical entry points
 and the `run_*_gpu.py` wrappers a remote convenience. Today dialogue submission
-and those wrappers still check for the worker, and the narration and score
-wrappers alone check the authority hash and write the credit preflight and
-execution receipts.
+and those wrappers still check for the worker. The dialogue runner and both
+wrappers check the authority hash and write a credit preflight and an execution
+record; the music and narration finite runners check no authority hash.
 Model runtimes remain separate:
 
 | Lane | Runtime requirements |

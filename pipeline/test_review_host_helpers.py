@@ -23,6 +23,19 @@ class WorkerGateTests(unittest.TestCase):
             with self.assertRaises(_common.MediaWorkerRequired):
                 _common.require_media_worker("Upscale")
 
+    def test_nvidia_smi_that_lists_no_gpu_is_refused(self):
+        import subprocess
+        failure = subprocess.CalledProcessError(9, ["nvidia-smi", "-L"])
+        with mock.patch.object(_common.sys, "platform", "linux"), \
+                mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+                mock.patch("subprocess.run", side_effect=failure):
+            with self.assertRaisesRegex(_common.MediaWorkerRequired, "found no usable GPU"):
+                _common.require_media_worker("Upscale")
+        with mock.patch.object(_common.sys, "platform", "linux"), \
+                mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+                mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "GPU 0: demo\n", "")):
+            self.assertEqual(_common.require_media_worker("Upscale"), "GPU 0: demo")
+
 
 class ReviewFontTests(unittest.TestCase):
     def test_explicit_then_profile_then_none(self):

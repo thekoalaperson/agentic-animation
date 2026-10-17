@@ -7,7 +7,6 @@
     "id": "configure-your-channel",
     "language": "hi"
   },
-  "fonts": {"review": "/path/to/licensed/review-font.ttf"},
   "stills": {
     "sourceRoots": {"imagegen": "/path/to/imagegen/output"},
     "canonRoot": "/path/to/private-studio/series-canon"
