@@ -109,7 +109,8 @@ def main():
     planned = [k for k, s in statuses.items() if s == "PLANNED"]
     if planned and a.poll_only:
         receipt("AWAITING_REMAINDER", before, wallet(), notYetPosted=planned)
-        raise SystemExit("Posted cues have landed; post the rest with kie_music_finite.py "
+        landed = "Posted cues have landed" if len(planned) < len(statuses) else "No cue is posted yet"
+        raise SystemExit(f"{landed}; post the rest with kie_music_finite.py "
                          "--submit, then observe them here with --poll-only")
     if planned:
         pilot = [k for k, s in statuses.items() if s == "DOWNLOADED"]
