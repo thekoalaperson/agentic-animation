@@ -21,6 +21,23 @@ reconcile an uncertain submission before retrying it. A queue has one owner and
 bounded execution. Credit deltas can overlap; keep provider receipts and session
 totals. Profile identity alone is not authorization.
 
+A frozen manifest binds more than its job list. It binds the draft it came
+from, the source audit, production overrides, the authority file, every still
+and prompt, and the price it was frozen at. A batch resumes against those
+frozen bytes, so none of them may change between the freeze and the last
+reconciled task. Change a bound file and you are making a new manifest, which
+needs its own approval record. Each runner's `--freeze` writes the manifest
+with these hashes, and a pilot is simply a smaller frozen manifest. A later
+manifest may list it under `siblingManifests` so that no job is paid for twice.
+
+A price is evidence with a source. Record the provider's own page for the exact
+model and resolution, its URL, and the UTC time you read it. Once a batch lands,
+a receipt's task ID and `creditsConsumed` are the best evidence for the next
+manifest's rate. Never use a test fixture's rate. Worker hours usually cost more
+than API calls. The dialogue runner stops once landed charges pass the
+manifest's `maximumCredits`, and it reports each receipted job's rate in
+`price-variance.json`.
+
 A hash-bound old job resumes with its recorded runner and manifest. Use an
 explicit migration record when adapting it; do not change old evidence to make
 incompatible files appear to match.

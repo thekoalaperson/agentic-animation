@@ -11,6 +11,7 @@ sequences. Choose the amount of process that helps the work.
 | Register stills and trace dependencies | `register_builtin_imagegen.py`, `asset_registry.py` |
 | Generate hosted motion/dialogue | `kie_video.py`, `kie_dialogue_finite.py` |
 | Generate narration or score | `eleven_batch_finite.py`, `kie_music_finite.py` |
+| Freeze and authorize a paid batch | each paid runner's `--freeze` and `--print-schema`, `paid_approval.py` |
 | Run H3 jobs and ingest picture | `h3/stage_finite.py`, `h3/box/finite_client.py`, `h3/ingest_finite.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
 | Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
