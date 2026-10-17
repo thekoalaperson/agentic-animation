@@ -145,11 +145,11 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             kie.assert_not_called()
 
     def test_recorded_pending_task_is_polled_without_a_second_generation_post(self):
-        for extra in ([], ["--resume-only"]):
-            with self.subTest(extra=extra):
-                self.recover_recorded_pending_task(extra)
+        for extra, receipt in (([], 27), (["--resume-only"], 27), ([], None)):
+            with self.subTest(extra=extra, receipt=receipt):
+                self.recover_recorded_pending_task(extra, receipt)
 
-    def recover_recorded_pending_task(self, extra):
+    def recover_recorded_pending_task(self, extra, receipt):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prompt, frame, stem, argv, source_sha, manifest_sha, execution_sha = self.fixture(root)
@@ -194,12 +194,15 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             def kie(route, payload=None):
                 calls.append(route)
                 if route == "chat/credit":
-                    return 1000
+                    return 980
                 if route.startswith("jobs/recordInfo"):
-                    return {
-                        "state": "success", "creditsConsumed": 27,
+                    record = {
+                        "state": "success",
                         "resultJson": json.dumps({"resultUrls": ["https://offline/result.mp4"]}),
                     }
+                    if receipt is not None:
+                        record["creditsConsumed"] = receipt
+                    return record
                 if route == "jobs/createTask":
                     self.fail("recovery attempted a second generation POST")
                 self.fail(f"unexpected route: {route}")
@@ -216,6 +219,12 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             if extra:
                 upload.assert_not_called()
                 self.assertNotIn("chat/credit", calls)
+            meta = json.loads(stem.with_suffix(".vid.json").read_text(encoding="utf-8"))
+            if receipt is None:
+                # Wallet deltas can overlap concurrent jobs; they are labelled.
+                self.assertEqual((meta["credits"], meta["creditsSource"]), (20.0, "wallet-delta"))
+            else:
+                self.assertEqual((meta["credits"], meta["creditsSource"]), (27, "receipt"))
 
     def test_success_writes_bound_immutable_sidecar_and_validated_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -249,6 +258,7 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
                  mock.patch.object(VIDEO, "kie", side_effect=kie), \
                  mock.patch.object(VIDEO, "env_key", return_value="offline"), \
                  mock.patch.object(VIDEO, "download_public_media", return_value=raw), \
+                 mock.patch.object(VIDEO, "usd_per_credit", return_value=0.01), \
                  mock.patch.object(VIDEO.time, "sleep"):
                 VIDEO.main(argv)
 
@@ -275,6 +285,7 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
                 self.assertEqual(meta[key], value, key)
             self.assertEqual(meta["requestFingerprint"], meta["requestSha256"])
             self.assertEqual(VIDEO.canonical_sha256(meta["request"]), meta["requestFingerprint"])
+            self.assertEqual((meta["creditsSource"], meta["cost_usd"]), ("receipt", 0.27))
             self.assertFalse(stem.with_suffix(".pending.json").exists())
 
             plan = {"manifestSha256": manifest_sha}

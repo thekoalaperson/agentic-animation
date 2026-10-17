@@ -20,7 +20,8 @@ import argparse, hashlib, json, os, pathlib, re, sys, time
 import urllib.parse
 import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from _common import kie, upload_ref, env_key, canonical_sha256, sha256_file as file_sha256
+from _common import (kie, upload_ref, env_key, canonical_sha256, sha256_file as file_sha256,
+                     usd_per_credit)
 
 MODELS = {'grok': 'grok-imagine/image-to-video',
           'grok15': 'grok-imagine-video-1-5-preview',
@@ -513,6 +514,8 @@ def main(argv=None):
     if resume_only and not landed_pending.exists():
         sys.exit(f'no recorded paid task to resume at {landed_pending}; '
                  'resume-only never creates a generation request')
+    # Read before any paid call so a malformed profile cannot fail after one.
+    usd_rate = usd_per_credit()
     t0 = time.time()
     if resume_only:
         # Recovery polls a recorded taskId; it never uploads or reads a wallet.
@@ -623,11 +626,16 @@ def main(argv=None):
         sys.exit('no resultUrls: ' + json.dumps(rec)[:500])
     mp4 = download_public_media(urls[0])
     output_sha256 = hashlib.sha256(mp4).hexdigest()
+    # A provider receipt is per-task evidence; a wallet delta can include
+    # other tasks running at the same time, so it is labelled as such.
     credits = rec.get('creditsConsumed')
+    credits_source = 'receipt' if credits is not None else None
     if credits is None:
         saved = read_json(pending, 'pending recovery record')
-        credits = max(0, float(saved.get('walletBefore', wallet_before))
-                      - float(kie('chat/credit')))
+        before = saved.get('walletBefore', wallet_before)
+        if before is not None:
+            credits = max(0, float(before) - float(kie('chat/credit')))
+            credits_source = 'wallet-delta'
     meta = {'provenanceVersion': PENDING_VERSION,
             'provider': 'kie.ai', 'model': model, 'taskId': task,
             'jobId': job_id,
@@ -648,7 +656,8 @@ def main(argv=None):
             'audio': embedded_audio,
             'input': request['input'],
             'credits': credits,
-            'cost_usd': round(credits * 0.005, 4) if credits else None,
+            'creditsSource': credits_source,
+            'cost_usd': round(credits * usd_rate, 4) if credits and usd_rate else None,
             'res': res, 'dur': dur, 'first_frame': frame,
             'last_frame': last,
             'refs': [frame] + refs, 'aspect_ratio': inp.get('aspect_ratio'),
@@ -669,7 +678,8 @@ def main(argv=None):
                   sidecarSha256=file_sha256(landed_meta), landedAt=time.time())
     atomic_json(pending, orphan, replace=True)
     pending.unlink()
-    print(f'{landed}  ${meta["cost_usd"]}  {meta["secs"]}s  {model} {res}')
+    cost = f'${meta["cost_usd"]}' if meta['cost_usd'] is not None else f'{credits} credits'
+    print(f'{landed}  {cost}  {meta["secs"]}s  {model} {res}')
 
 if __name__ == '__main__':
     main()

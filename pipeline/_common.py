@@ -4,7 +4,7 @@ production tools.
 Code, projects and credentials have separate roots. A profile supplies defaults,
 never permission to spend, approve creative work, or publish an artifact.
 """
-import base64, hashlib, json, mimetypes, os, pathlib, sys, urllib.error, urllib.request
+import base64, hashlib, json, math, mimetypes, os, pathlib, sys, urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -29,6 +29,21 @@ def profile_value(*keys, default=None):
             return default
         value = value[key]
     return value
+
+
+def usd_per_credit():
+    """The operator's own Kie USD-per-credit figure from the profile, or None.
+
+    There is deliberately no default: a stale built-in rate would read as a
+    price quote. Set ``providers.kie.usdPerCredit`` from the provider's page.
+    """
+    value = profile_value('providers', 'kie', 'usdPerCredit')
+    if value is None:
+        return None
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError('providers.kie.usdPerCredit must be a positive number')
+    return float(value)
 
 
 def project_root(path=None):

@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
 from pipeline._common import (attempt_records, canonical_sha256, project_root,
-                              sha256_file as sha256, write_attempt_json)
+                              sha256_file as sha256, usd_per_credit, write_attempt_json)
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
 EPISODE_CODE = None
@@ -445,7 +445,54 @@ def validate_completed(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     if not isinstance(task_id, str) or not task_id:
         raise PlanError(f"{row['id']}: sidecar lacks taskId")
     return {"id": row["id"], **media, "taskId": task_id,
-            "requestFingerprint": fingerprint, "resumed": True}
+            "requestFingerprint": fingerprint, "resumed": True,
+            "credits": meta.get("credits"), "creditsSource": meta.get("creditsSource")}
+
+
+PRICE_VARIANCE_REPORT_TOLERANCE = 1.25
+
+
+def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compare landed charges with the frozen price; stop past maximumCredits.
+
+    The cumulative ceiling is the refusal: every landed credit counts, however
+    it was measured. Per-job rates come only from provider receipts, because
+    wallet deltas overlap when jobs run concurrently; they are reported, and a
+    rate above the declared one is information for the next manifest's price.
+    """
+    rate = plan["pricing"]["creditsPerSecond"]
+    rows, cumulative = [], 0.0
+    for job_id, landed in completed.items():
+        credits = landed.get("credits")
+        if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+            cumulative += float(credits)
+        row = {"id": job_id, "credits": credits, "creditsSource": landed.get("creditsSource"),
+               "measuredSeconds": landed.get("durationSeconds")}
+        if (landed.get("creditsSource") == "receipt" and credits is not None
+                and landed.get("durationSeconds")):
+            per_second = float(credits) / float(landed["durationSeconds"])
+            row.update(creditsPerMeasuredSecond=round(per_second, 4),
+                       ratioToDeclared=round(per_second / rate, 4),
+                       aboveReportTolerance=per_second > rate * PRICE_VARIANCE_REPORT_TOLERANCE)
+        rows.append(row)
+    over = cumulative > plan["maximumCredits"]
+    report = {"manifestSha256": plan["manifestSha256"], "declaredCreditsPerSecond": rate,
+              "maximumCredits": plan["maximumCredits"], "cumulativeLandedCredits": cumulative,
+              "reportTolerance": PRICE_VARIANCE_REPORT_TOLERANCE,
+              "status": "REFUSED" if over else "WITHIN_CEILING", "jobs": rows}
+    atomic_json(HERE / "price-variance.json", report)
+    if over:
+        raise PlanError(f"landed charges {cumulative} exceed maximumCredits "
+                        f"{plan['maximumCredits']}; see price-variance.json")
+    return report
+
+
+def estimated_cost(plan: dict[str, Any]) -> dict[str, Any]:
+    credits = plan["totalSeconds"] * plan["pricing"]["creditsPerSecond"]
+    usd = usd_per_credit()
+    return {"estimatedCredits": credits,
+            "estimatedUsd": round(credits * usd, 4) if usd is not None else None,
+            "usdPerCredit": usd}
 
 
 def validate_pending(plan: dict[str, Any], row: dict[str, Any], path: Path,
@@ -626,6 +673,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "generatedSeconds": plan["totalSeconds"],
             "capSeconds": plan["maxGeneratedSeconds"],
             "maximumCredits": plan["maximumCredits"],
+            **estimated_cost(plan),
             "financialApproval": plan["financialApproval"],
             "financialAuthorized": authorized,
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
@@ -676,6 +724,7 @@ def execute(max_generated_seconds: int, submit: bool,
             result = validate_completed(plan, row)
             result["resumed"] = False
             return result
+        check_charges(plan, completed)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             for offset in range(0, len(jobs), concurrency):
                 group = jobs[offset:offset + concurrency]
@@ -690,6 +739,7 @@ def execute(max_generated_seconds: int, submit: bool,
                         errors.append(f"{row['id']}: {exc}")
                 if errors:
                     raise PlanError("; ".join(errors))
+                check_charges(plan, completed)
         ordered = [completed[row["id"]] for row in plan["jobs"]]
         audit = {
             "episode": EPISODE_CODE,

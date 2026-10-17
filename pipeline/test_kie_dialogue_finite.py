@@ -1,6 +1,7 @@
 """Offline safety tests; no model calls or media processing."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -136,6 +137,37 @@ class DialogueFiniteTest(unittest.TestCase):
         self.assertTrue(all(url.startswith('https://placeholder.invalid/') for url in body['image_urls']))
         self.assertFalse((self.work/'motion/demo-s1001.pending.json').exists())
         self.assertFalse((self.work/'motion').exists())
+
+    def test_landed_charges_stop_only_past_the_ceiling_and_rates_need_receipts(self):
+        plan = RUNNER.load_plan(self.manifest, 7)
+        within = {'demo-s1001': {'credits': 35, 'creditsSource': 'receipt', 'durationSeconds': 7.0},
+                  'demo-s1002': {'credits': 10, 'creditsSource': 'wallet-delta', 'durationSeconds': 7.0}}
+        plan['maximumCredits'] = 45
+        report = RUNNER.check_charges(plan, within)
+        self.assertEqual(report['status'], 'WITHIN_CEILING')
+        receipted, delta = report['jobs']
+        self.assertEqual(receipted['ratioToDeclared'], 1.0)
+        self.assertNotIn('ratioToDeclared', delta)
+        plan['maximumCredits'] = 44
+        with self.assertRaisesRegex(RUNNER.PlanError, 'exceed maximumCredits'):
+            RUNNER.check_charges(plan, within)
+        saved = json.loads((self.work/'price-variance.json').read_text())
+        self.assertEqual((saved['status'], saved['cumulativeLandedCredits']), ('REFUSED', 45.0))
+        plan['maximumCredits'] = 1000
+        pricey = {'demo-s1001': {'credits': 70, 'creditsSource': 'receipt', 'durationSeconds': 7.0}}
+        report = RUNNER.check_charges(plan, pricey)
+        self.assertEqual(report['status'], 'WITHIN_CEILING')
+        self.assertTrue(report['jobs'][0]['aboveReportTolerance'])
+
+    def test_dry_run_estimates_usd_only_from_the_profile(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop('AGENTIC_PROFILE', None)
+            self.assertIsNone(RUNNER.execute(7, False)['estimatedUsd'])
+        profile = self.root/'profile.json'
+        profile.write_text(json.dumps({'providers': {'kie': {'usdPerCredit': 0.01}}}))
+        with mock.patch.dict(os.environ, {'AGENTIC_PROFILE': str(profile)}):
+            result = RUNNER.execute(7, False)
+        self.assertEqual((result['estimatedCredits'], result['estimatedUsd']), (35, 0.35))
 
     def test_reconcile_only_polls_recorded_tasks_without_approval(self):
         row_ids = []

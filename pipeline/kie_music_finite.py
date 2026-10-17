@@ -28,12 +28,12 @@ import urllib.request
 if __package__:
     from ._common import (atomic_json as _atomic_json,
                           atomic_new_bytes as _atomic_bytes_new, env_key,
-                          sha256_file as _sha_file)
+                          sha256_file as _sha_file, usd_per_credit)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
     from _common import (atomic_json as _atomic_json,
                          atomic_new_bytes as _atomic_bytes_new, env_key,
-                         sha256_file as _sha_file)
+                         sha256_file as _sha_file, usd_per_credit)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
 
@@ -667,7 +667,11 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
     plan["approvalAdmissionSha256"] = approval["sha256"] if approval else None
     plan["approvalAuthorizationId"] = approval["authorizationId"] if approval else None
     if operation == "dry-run":
+        usd = usd_per_credit()
         return {"operation": "DRY_RUN", "networkCalls": 0,
+                "estimatedCredits": plan["expectedCredits"],
+                "estimatedUsd": round(plan["expectedCredits"] * usd, 4) if usd is not None else None,
+                "usdPerCredit": usd,
                 "financialApproval": plan["doc"].get("financialApproval") is True,
                 "financialAuthorized": plan["financialAuthorized"],
                 "approvalAdmissionSha256": plan["approvalAdmissionSha256"],
