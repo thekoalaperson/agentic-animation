@@ -52,13 +52,13 @@ import urllib.request
 if __package__:
     from ._common import (atomic_json as _atomic_json,
                           atomic_new_bytes as _atomic_new_bytes,
-                          canonical_sha256 as _canonical_sha, env_key,
+                          canonical_sha256 as _canonical_sha, env_key, project_root,
                           sha256_file as _sha256_file)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
     from _common import (atomic_json as _atomic_json,
                          atomic_new_bytes as _atomic_new_bytes,
-                         canonical_sha256 as _canonical_sha, env_key,
+                         canonical_sha256 as _canonical_sha, env_key, project_root,
                          sha256_file as _sha256_file)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
@@ -70,7 +70,7 @@ STATE_VERSION = 1
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 VOICE_SETTING_RANGES = {"stability": (0, 1), "similarity_boost": (0, 1), "style": (0, 1),
                         "speed": (0.7, 1.2), "use_speaker_boost": "boolean"}
-ITEM_FIELDS = {"id", "text", "textFile", "output"}
+ITEM_FIELDS = {"id", "text", "textFile", "textSha256", "output"}
 
 
 def schema() -> dict[str, Any]:
@@ -87,7 +87,8 @@ def schema() -> dict[str, Any]:
         "voiceSettingRanges": VOICE_SETTING_RANGES,
         "voiceSettingsNote": "every key is required and frozen; no value is supplied by the tool",
         "itemFields": sorted(ITEM_FIELDS),
-        "itemRule": "exactly one of text or textFile; output is a relative .mp3 below episodeRoot",
+        "itemRule": ("exactly one of text or textFile; textSha256, when present, binds the "
+                     "textFile bytes; output is a relative .mp3 below episodeRoot"),
         "aggregateCharacters": "sum of stripped item text lengths; --max-characters must equal it",
         "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
         "approvalLane": APPROVAL_LANE,
@@ -288,7 +289,11 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
                 raw_text = text_path.read_text(encoding="utf-8")
             except OSError as exc:
                 raise PlanError(f"{item_id}: cannot read textFile: {exc}") from exc
+            if "textSha256" in item and _sha256_file(text_path) != item["textSha256"]:
+                raise PlanError(f"{item_id}: textFile changed after the manifest was frozen")
         else:
+            if "textSha256" in item:
+                raise PlanError(f"{item_id}: textSha256 binds a textFile, not inline text")
             text_path = None
             raw_text = item["text"]
         text = _hindi_text(raw_text, item_id)
@@ -610,6 +615,96 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
             pass
 
 
+def freeze(draft_path: Path, manifest_path: Path, project: Path, *,
+           voice_settings: dict[str, Any], voice_id: str | None = None,
+           authority_path: Path | None = None) -> dict[str, Any]:
+    """Write a narration manifest from a draft plan, then dry-run it.
+
+    Accepts the narration-plan.json that prepare_episode_production.py writes
+    (project-relative outputs, inline text) and items that name a textFile,
+    which are bound by textSha256. Voice settings are the operator's own
+    frozen choice; the tool supplies none. financialApproval is always false.
+    """
+    project = project.resolve()
+    manifest_path = manifest_path.resolve()
+    if manifest_path.exists():
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}")
+    if not _is_below(manifest_path, project) or not _is_below(draft_path.resolve(), project):
+        raise PlanError("draft and manifest must both sit inside the project")
+    try:
+        draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot read narration draft: {exc}") from exc
+    settings = _validate_voice_settings(voice_settings)
+    voice = voice_id or draft.get("voiceId") or draft.get("voice")
+    if not isinstance(voice, str) or not SAFE_ID.fullmatch(voice):
+        raise PlanError("no cast voice: pass --voice-id or name voiceId in the draft")
+    model = draft.get("modelId", draft.get("model", ALLOWED_MODEL))
+    if model != ALLOWED_MODEL:
+        raise PlanError(f"this lane accepts only {ALLOWED_MODEL}; the draft asks for {model!r}")
+    items = draft.get("items")
+    if not isinstance(items, list) or not items:
+        raise PlanError("draft items must be a non-empty list")
+    here = manifest_path.parent
+    frozen, problems, total = [], [], 0
+    for position, item in enumerate(items):
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not SAFE_ID.fullmatch(item_id):
+            problems.append(f"item {position}: id is missing or malformed")
+            continue
+        output = item.get("output")
+        if not isinstance(output, str) or not output.endswith(".mp3"):
+            problems.append(f"{item_id}: output must be a project-relative .mp3 path")
+            continue
+        row: dict[str, Any] = {"id": item_id,
+                               "output": os.path.relpath(project / output, here)}
+        if isinstance(item.get("textFile"), str):
+            text_path = (project / item["textFile"]).resolve()
+            if not text_path.is_file():
+                problems.append(f"{item_id}: textFile is missing: {text_path}")
+                continue
+            row.update(textFile=os.path.relpath(text_path, here),
+                       textSha256=_sha256_file(text_path))
+            text = text_path.read_text(encoding="utf-8")
+        else:
+            text = item.get("text")
+            row["text"] = text
+        if not isinstance(text, str) or not text.strip():
+            problems.append(f"{item_id}: narration text is empty")
+            continue
+        total += len(text.strip())
+        frozen.append(row)
+    if problems:
+        raise PlanError("cannot freeze yet: " + "; ".join(problems))
+    relative_root = os.path.relpath(project, here)
+    doc: dict[str, Any] = {
+        "version": 1, "episode": draft.get("episode"), "financialApproval": False,
+        "language": "hi", "voiceId": voice, "modelId": ALLOWED_MODEL,
+        "outputFormat": ALLOWED_FORMAT, "voiceSettings": settings,
+        "episodeRoot": relative_root, "projectRoot": relative_root,
+        "provenancePathBase": "project",
+        "sourcePlan": draft_path.resolve().relative_to(project).as_posix(),
+        "sourcePlanSha256": _sha256_file(draft_path.resolve()),
+        "aggregateCharacters": total, "items": frozen,
+    }
+    if authority_path is not None:
+        authority_path = authority_path.resolve()
+        if not authority_path.is_file():
+            raise PlanError(f"authority file is missing: {authority_path}")
+        doc.update(authority=os.path.relpath(authority_path, here),
+                   authoritySha256=_sha256_file(authority_path))
+    raw = (json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    try:
+        _atomic_new_bytes(manifest_path, raw)
+    except FileExistsError as exc:
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}") from exc
+    try:
+        return execute(manifest_path, total, False)
+    except PlanError:
+        manifest_path.unlink()
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -621,6 +716,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="explicit hard cap for all manifest text; must equal aggregateCharacters")
     parser.add_argument("--print-schema", action="store_true",
                         help="print the narration manifest contract and exit")
+    parser.add_argument("--freeze", type=Path, metavar="DRAFT",
+                        help="write MANIFEST from a narration plan, then dry-run it")
+    freezing = parser.add_argument_group("freeze inputs")
+    freezing.add_argument("--project", type=Path, help="project root (or AGENTIC_PROJECT_ROOT)")
+    freezing.add_argument("--voice-settings", type=Path,
+                          help="JSON with every voiceSettings key, chosen for this film")
+    freezing.add_argument("--voice-id", help="the cast voice; otherwise the draft's voiceId")
+    freezing.add_argument("--authority", type=Path, help="production authority file to bind")
     parser.add_argument("--submit", action="store_true",
                         help="perform at most one POST for each pending item")
     parser.add_argument("--approval-admission", type=Path,
@@ -628,6 +731,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.print_schema:
         print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.freeze is not None:
+        if args.manifest is None or args.voice_settings is None:
+            parser.error("--freeze DRAFT needs the MANIFEST path to write and --voice-settings")
+        try:
+            settings = json.loads(args.voice_settings.read_text(encoding="utf-8"))
+            result = freeze(args.freeze, args.manifest, project_root(args.project),
+                            voice_settings=settings, voice_id=args.voice_id,
+                            authority_path=args.authority)
+        except (PlanError, ValueError, OSError) as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"frozen": str(args.manifest.resolve()), **result},
+                         ensure_ascii=False, indent=2))
         return 0
     if args.manifest is None or args.max_characters is None:
         parser.error("manifest and --max-characters are required")

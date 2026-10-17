@@ -64,7 +64,7 @@ def schema() -> dict[str, Any]:
                                "sourceDraft", "sourceDraftSha256", "cues", "creditsPerRequest",
                                "maxRequests", "maxCredits", "outputDirectory",
                                "expectedCandidatesPerRequest"],
-        "optionalRootFields": ["episode", "provenancePathBase", "projectRoot",
+        "optionalRootFields": ["episode", "pricing", "provenancePathBase", "projectRoot",
                                "productionOverrides", "productionOverridesSha256",
                                "authority", "authoritySha256", "creativeBindings"],
         "fixedValues": {"version": 1},
@@ -714,6 +714,82 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
             pass
 
 
+UTC_SECOND = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+
+def _new_bytes(path: Path, raw: bytes) -> None:
+    try:
+        _atomic_bytes_new(path, raw)
+    except FileExistsError as exc:
+        raise PlanError(f"refusing to overwrite {path}") from exc
+
+
+def freeze(draft_path: Path, manifest_path: Path, *, credits_per_request: int,
+           price_verified_at: str, price_evidence: str, authority_path: Path,
+           output_directory: str = "sources", expected_candidates: int = 2,
+           episode: str | None = None) -> dict[str, Any]:
+    """Write an execution manifest from a {commonPayload, cues} draft, then dry-run it.
+
+    The cue list is the draft's cues with commonPayload merged in, exactly what
+    load_plan compares. The price is the operator's own live reading; the tool
+    never supplies a rate. financialApproval is always false: only a separate
+    approval record, drafted after this freeze, authorizes spending.
+    """
+    manifest_path = manifest_path.resolve()
+    if manifest_path.exists():
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}")
+    if (isinstance(credits_per_request, bool) or not isinstance(credits_per_request, int)
+            or credits_per_request <= 0):
+        raise PlanError("--credits-per-request must be the positive whole rate you verified today")
+    if not isinstance(price_verified_at, str) or not UTC_SECOND.fullmatch(price_verified_at):
+        raise PlanError("--price-verified-at must be a UTC time such as 2026-01-01T12:00:00Z")
+    if not isinstance(price_evidence, str) or not price_evidence.strip():
+        raise PlanError("--price-evidence must say where the live price was read")
+    root = manifest_path.parent
+    draft_path = draft_path.resolve()
+    try:
+        source = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot read score draft: {exc}") from exc
+    common, cues = source.get("commonPayload"), source.get("cues")
+    if not isinstance(common, dict) or not isinstance(cues, list) or not cues:
+        raise PlanError("score draft needs commonPayload and a non-empty cues list")
+    root.mkdir(parents=True, exist_ok=True)
+    if not _is_below(draft_path, root):
+        copy = root / "creative-draft.json"
+        if copy.exists() and copy.read_bytes() != draft_path.read_bytes():
+            raise PlanError(f"{copy} already holds a different draft")
+        if not copy.exists():
+            _new_bytes(copy, draft_path.read_bytes())
+        draft_path = copy
+    authority_path = authority_path.resolve()
+    if not authority_path.is_file():
+        raise PlanError(f"authority file is missing: {authority_path}")
+    materialized = [{**cue, "payload": {**common, **cue.get("payload", {})}} for cue in cues]
+    doc = {
+        "version": 1, "episode": episode or source.get("episode"),
+        "financialApproval": False, "currentPriceVerified": True,
+        "pricing": {"creditsPerRequest": credits_per_request, "verifiedAtUtc": price_verified_at,
+                    "evidence": price_evidence.strip()},
+        "sourceDraft": draft_path.relative_to(root).as_posix(),
+        "sourceDraftSha256": _sha_file(draft_path),
+        "authority": os.path.relpath(authority_path, root),
+        "authoritySha256": _sha_file(authority_path),
+        "creditsPerRequest": credits_per_request, "maxRequests": len(materialized),
+        "maxCredits": len(materialized) * credits_per_request,
+        "outputDirectory": output_directory,
+        "expectedCandidatesPerRequest": expected_candidates,
+        "cues": materialized,
+    }
+    _new_bytes(manifest_path, (json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2)
+                               + "\n").encode("utf-8"))
+    try:
+        return execute(manifest_path, doc["maxRequests"], doc["maxCredits"])
+    except PlanError:
+        manifest_path.unlink()
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -725,6 +801,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-credits", type=int)
     parser.add_argument("--print-schema", action="store_true",
                         help="print the score manifest contract and exit")
+    parser.add_argument("--freeze", type=Path, metavar="DRAFT",
+                        help="write MANIFEST from a {commonPayload, cues} draft, then dry-run it")
+    freezing = parser.add_argument_group("freeze inputs (the price is your own live reading)")
+    freezing.add_argument("--credits-per-request", type=int)
+    freezing.add_argument("--price-verified-at", help="UTC time you read the provider's price")
+    freezing.add_argument("--price-evidence", help="where you read it: page URL and model")
+    freezing.add_argument("--authority", type=Path, help="the production authority file to bind")
+    freezing.add_argument("--output-directory", default="sources",
+                          help="candidate folder below the manifest (default sources)")
+    freezing.add_argument("--expected-candidates", type=int, default=2,
+                          help="takes the provider returns per request (default 2)")
+    freezing.add_argument("--episode", help="project code when the draft names none")
     parser.add_argument("--approval-admission", type=Path)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--submit", action="store_true")
@@ -732,6 +820,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.print_schema:
         print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.freeze is not None:
+        if args.manifest is None or args.authority is None:
+            parser.error("--freeze DRAFT needs the MANIFEST path to write and --authority")
+        try:
+            result = freeze(args.freeze, args.manifest,
+                            credits_per_request=args.credits_per_request,
+                            price_verified_at=args.price_verified_at,
+                            price_evidence=args.price_evidence, authority_path=args.authority,
+                            output_directory=args.output_directory,
+                            expected_candidates=args.expected_candidates, episode=args.episode)
+        except PlanError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"frozen": str(args.manifest.resolve()), **result},
+                         ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.manifest is None or args.max_requests is None or args.max_credits is None:
         parser.error("manifest, --max-requests and --max-credits are required")

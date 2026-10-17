@@ -80,6 +80,8 @@ JOB_FIELDS = {
     "id", "speaker", "hindi", "durationSeconds", "source", "sourceSha256",
     "prompt", "promptSha256", "outputStem",
 }
+# Optional root fields: absent, a manifest validates exactly as before.
+OPTIONAL_ROOT_FIELDS = {"siblingManifests"}
 APPROVAL_LANE = "grok-dialogue"
 FIXED_HEADER = {
     "version": 2,
@@ -98,6 +100,10 @@ def schema() -> dict[str, Any]:
     return {
         "manifest": "work/<batch>/execution-manifest.json",
         "rootFields": sorted(ROOT_FIELDS),
+        "optionalRootFields": {
+            "siblingManifests": "[{path, sha256}] of other frozen dialogue manifests in this "
+                                "project; any shared job id or output stem is refused",
+        },
         "fixedValues": {**FIXED_HEADER, "episode": "the project code (storyboard episode)"},
         "jobFields": sorted(JOB_FIELDS),
         "pricingFields": sorted(PRICING_FIELDS),
@@ -189,6 +195,35 @@ def execution_request(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, An
     }
 
 
+def check_siblings(value: Any, manifest_path: Path, ids: set[str], stems: set[Path]) -> None:
+    """Refuse a job or output that another frozen manifest of this project also holds.
+
+    Only the siblings' frozen bytes are read, never their completion state, so
+    this manifest's scope stays exactly what its approval record bound.
+    """
+    if not isinstance(value, list) or not value:
+        raise PlanError("siblingManifests must be a non-empty list of {path, sha256}")
+    for position, entry in enumerate(value):
+        label = f"siblingManifests[{position}]"
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise PlanError(f"{label} must be exactly {{path, sha256}}")
+        path = project_path(entry["path"], label, EPISODE / "work")
+        if path == manifest_path.resolve():
+            raise PlanError(f"{label} names this manifest itself")
+        if not path.is_file() or sha256(path) != require_sha(entry["sha256"], f"{label}.sha256"):
+            raise PlanError(f"{label} is missing or changed after this manifest was frozen: {path}")
+        other = read_object(path, label).get("jobs")
+        if not isinstance(other, list):
+            raise PlanError(f"{label} has no jobs list")
+        shared = sorted(ids & {job.get("id") for job in other if isinstance(job, dict)})
+        if shared:
+            raise PlanError(f"{label} already holds job ids {shared}; a job is paid for once")
+        other_stems = {(EPISODE / job["outputStem"]).resolve() for job in other
+                       if isinstance(job, dict) and isinstance(job.get("outputStem"), str)}
+        if stems & other_stems:
+            raise PlanError(f"{label} writes the same output stems {sorted(map(str, stems & other_stems))}")
+
+
 def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]:
     if (isinstance(max_generated_seconds, bool)
             or not isinstance(max_generated_seconds, int)
@@ -196,9 +231,9 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         raise PlanError("--max-generated-seconds must be a positive integer")
     manifest_path = manifest_path.resolve()
     doc = read_object(manifest_path, "execution manifest")
-    if set(doc) != ROOT_FIELDS:
+    if set(doc) - OPTIONAL_ROOT_FIELDS != ROOT_FIELDS:
         missing = sorted(ROOT_FIELDS - set(doc))
-        extra = sorted(set(doc) - ROOT_FIELDS)
+        extra = sorted(set(doc) - ROOT_FIELDS - OPTIONAL_ROOT_FIELDS)
         raise PlanError(f"execution manifest schema mismatch; missing={missing}, extra={extra}")
     expected_header = {**FIXED_HEADER, "episode": EPISODE_CODE}
     for key, expected in expected_header.items():
@@ -285,6 +320,8 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         normalized.append(row)
         total += duration
 
+    if "siblingManifests" in doc:
+        check_siblings(doc["siblingManifests"], manifest_path, ids, stems)
     if (isinstance(doc.get("jobCount"), bool) or doc.get("jobCount") != len(jobs)
             or isinstance(doc.get("maximumGeneratedSeconds"), bool)
             or doc.get("maximumGeneratedSeconds") != total):
@@ -763,6 +800,188 @@ def execute(max_generated_seconds: int, submit: bool,
         LOCK.unlink(missing_ok=True)
 
 
+UTC_SECOND = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+NO_AUDIT = {"kind": "source-audit", "newAngleAuditPerformed": False,
+            "note": "No new-angle source audit was performed before this freeze."}
+NO_OVERRIDES = {"items": {}, "note": "No production overrides were declared at freeze time."}
+
+
+def _write_new_json(path: Path, value: Any) -> None:
+    from pipeline._common import atomic_new_bytes
+    raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    try:
+        atomic_new_bytes(path, raw)
+    except FileExistsError as exc:
+        raise PlanError(f"refusing to overwrite {path}") from exc
+
+
+def _relative(path: Path) -> str:
+    return path.resolve().relative_to(EPISODE).as_posix()
+
+
+def _draft_source(item: dict[str, Any]) -> Path:
+    value = item.get("source", item.get("still"))
+    if not isinstance(value, str) or not value:
+        raise PlanError(f"{item.get('id')}: draft item names no source still")
+    path = Path(value)
+    return contained(path if path.is_absolute() else EPISODE / path, EPISODE, f"{item.get('id')}.source")
+
+
+def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
+           price_verified_at: str, price_evidence: str, maximum_credits: float | None = None,
+           durations: dict[str, int] | None = None, only: list[str] | None = None,
+           omit_from: list[Path] | None = None, selection_reason: str | None = None,
+           no_source_audit: bool = False, no_production_overrides: bool = False,
+           episode_code: str | None = None, production_overrides: Path | None = None,
+           authority_path: Path | None = None) -> dict[str, Any]:
+    """Write execution-manifest.json from a draft with every hash computed.
+
+    The field list comes from ROOT_FIELDS and JOB_FIELDS, so the writer and the
+    validator cannot drift. The price is the operator's own live reading; the
+    tool never supplies a rate. financialApproval is always false: only a
+    separate approval record, drafted after this freeze, authorizes spending.
+    """
+    if EPISODE is None:
+        raise PlanError("freeze needs --project (or AGENTIC_PROJECT_ROOT)")
+    manifest_path = contained(manifest_path, EPISODE / "work", "manifest")
+    if manifest_path.exists():
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}")
+    here = manifest_path.parent
+    draft = read_object(draft_path.resolve(), "dialogue draft")
+    code = episode_code or draft.get("episode")
+    if not isinstance(code, str) or not code:
+        raise PlanError("the draft names no episode; pass --episode-code")
+    if (isinstance(credits_per_second, bool) or not isinstance(credits_per_second, (int, float))
+            or not math.isfinite(credits_per_second) or credits_per_second <= 0):
+        raise PlanError("--credits-per-second must be the positive rate you verified today")
+    if not isinstance(price_verified_at, str) or not UTC_SECOND.fullmatch(price_verified_at):
+        raise PlanError("--price-verified-at must be a UTC time such as 2026-01-01T12:00:00Z")
+    if not isinstance(price_evidence, str) or not price_evidence.strip():
+        raise PlanError("--price-evidence must say where the live price was read")
+    items = draft.get("items")
+    if not isinstance(items, list) or not items:
+        raise PlanError("draft items must be a non-empty list")
+    by_id = {item.get("id"): item for item in items if isinstance(item, dict)}
+    if len(by_id) != len(items):
+        raise PlanError("draft items need unique ids")
+
+    omitted: dict[str, list[str]] = {}
+    siblings = []
+    for other_path in omit_from or []:
+        other_path = contained(other_path, EPISODE / "work", "--omit-from manifest")
+        other = read_object(other_path, "--omit-from manifest").get("jobs") or []
+        held = sorted(job["id"] for job in other if isinstance(job, dict) and job.get("id") in by_id)
+        omitted[_relative(other_path)] = held
+        siblings.append({"path": _relative(other_path), "sha256": sha256(other_path)})
+    selected = list(by_id)
+    if only:
+        unknown = sorted(set(only) - set(by_id))
+        if unknown:
+            raise PlanError(f"--only names ids missing from the draft: {unknown}")
+        selected = [job_id for job_id in selected if job_id in set(only)]
+    skip = {job_id for held in omitted.values() for job_id in held}
+    selected = [job_id for job_id in selected if job_id not in skip]
+    if not selected:
+        raise PlanError("the selection leaves no jobs to freeze")
+    if (only or omit_from) and not (selection_reason and selection_reason.strip()):
+        raise PlanError("a selection needs --selection-reason, kept in selection-note.json")
+
+    problems, jobs = [], []
+    durations = durations or {}
+    for job_id in selected:
+        item = by_id[job_id]
+        line = item.get("hindi", item.get("text"))
+        duration = item.get("durationSeconds", durations.get(job_id))
+        prompt = (EPISODE / item["prompt"]) if isinstance(item.get("prompt"), str) else here / "prompts" / f"{job_id}.txt"
+        found = []
+        if not isinstance(item.get("speaker"), str) or not item["speaker"].strip():
+            found.append(f"{job_id}: no speaker")
+        if not isinstance(line, str) or not line.strip():
+            found.append(f"{job_id}: no dialogue line")
+        if (isinstance(duration, bool) or not isinstance(duration, int)
+                or duration not in ALLOWED_DURATIONS):
+            found.append(f"{job_id}: durationSeconds missing or not a whole number "
+                         f"{min(ALLOWED_DURATIONS)}-{max(ALLOWED_DURATIONS)}")
+        if not prompt.is_file():
+            found.append(f"{job_id}: prompt not written yet at {prompt}")
+        elif isinstance(line, str) and line not in prompt.read_text(encoding="utf-8"):
+            found.append(f"{job_id}: prompt does not contain the exact line")
+        try:
+            source = _draft_source(item)
+            if not source.is_file():
+                found.append(f"{job_id}: source still missing at {source}")
+        except PlanError as exc:
+            found.append(str(exc))
+        problems.extend(found)
+        if found:
+            continue
+        jobs.append({"id": job_id, "speaker": item["speaker"], "hindi": line,
+                     "durationSeconds": duration, "source": _relative(source),
+                     "sourceSha256": sha256(source), "prompt": _relative(prompt),
+                     "promptSha256": sha256(prompt),
+                     "outputStem": _relative(here / "motion" / job_id)})
+    if problems:
+        raise PlanError("cannot freeze yet: " + "; ".join(problems))
+
+    here.mkdir(parents=True, exist_ok=True)
+    draft_copy = here / "draft-manifest.json"
+    if draft_copy.resolve() != draft_path.resolve():
+        if draft_copy.exists() and draft_copy.read_bytes() != draft_path.read_bytes():
+            raise PlanError(f"{draft_copy} already holds a different draft")
+        if not draft_copy.exists():
+            from pipeline._common import atomic_new_bytes
+            atomic_new_bytes(draft_copy, draft_path.read_bytes())
+    audit = here / "source-audit.json"
+    if not audit.exists():
+        if not no_source_audit:
+            raise PlanError(f"write {audit} from your source inspection, or pass "
+                            "--no-source-audit to record that none was performed")
+        _write_new_json(audit, NO_AUDIT)
+    overrides = contained(production_overrides or EPISODE / "story/production-overrides-v1.json",
+                          EPISODE / "story", "production overrides")
+    if not overrides.exists():
+        if not no_production_overrides:
+            raise PlanError(f"{overrides} is missing; pass --no-production-overrides to record none")
+        _write_new_json(overrides, NO_OVERRIDES)
+    authority = contained(authority_path or EPISODE / "story/GOAL.md", EPISODE / "story", "authority")
+    if not authority.is_file():
+        raise PlanError(f"authority file is missing: {authority}")
+
+    total = sum(job["durationSeconds"] for job in jobs)
+    ceiling = total * credits_per_second if maximum_credits is None else maximum_credits
+    doc = {
+        **FIXED_HEADER, "episode": code,
+        "financialApproval": False,
+        "financialState": "frozen; awaiting a hash-bound approval record",
+        "draftManifest": _relative(draft_copy), "draftManifestSha256": sha256(draft_copy),
+        "newAngleAudit": _relative(audit), "newAngleAuditSha256": sha256(audit),
+        "productionOverrides": _relative(overrides), "productionOverridesSha256": sha256(overrides),
+        "authority": _relative(authority), "authoritySha256": sha256(authority),
+        "jobCount": len(jobs), "maximumGeneratedSeconds": total, "jobs": jobs,
+        "pricing": {"creditsPerSecond": credits_per_second, "verifiedAtUtc": price_verified_at,
+                    "evidence": price_evidence.strip()},
+        "maximumCredits": ceiling,
+    }
+    if siblings:
+        doc["siblingManifests"] = siblings
+    if set(doc) - OPTIONAL_ROOT_FIELDS != ROOT_FIELDS or any(set(job) != JOB_FIELDS for job in jobs):
+        raise PlanError("freeze produced fields the validator does not accept")
+    _write_new_json(manifest_path, doc)
+    try:
+        configure(manifest_path, EPISODE, overrides, code, authority)
+        result = execute(total, False)
+    except PlanError:
+        manifest_path.unlink()
+        raise
+    if only or omit_from:
+        _write_new_json(here / "selection-note.json", {
+            "reason": selection_reason.strip(), "selected": selected,
+            "only": sorted(only or []), "omittedBecauseHeldBy": omitted,
+            "manifest": _relative(manifest_path), "manifestSha256": sha256(manifest_path),
+            "draft": _relative(draft_copy), "draftJobCount": len(by_id)})
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -793,9 +1012,52 @@ def main(argv: list[str] | None = None) -> int:
                        help="dry run that also prints each provider request with placeholder URLs")
     modes.add_argument("--print-schema", action="store_true",
                        help="print the execution manifest contract and exit")
+    modes.add_argument("--freeze", type=Path, metavar="DRAFT",
+                       help="write MANIFEST from a dialogue draft with every hash computed, "
+                            "then dry-run it; never overwrites")
+    freezing = parser.add_argument_group("freeze inputs (the price is your own live reading)")
+    freezing.add_argument("--credits-per-second", type=float)
+    freezing.add_argument("--price-verified-at", help="UTC time you read the provider's price")
+    freezing.add_argument("--price-evidence", help="where you read it: page URL and model")
+    freezing.add_argument("--maximum-credits", type=float,
+                          help="ceiling; defaults to frozen seconds x credits per second")
+    freezing.add_argument("--durations", type=Path,
+                          help="JSON {job id: seconds} for draft items without durationSeconds")
+    freezing.add_argument("--only", help="comma-separated job ids to freeze (a pilot, a retake set)")
+    freezing.add_argument("--omit-from", type=Path, action="append",
+                          help="omit jobs another frozen manifest already holds, and bind it "
+                               "as a sibling so no job is paid for twice")
+    freezing.add_argument("--selection-reason", help="why this subset; kept in selection-note.json")
+    freezing.add_argument("--no-source-audit", action="store_true",
+                          help="record that no new-angle source audit was performed")
+    freezing.add_argument("--no-production-overrides", action="store_true",
+                          help="record that this episode has no production overrides")
     args = parser.parse_args(argv)
     if args.print_schema:
         print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.freeze is not None:
+        if args.manifest is None:
+            parser.error("--freeze DRAFT needs the MANIFEST path to write")
+        try:
+            global EPISODE
+            EPISODE = project_root(args.episode_root)
+            durations = (read_object(args.durations.resolve(), "durations")
+                         if args.durations else None)
+            result = freeze(
+                args.freeze, args.manifest, credits_per_second=args.credits_per_second,
+                price_verified_at=args.price_verified_at, price_evidence=args.price_evidence,
+                maximum_credits=args.maximum_credits, durations=durations,
+                only=[x for x in (args.only or "").split(",") if x] or None,
+                omit_from=args.omit_from, selection_reason=args.selection_reason,
+                no_source_audit=args.no_source_audit,
+                no_production_overrides=args.no_production_overrides,
+                episode_code=args.episode_code, production_overrides=args.production_overrides,
+                authority_path=args.authority_file)
+        except (PlanError, ValueError) as exc:
+            raise SystemExit(f"REFUSED: {exc}") from exc
+        print(json.dumps({"frozen": str(args.manifest.resolve()), **result},
+                         ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.manifest is None or args.max_generated_seconds is None:
         parser.error("manifest and --max-generated-seconds are required")
