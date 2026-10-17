@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from build_working_audio import validate_working_clock
@@ -35,6 +36,52 @@ class WorkingClockTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):validate_working_clock(self.clock,'OTHER')
         self.clock['renderable']=True
         with self.assertRaises(RuntimeError):validate_working_clock(self.clock,'DEMO')
+
+
+
+class AuditionTests(unittest.TestCase):
+    def test_audition_receipts_get_their_own_kinds(self):
+        import build_working_audio as working
+        for kind in ('working-audio-stems-not-final','working-audio-context-not-final'):
+            record=working.label_audition({'kind':kind},True,{'computeHost':'demo'})
+            self.assertTrue(record['kind'].endswith('-audition-not-final'))
+            self.assertIs(record['admissible'],False)
+            self.assertEqual(working.label_audition({'kind':kind},False,None),{'kind':kind})
+        self.assertEqual(working.audition_output('work/mix-v1',True),'work/mix-v1-audition-not-final')
+
+    def test_admission_steps_refuse_audition_receipts(self):
+        import tempfile, json
+        import build_working_audio as working
+        import build_score_sfx_revision as revision
+        import short_audio_contract as short
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            stems=working.label_audition({'kind':'working-audio-stems-not-final','finalApproved':False,
+                                          'outputs':{'voice':{'sha256':'a'*64}}},True,{})
+            (root/'voice.json').write_text(json.dumps(stems));(root/'sfx.json').write_text('{}')
+            config={'inputs':{'clock':{'sha256':'c'*64},'voice':{'sha256':'a'*64}}}
+            with self.assertRaisesRegex(RuntimeError,'working admission provenance'):
+                revision.validate_working_stems(config,{'voiceAudit':root/'voice.json','sfxAudit':root/'sfx.json'})
+            mix=working.label_audition({'kind':'working-audio-context-not-final','voiceGain':1,
+                                        'unchangedVoiceRecoveryMaxError':0.0},True,{})
+            for name,value in (('mix',mix),('voice',stems),('source',{})):
+                (root/f'{name}.json').write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError,'linear whole-voice provenance'):
+                short.prepared_audio({'inputs':{}},{'mixAudit':root/'mix.json','voiceAudit':root/'voice.json',
+                                                    'sourceVoiceAudit':root/'source.json'},None)
+
+    def test_production_run_keeps_its_gate(self):
+        import build_working_audio as working
+        with unittest.mock.patch.object(working.sys,'platform','darwin'),self.assertRaisesRegex(RuntimeError,'qualified GPU worker'):
+            working.main(['/nonexistent','/nonexistent.json'])
+
+    def test_working_music_keeps_its_gate(self):
+        import tempfile, json
+        import render_working_music as music
+        with tempfile.TemporaryDirectory() as d:
+            config=Path(d)/'config.json';config.write_text(json.dumps({'finalApproved':False}))
+            with unittest.mock.patch.object(music.platform,'system',return_value='Darwin'),self.assertRaisesRegex(RuntimeError,'GCP'):
+                music.main([d,str(config)])
 
 
 if __name__=='__main__':unittest.main()

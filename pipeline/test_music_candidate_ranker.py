@@ -395,6 +395,38 @@ class BindingAndExecutionTests(unittest.TestCase):
             self.assertTrue(all(candidate["selectionVerdict"].startswith("unreviewed")
                                 for candidate in report["candidates"]))
 
+    def test_off_worker_decode_needs_an_explicit_audition(self) -> None:
+        with patch.object(ranker.sys, "platform", "darwin"):
+            with self.assertRaisesRegex(ranker.AnalysisError, "qualified GPU worker"):
+                ranker.decode_audio(Path("/nonexistent.wav"), SAMPLE_RATE)
+            with self.assertRaisesRegex(ranker.AnalysisError, "audio decode failed|ffmpeg is required"):
+                ranker.decode_audio(Path("/nonexistent.wav"), SAMPLE_RATE, audition=True)
+
+    def test_audition_report_is_labelled_and_leaves_the_report_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            audio = pulse_track(seconds=12.0)
+            fixture.add_candidate(1, audio)
+            fixture.add_candidate(2, audio.copy())
+            with patch.object(ranker, "decode_audio", return_value=audio) as decode, \
+                    patch.object(ranker, "audition_record",
+                                 return_value={"audition": True, "admissible": False}):
+                result = ranker.execute(fixture.manifest_path, do_analyze=True, audition=True)
+            self.assertTrue(all(call.kwargs == {"audition": True} for call in decode.call_args_list))
+            self.assertTrue(result["audition"])
+            self.assertFalse((fixture.root / "analysis" / "report.json").exists())
+            labelled = fixture.root / "analysis" / "report-audition-not-final.json"
+            self.assertEqual(Path(result["report"]).name, labelled.name)
+            report = json.loads(labelled.read_text(encoding="utf-8"))
+            self.assertEqual(report["auditionRecord"], {"audition": True, "admissible": False})
+            with patch.object(ranker, "decode_audio", return_value=audio):
+                plain = ranker.execute(fixture.manifest_path, do_analyze=True)
+            self.assertNotIn("audition", plain)
+            normal = json.loads((fixture.root / "analysis" / "report.json").read_text(encoding="utf-8"))
+            self.assertNotIn("auditionRecord", normal)
+            with self.assertRaisesRegex(ranker.AnalysisError, "applies to --analyze"):
+                ranker.execute(fixture.manifest_path, audition=True)
+
     def test_media_changed_after_sidecar_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = ManifestFixture(Path(directory))

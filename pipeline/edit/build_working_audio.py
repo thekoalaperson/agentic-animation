@@ -2,6 +2,13 @@
 
 This does not turn an incomplete picture clock into a renderable edit plan.
 The shared voice/score mechanics remain in assemble_longform.
+
+Without --audition this runs on the qualified GPU worker. --audition runs on
+any host with ffmpeg, writes into `<outputDirectory>-audition-not-final`,
+records the real host and ffmpeg build, and gives its receipt an audition kind
+(working-audio-stems-audition-not-final or
+working-audio-context-audition-not-final) that no later stem, Short or master
+step accepts.
 """
 import argparse
 import json
@@ -12,6 +19,24 @@ import sys
 import math
 
 import assemble_longform as assembly
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import _common
+
+AUDITION = '-audition-not-final'
+AUDITION_KINDS = {'working-audio-stems-not-final': 'working-audio-stems-audition-not-final',
+                  'working-audio-context-not-final': 'working-audio-context-audition-not-final'}
+
+
+def audition_output(name, audition):
+    return name + AUDITION if audition else name
+
+
+def label_audition(record, audition, host):
+    """Give an audition receipt its own kind so admission steps refuse it."""
+    if audition:
+        record.update(kind=AUDITION_KINDS[record['kind']], audition=True, admissible=False, hostRecord=host)
+    return record
 
 
 def validate_working_clock(clock, episode):
@@ -32,7 +57,7 @@ def validate_working_clock(clock, episode):
         raise RuntimeError('Working speech clock does not end at its declared runtime')
 
 
-def mix_working(ep, config_path, config):
+def mix_working(ep, config_path, config, audition=False, host=None):
     """Use shared mixer DSP without promoting a working clock into picture."""
     import mix_absolute_sfx_longform as mix
     if config.get('finalApproved') is not False:
@@ -55,7 +80,7 @@ def mix_working(ep, config_path, config):
     runtime=float(clock['runtimeSeconds']); expected=round(runtime*mix.SR)
     for key in ('voice','music','sfx'):
         mix.verify_audio_probe(mix.probe_media(paths[key]),runtime,expected,key,codec='pcm_f32le' if key=='sfx' else 'pcm_s24le')
-    output=mix.work_output(ep,config['outputDirectory'],'working audio mix directory')
+    output=mix.work_output(ep,audition_output(config['outputDirectory'],audition),'working audio mix directory')
     if output.name in ('assembly-v1','final-delivery-v1'):
         raise RuntimeError('Working mix cannot overwrite canonical assembly')
     output.mkdir(parents=True,exist_ok=True)
@@ -98,23 +123,29 @@ def mix_working(ep, config_path, config):
                 runtimeSeconds=runtime,settings=settings,filterGraph=graph,buses=audit,scoreNotchAutomation=notches,
                 output=dict(path=str(premaster),sha256=assembly.sha(premaster)),
                 scope='Unnormalized floating-point context mix and measured voice/background competition; no listening or final creative acceptance claim.')
+    label_audition(result,audition,host)
     mix.atomic_json(output/'working-mix-audit.json',result)
     print(json.dumps({k:v for k,v in result.items() if k!='buses'},indent=2))
     print(json.dumps(audit['intelligibility']['summary'],indent=2))
 
 
-def main():
-    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
-        raise RuntimeError("Production audio work belongs on the qualified GPU worker")
-    parser = argparse.ArgumentParser()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("episode", type=Path)
     parser.add_argument("config", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--audition", action="store_true",
+                        help="Run on this host; outputs are labelled, inadmissible auditions")
+    args = parser.parse_args(argv)
+    host = None
+    if args.audition:
+        host = _common.preview_host_record(None)
+    elif sys.platform != "linux" or not shutil.which("nvidia-smi"):
+        raise RuntimeError("Production audio work belongs on the qualified GPU worker")
     ep = args.episode.resolve()
     config_path = args.config.resolve()
     config = json.loads(config_path.read_text())
     if config.get('kind') == 'working-audio-mix-only':
-        return mix_working(ep, config_path, config)
+        return mix_working(ep, config_path, config, audition=args.audition, host=host)
     original_config_sha=assembly.sha(config_path)
     voice_only = config.get("kind") == "working-voice-only"
     if config.get("kind") not in ("working-audio-only", "working-voice-only") or config.get("finalApproved") is not False:
@@ -131,7 +162,7 @@ def main():
         score = json.loads(bound["scorePlan"].read_text())
         if score.get("finalApproved") is not False or score.get("clockSha256") != config["clock"]["sha256"]:
             raise RuntimeError("Working score must bind this exact current clock")
-    output = (ep / config["outputDirectory"]).resolve()
+    output = (ep / audition_output(config["outputDirectory"], args.audition)).resolve()
     if not output.is_relative_to(ep / "work") or output.name == "assembly-v1":
         raise RuntimeError("Working audio must stay in a separate work directory")
     output.mkdir(parents=True, exist_ok=True)
@@ -151,6 +182,7 @@ def main():
                "rendererSha256": assembly.sha(Path(assembly.__file__)),
                "runtimeSeconds": clock["runtimeSeconds"],
                "outputs": {k: {"path": str(p), "sha256": assembly.sha(p)} for k, p in outputs.items()}}
+    label_audition(receipt, args.audition, host)
     (output / "audio-stem-audit.json").write_text(json.dumps(receipt, indent=2)+"\n")
     print(json.dumps(receipt, indent=2))
 
