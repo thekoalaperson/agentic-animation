@@ -83,6 +83,14 @@ class FiniteElevenBatchTest(unittest.TestCase):
             self.assertEqual(wrapper._sha256_file(receipt),
                              hashlib.sha256(receipt.read_bytes()).hexdigest())
 
+    def test_schema_covers_a_valid_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = json.loads(self.manifest(Path(tmp)).read_text())
+        shown = finite.schema()
+        self.assertLessEqual(set(doc), set(shown["requiredRootFields"]) | set(shown["optionalRootFields"]))
+        self.assertLessEqual(set(shown["requiredRootFields"]), set(doc))
+        self.assertEqual(set(doc["voiceSettings"]), set(shown["voiceSettingRanges"]))
+
     def test_default_is_dry_run_with_no_network_or_state_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

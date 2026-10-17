@@ -68,6 +68,31 @@ ALLOWED_MODEL = "eleven_multilingual_v2"
 ALLOWED_FORMAT = "mp3_44100_192"
 STATE_VERSION = 1
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+VOICE_SETTING_RANGES = {"stability": (0, 1), "similarity_boost": (0, 1), "style": (0, 1),
+                        "speed": (0.7, 1.2), "use_speaker_boost": "boolean"}
+ITEM_FIELDS = {"id", "text", "textFile", "output"}
+
+
+def schema() -> dict[str, Any]:
+    """The narration manifest contract, read from the validator's own values."""
+    return {
+        "manifest": "any work/ path; item paths are relative to the manifest",
+        "requiredRootFields": ["version", "financialApproval", "language", "voiceId", "modelId",
+                               "outputFormat", "voiceSettings", "aggregateCharacters", "items"],
+        "optionalRootFields": ["episode", "episodeRoot", "provenancePathBase", "projectRoot",
+                               "sourcePlan", "sourcePlanSha256", "productionOverrides",
+                               "productionOverridesSha256", "authority", "authoritySha256"],
+        "fixedValues": {"version": 1, "language": "hi", "modelId": ALLOWED_MODEL,
+                        "outputFormat": ALLOWED_FORMAT},
+        "voiceSettingRanges": VOICE_SETTING_RANGES,
+        "voiceSettingsNote": "every key is required and frozen; no value is supplied by the tool",
+        "itemFields": sorted(ITEM_FIELDS),
+        "itemRule": "exactly one of text or textFile; output is a relative .mp3 below episodeRoot",
+        "aggregateCharacters": "sum of stripped item text lengths; --max-characters must equal it",
+        "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
+        "approvalLane": APPROVAL_LANE,
+        "approvalScope": ["items", "characters"],
+    }
 
 
 class PlanError(ValueError):
@@ -216,7 +241,7 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
     ids: set[str] = set()
     outputs: set[str] = set()
     total = 0
-    allowed_item_keys = {"id", "text", "textFile", "output"}
+    allowed_item_keys = ITEM_FIELDS
     for pos, item in enumerate(items):
         if not isinstance(item, dict):
             raise PlanError(f"item {pos}: must be an object")
@@ -567,15 +592,26 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--max-characters", type=int, required=True,
-                        help="explicit hard cap for all manifest text")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Item fields: " + ", ".join(sorted(ITEM_FIELDS)) + ". Voice settings: "
+                + ", ".join(sorted(VOICE_SETTING_RANGES)) + ". Run --print-schema for the "
+                "whole contract; the approval lane is " + APPROVAL_LANE + "."))
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--max-characters", type=int,
+                        help="explicit hard cap for all manifest text; must equal aggregateCharacters")
+    parser.add_argument("--print-schema", action="store_true",
+                        help="print the narration manifest contract and exit")
     parser.add_argument("--submit", action="store_true",
                         help="perform at most one POST for each pending item")
     parser.add_argument("--approval-admission", type=Path,
                         help="hash-bound external paid authorization record")
     args = parser.parse_args(argv)
+    if args.print_schema:
+        print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.manifest is None or args.max_characters is None:
+        parser.error("manifest and --max-characters are required")
     try:
         result = execute(
             args.manifest,

@@ -47,8 +47,38 @@ IN_PROGRESS = {"PENDING", "WAITING", "QUEUING", "GENERATING", "CREATE_TASK",
                "TEXT_SUCCESS", "FIRST_SUCCESS"}
 
 
+PAYLOAD_FIELDS = {"model", "customMode", "instrumental", "prompt", "title",
+                  "duration", "callBackUrl", "negativeTags", "style"}
+CUE_FIELDS = {"id", "shots", "emotionalArc", "payload"}
+
+
 class PlanError(ValueError):
     pass
+
+
+def schema() -> dict[str, Any]:
+    """The score execution manifest contract, read from the validator's own sets."""
+    return {
+        "manifest": "execution manifest; sourceDraft and outputDirectory sit below it",
+        "requiredRootFields": ["version", "financialApproval", "currentPriceVerified",
+                               "sourceDraft", "sourceDraftSha256", "cues", "creditsPerRequest",
+                               "maxRequests", "maxCredits", "outputDirectory",
+                               "expectedCandidatesPerRequest"],
+        "optionalRootFields": ["episode", "provenancePathBase", "projectRoot",
+                               "productionOverrides", "productionOverridesSha256",
+                               "authority", "authoritySha256", "creativeBindings"],
+        "fixedValues": {"version": 1},
+        "cueFields": sorted(CUE_FIELDS),
+        "payloadFields": sorted(PAYLOAD_FIELDS),
+        "payloadRules": {"model": ["V5_5", "V6"], "customMode": True, "instrumental": True,
+                         "prompt": "", "duration": "integer 10-360", "style": "1-1000 characters",
+                         "title": "1-80 characters", "negativeTags": "non-empty"},
+        "sourceDraft": "{commonPayload, cues}; frozen cues equal each draft cue with commonPayload merged in",
+        "ceilings": "cues x creditsPerRequest must fit maxCredits; --max-requests/--max-credits may not exceed the manifest",
+        "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
+        "approvalLane": "suno-score",
+        "approvalScope": ["requests", "credits", "sourceSeconds"],
+    }
 
 
 class UncertainRequest(RuntimeError):
@@ -167,15 +197,14 @@ def load_plan(manifest_path: Path, max_requests: int,
         raise PlanError("frozen cues are not byte-semantically equal to source draft cues")
     ids: set[str] = set()
     for cue in cues:
-        if not isinstance(cue, dict) or set(cue) != {"id", "shots", "emotionalArc", "payload"}:
+        if not isinstance(cue, dict) or set(cue) != CUE_FIELDS:
             raise PlanError("each cue must freeze id, shots, emotionalArc and payload")
         cue_id = cue.get("id")
         if not isinstance(cue_id, str) or not SAFE_ID.fullmatch(cue_id) or cue_id in ids:
             raise PlanError(f"duplicate or malformed cue id: {cue_id}")
         ids.add(cue_id)
         payload = cue.get("payload")
-        required = {"model", "customMode", "instrumental", "prompt", "title",
-                    "duration", "callBackUrl", "negativeTags", "style"}
+        required = PAYLOAD_FIELDS
         if not isinstance(payload, dict) or set(payload) != required:
             raise PlanError(f"{cue_id}: payload fields must be exactly {sorted(required)}")
         if payload["model"] not in {"V5_5", "V6"} or payload["customMode"] is not True:
@@ -651,15 +680,26 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--max-requests", type=int, required=True)
-    parser.add_argument("--max-credits", type=int, required=True)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Cue fields: " + ", ".join(sorted(CUE_FIELDS)) + ". Payload fields: "
+                + ", ".join(sorted(PAYLOAD_FIELDS)) + ". Run --print-schema for the whole "
+                "contract; the approval lane is suno-score."))
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--max-requests", type=int)
+    parser.add_argument("--max-credits", type=int)
+    parser.add_argument("--print-schema", action="store_true",
+                        help="print the score manifest contract and exit")
     parser.add_argument("--approval-admission", type=Path)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--submit", action="store_true")
     actions.add_argument("--poll", action="store_true")
     args = parser.parse_args(argv)
+    if args.print_schema:
+        print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.manifest is None or args.max_requests is None or args.max_credits is None:
+        parser.error("manifest, --max-requests and --max-credits are required")
     operation = "submit" if args.submit else "poll" if args.poll else "dry-run"
     try:
         result = execute(args.manifest, args.max_requests, args.max_credits,

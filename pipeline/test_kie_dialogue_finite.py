@@ -116,6 +116,27 @@ class DialogueFiniteTest(unittest.TestCase):
                 RUNNER.execute(7,True,approval)
         run.assert_not_called()
 
+    def test_schema_matches_the_validator_and_a_valid_manifest(self):
+        shown = RUNNER.schema()
+        self.assertEqual(set(shown['rootFields']), set(self.doc))
+        self.assertEqual(set(shown['jobFields']), set(self.doc['jobs'][0]))
+        for key, value in shown['fixedValues'].items():
+            if key != 'episode':
+                self.assertEqual(self.doc[key], value)
+
+    def test_print_requests_shows_placeholder_payloads_offline(self):
+        real_root = Path(__file__).resolve().parents[1]
+        with mock.patch.object(RUNNER, 'ROOT', real_root):
+            result = RUNNER.execute(7, False, show_requests=True)
+        self.assertEqual(result['networkCalls'], 0)
+        [shown] = result['requests']
+        self.assertEqual(shown['endpoint'], 'jobs/createTask')
+        body = shown['body']['input']
+        self.assertEqual(body['prompt'], 'Exact Hindi: नमस्ते।')
+        self.assertTrue(all(url.startswith('https://placeholder.invalid/') for url in body['image_urls']))
+        self.assertFalse((self.work/'motion/demo-s1001.pending.json').exists())
+        self.assertFalse((self.work/'motion').exists())
+
     def test_reconcile_only_polls_recorded_tasks_without_approval(self):
         row_ids = []
         def fake_run(command, **kwargs):

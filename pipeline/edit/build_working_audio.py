@@ -104,12 +104,12 @@ def mix_working(ep, config_path, config):
 
 
 def main():
-    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
-        raise RuntimeError("Production audio work belongs on the qualified GPU worker")
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("episode", type=Path)
     parser.add_argument("config", type=Path)
     args = parser.parse_args()
+    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
+        raise RuntimeError("Production audio work belongs on the qualified GPU worker")
     ep = args.episode.resolve()
     config_path = args.config.resolve()
     config = json.loads(config_path.read_text())

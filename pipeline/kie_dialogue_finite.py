@@ -79,6 +79,44 @@ JOB_FIELDS = {
     "id", "speaker", "hindi", "durationSeconds", "source", "sourceSha256",
     "prompt", "promptSha256", "outputStem",
 }
+APPROVAL_LANE = "grok-dialogue"
+FIXED_HEADER = {
+    "version": 2,
+    "provider": "kie.ai",
+    "route": "grok15",
+    "model": "grok-imagine-video-1-5-preview",
+    "resolution": "720p",
+    "aspectRatio": "16:9",
+    "language": "hi-IN",
+}
+PRICING_FIELDS = {"creditsPerSecond", "verifiedAtUtc", "evidence"}
+
+
+def schema() -> dict[str, Any]:
+    """The frozen execution manifest contract, read from the validator's own sets."""
+    return {
+        "manifest": "work/<batch>/execution-manifest.json",
+        "rootFields": sorted(ROOT_FIELDS),
+        "fixedValues": {**FIXED_HEADER, "episode": "the project code (storyboard episode)"},
+        "jobFields": sorted(JOB_FIELDS),
+        "pricingFields": sorted(PRICING_FIELDS),
+        "durationSeconds": sorted(ALLOWED_DURATIONS),
+        "boundFiles": {
+            "draftManifest": "draft-manifest.json beside the manifest",
+            "newAngleAudit": "source-audit.json beside the manifest",
+            "productionOverrides": "story/production-overrides-v1.json or --production-overrides",
+            "authority": "story/GOAL.md or --authority-file",
+        },
+        "jobPaths": {"prompt": "prompts/ beside the manifest; must contain the exact line",
+                     "outputStem": "motion/<id> beside the manifest",
+                     "source": "any project file, hash-bound"},
+        "aggregates": {"jobCount": "number of jobs",
+                       "maximumGeneratedSeconds": "sum of durationSeconds",
+                       "maximumCredits": "at least maximumGeneratedSeconds x creditsPerSecond"},
+        "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
+        "approvalLane": APPROVAL_LANE,
+        "approvalScope": ["jobs", "generatedSeconds", "credits"],
+    }
 
 
 class PlanError(ValueError):
@@ -161,16 +199,7 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         missing = sorted(ROOT_FIELDS - set(doc))
         extra = sorted(set(doc) - ROOT_FIELDS)
         raise PlanError(f"execution manifest schema mismatch; missing={missing}, extra={extra}")
-    expected_header = {
-        "version": 2,
-        "episode": EPISODE_CODE,
-        "provider": "kie.ai",
-        "route": "grok15",
-        "model": "grok-imagine-video-1-5-preview",
-        "resolution": "720p",
-        "aspectRatio": "16:9",
-        "language": "hi-IN",
-    }
+    expected_header = {**FIXED_HEADER, "episode": EPISODE_CODE}
     for key, expected in expected_header.items():
         if doc.get(key) != expected:
             raise PlanError(f"execution manifest {key} must be {expected!r}")
@@ -180,7 +209,7 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         raise PlanError("financialState must be a non-empty string")
 
     pricing = doc.get("pricing")
-    if not isinstance(pricing, dict) or set(pricing) != {"creditsPerSecond", "verifiedAtUtc", "evidence"}:
+    if not isinstance(pricing, dict) or set(pricing) != PRICING_FIELDS:
         raise PlanError("pricing must bind a verified rate, UTC date and evidence")
     rate = pricing["creditsPerSecond"]
     if (isinstance(rate, bool) or not isinstance(rate, (int, float))
@@ -486,7 +515,6 @@ def acquire_lock(path: Path, manifest_sha256: str) -> None:
         os.close(descriptor)
 
 
-APPROVAL_LANE = "grok-dialogue"
 
 
 def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +555,20 @@ def write_progress(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) -
     })
 
 
+def print_requests(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each job's provider request with placeholder URLs; kie_video never uploads here."""
+    shown = []
+    for row in plan["jobs"]:
+        done = subprocess.run(kie_video_command(plan, row) + ["--print-request"], cwd=ROOT,
+                              capture_output=True, text=True)
+        if done.returncode:
+            raise PlanError(f"{row['id']}: request preview failed: {done.stderr.strip()[-400:]}")
+        request = json.loads(done.stdout)
+        shown.append({"id": row["id"], "endpoint": request["endpoint"], "body": request["body"],
+                      "localRequestSha256": request["localRequestSha256"]})
+    return shown
+
+
 def reconcile(max_generated_seconds: int) -> dict[str, Any]:
     """Finish already-submitted tasks without any new generation POST.
 
@@ -561,7 +603,8 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
 
 
 def execute(max_generated_seconds: int, submit: bool,
-            approval_admission: Path | None = None, concurrency: int = 1) -> dict[str, Any]:
+            approval_admission: Path | None = None, concurrency: int = 1,
+            show_requests: bool = False) -> dict[str, Any]:
     plan = load_plan(MANIFEST, max_generated_seconds)
     try:
         approval = validate_paid_approval(
@@ -586,6 +629,9 @@ def execute(max_generated_seconds: int, submit: bool,
             "financialAuthorized": authorized,
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
             "manifestSha256": plan["manifestSha256"],
+            **({"requests": print_requests(plan),
+                "requestNote": "image URLs are placeholders; nothing was uploaded"}
+               if show_requests else {}),
         }
     if not authorized:
         raise PlanError("submission requires a current approval record (--approval-admission); "
@@ -666,8 +712,12 @@ def execute(max_generated_seconds: int, submit: bool,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Manifest root fields: " + ", ".join(sorted(ROOT_FIELDS)) + ".\nJob fields: "
+                + ", ".join(sorted(JOB_FIELDS)) + ".\nRun --print-schema for the whole contract; "
+                "the approval lane is " + APPROVAL_LANE + "."))
+    parser.add_argument("manifest", type=Path, nargs="?")
     parser.add_argument("--project", "--episode-root", dest="episode_root", type=Path,
                         help="Private project path (or AGENTIC_PROJECT_ROOT)")
     parser.add_argument("--episode-code",
@@ -678,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Explicit versioned script overrides inside this episode's story directory")
     parser.add_argument("--concurrency", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--credential-stdin", action="store_true")
-    parser.add_argument("--max-generated-seconds", type=int, required=True)
+    parser.add_argument("--max-generated-seconds", type=int,
+                        help="must equal the frozen total; required except with --print-schema")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--submit", action="store_true",
                        help="paid run; requires --approval-admission")
@@ -686,7 +737,16 @@ def main(argv: list[str] | None = None) -> int:
                        help="poll and land already-submitted tasks; never POSTs and needs no approval")
     parser.add_argument("--approval-admission", type=Path,
                         help="hash-bound paid authorization record (paid_approval.py)")
+    modes.add_argument("--print-requests", action="store_true",
+                       help="dry run that also prints each provider request with placeholder URLs")
+    modes.add_argument("--print-schema", action="store_true",
+                       help="print the execution manifest contract and exit")
     args = parser.parse_args(argv)
+    if args.print_schema:
+        print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.manifest is None or args.max_generated_seconds is None:
+        parser.error("manifest and --max-generated-seconds are required")
     try:
         configure(args.manifest, args.episode_root, args.production_overrides,
                   args.episode_code, args.authority_file)
@@ -700,7 +760,8 @@ def main(argv: list[str] | None = None) -> int:
             result = reconcile(args.max_generated_seconds)
         else:
             result = execute(args.max_generated_seconds, args.submit,
-                             args.approval_admission, args.concurrency)
+                             args.approval_admission, args.concurrency,
+                             show_requests=args.print_requests)
     except PlanError as exc:
         raise SystemExit(f"REFUSED: {exc}") from exc
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))

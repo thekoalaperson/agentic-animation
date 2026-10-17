@@ -72,6 +72,15 @@ class FiniteKieMusicTest(unittest.TestCase):
             self.assertEqual(wrapper._sha_file(receipt),
                              hashlib.sha256(receipt.read_bytes()).hexdigest())
 
+    def test_schema_covers_a_valid_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = json.loads(self.fixture(Path(tmp)).read_text())
+        shown = finite.schema()
+        self.assertLessEqual(set(doc), set(shown["requiredRootFields"]) | set(shown["optionalRootFields"]))
+        self.assertLessEqual(set(shown["requiredRootFields"]), set(doc) | {"episode"})
+        self.assertEqual(set(doc["cues"][0]), set(shown["cueFields"]))
+        self.assertEqual(set(doc["cues"][0]["payload"]), set(shown["payloadFields"]))
+
     def test_default_dry_run_is_zero_network_and_writes_no_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
