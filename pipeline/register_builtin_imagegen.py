@@ -42,6 +42,8 @@ REGISTERABLE = {"generation_ready", "failed", "needs_changes"}
 SUPPLIED_ORIGINS = {"human-made", "third-party"}
 PROVIDER_UPLOAD = {"allowed", "forbidden"}
 CANON_PREFIX = "canon:"
+# A retake moves bytes here (asset_registry.RETIRED); they are never a source again.
+RETIRED_PREFIX = "art/retired/"
 
 
 def fail(message: str) -> NoReturn:
@@ -69,6 +71,8 @@ def repo_file(root: Path, value: str, canon_root: Path | None = None) -> Path:
         raise GroundingError(f"reference escapes {label}: {value}") from exc
     if not path.is_file():
         raise GroundingError(f"grounding reference does not exist: {value}")
+    if base == root.resolve() and path.relative_to(base).as_posix().startswith(RETIRED_PREFIX):
+        raise GroundingError(f"reference is a retired still; register its replacement: {value}")
     return path
 
 
@@ -554,6 +558,7 @@ def register(
     created: str | None = None,
     digital_source_type: str | None = None,
     original: Path | None = None,
+    conversion: str | None = None,
 ) -> dict[str, Any]:
     exact_identity = list(exact_identity)
     if no_visible_identity and exact_identity:
@@ -563,7 +568,7 @@ def register(
         "--maker": maker, "--supplied-by": supplied_by, "--rights-basis": rights_basis,
         "--provider-upload": provider_upload, "--rights-evidence": rights_evidence,
         "--created": created, "--digital-source-type": digital_source_type,
-        "--original": original,
+        "--original": original, "--conversion": conversion,
     }
     if origin == "imagegen":
         given = [flag for flag, value in supplied_fields.items() if value]
@@ -576,6 +581,8 @@ def register(
             fail(f"--origin {origin} requires --rights-basis")
         if provider_upload not in PROVIDER_UPLOAD:
             fail(f"--origin {origin} requires --provider-upload {' or '.join(sorted(PROVIDER_UPLOAD))}")
+        if conversion and not original:
+            fail("--conversion describes the step from --original; pass --original too")
 
     source = source_image.resolve()
     if not source.is_file():
@@ -740,7 +747,11 @@ def register(
                 "format": fmt or (original_path.suffix.lstrip(".").lower() or None),
                 "width": original_width,
                 "height": original_height,
+                "dimensions_match_target": (None if original_width is None
+                                            else [original_width, original_height] == [width, height]),
             }
+            if conversion and conversion.strip():
+                provenance["original"]["conversion"] = conversion.strip()
     if "continuity_fact_skips" in grounding_evidence:
         provenance["continuity_fact_skips"] = grounding_evidence["continuity_fact_skips"]
     if note:
@@ -800,8 +811,11 @@ def retake(*, root: Path, manifest_path: Path, still_id: str, note: str | None =
 
     The files move to ``art/retired/<still_id>/<short-sha>/``, the manifest row
     returns to ``needs_changes`` with a history entry, and the downstream
-    assets that referenced the retired target are listed. Their hash bindings
-    then fail loudly until they are remade or explicitly re-pointed.
+    assets that referenced the retired target are listed. Reference packs and
+    motion manifests bind its hash and refuse until remade. Stills registered
+    against it hold its path (supplied and derived sidecars also record the
+    hash it had, but nothing re-checks that), so the downstream list and the
+    history entry are the record of which ones to remake or re-point.
     """
     if __package__:
         from .asset_registry import asset_key, downstream, load_registry
@@ -824,9 +838,10 @@ def retake(*, root: Path, manifest_path: Path, still_id: str, note: str | None =
     target_digest = sha256(target)
     try:
         assets = load_registry(root)
-        impact: Any = downstream(assets, asset_key(target_value, root))
     except ValueError as exc:
-        impact = {"unavailable": str(exc)}
+        fail(f"asset registry is inconsistent, so downstream impact is unknown; "
+             f"reconcile it before a retake: {exc}")
+    impact = downstream(assets, asset_key(target_value, root))
     retired = root / "art" / "retired" / still_id / target_digest[:12]
     if retired.exists():
         fail(f"retired location already exists: {retired.relative_to(root).as_posix()}")
@@ -861,6 +876,11 @@ def retake(*, root: Path, manifest_path: Path, still_id: str, note: str | None =
     except Exception:
         for original, destination in reversed(moved):
             os.rename(destination, original)
+        for directory in (retired, retired.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
         raise
     return {"still_id": still_id, "status": "needs_changes", **entry}
 
@@ -868,7 +888,7 @@ def retake(*, root: Path, manifest_path: Path, still_id: str, note: str | None =
 BATCH_KEYS = {
     "still_id", "source_image", "origin", "note", "exact_identity", "grounding_fact",
     "no_visible_identity", "maker", "supplied_by", "rights_basis", "provider_upload",
-    "rights_evidence", "created", "digital_source_type", "original",
+    "rights_evidence", "created", "digital_source_type", "original", "conversion",
 }
 
 
@@ -951,6 +971,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     supplied.add_argument("--digital-source-type", help="Optional IPTC digitalSourceType URI")
     supplied.add_argument("--original", type=Path,
                           help="Unconverted original (JPEG, WebP, TIFF, ...) whose PNG is being registered")
+    supplied.add_argument("--conversion",
+                          help="Optional note on the step from --original to the PNG: tool, settings, "
+                               "any crop or resample")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--retake", action="store_true",
                        help="Retire the registered still and sidecar to art/retired/ and reset the row")
@@ -959,12 +982,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "source_image and any per-row option by its flag name with underscores; "
                             "relative paths resolve from the batch file; stops at the first refusal")
     args = parser.parse_args(argv)
+    per_row = {
+        "--origin": args.origin != "imagegen", "--exact-identity": args.exact_identity,
+        "--grounding-fact": args.grounding_fact, "--no-visible-identity": args.no_visible_identity,
+        **{f"--{name.replace('_', '-')}": getattr(args, name) for name in (
+            "maker", "supplied_by", "rights_basis", "provider_upload", "rights_evidence",
+            "created", "digital_source_type", "original", "conversion")},
+    }
     if args.batch:
         if args.still_id or args.source_image:
             parser.error("--batch takes the manifest only; rows name still_id and source_image")
+        given = [flag for flag, value in {**per_row, "--note": args.note}.items() if value]
+        if given:
+            parser.error(f"{', '.join(given)} belong on each --batch row, not the command line")
     elif args.retake:
         if not args.still_id or args.source_image:
             parser.error("--retake takes the manifest and a still_id only")
+        shared = {"--source-root": args.source_root, "--policy": args.policy,
+                  "--storyboard": args.storyboard, "--canon-root": args.canon_root}
+        given = [flag for flag, value in {**per_row, **shared}.items() if value]
+        if given:
+            parser.error(f"--retake takes only --note and --root, not {', '.join(given)}")
     elif not args.still_id or not args.source_image:
         parser.error("still_id and source_image are required")
     return args
@@ -993,7 +1031,7 @@ def main(argv: list[str] | None = None) -> None:
                 maker=args.maker, supplied_by=args.supplied_by, rights_basis=args.rights_basis,
                 provider_upload=args.provider_upload, rights_evidence=args.rights_evidence,
                 created=args.created, digital_source_type=args.digital_source_type,
-                original=args.original,
+                original=args.original, conversion=args.conversion,
             )
     print(json.dumps(result, ensure_ascii=False))
 

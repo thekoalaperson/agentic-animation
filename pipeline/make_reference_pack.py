@@ -2,7 +2,7 @@
 """Compose registered images into one labelled reference pack.
 
 Each source must already be a registered asset whose recorded hash matches its
-bytes. The pack is a contact image with one labelled cell per source, plus the
+bytes, and not one a retake has retired. The pack is a contact image with one labelled cell per source, plus the
 ``.refpack.json`` sidecar that the still registrar validates as packed
 execution coverage. Labels come from the policy's identity authorities (an
 authority whose ``sources`` list the image), else from ``PATH=LABEL``, else
@@ -19,10 +19,10 @@ from typing import Any
 
 if __package__:
     from ._common import atomic_new_bytes, project_root, sha256_file as sha256
-    from .asset_registry import asset_key, load_registry
+    from .asset_registry import RETIRED, asset_key, load_registry
 else:
     from _common import atomic_new_bytes, project_root, sha256_file as sha256
-    from asset_registry import asset_key, load_registry
+    from asset_registry import RETIRED, asset_key, load_registry
 
 CELL = 512
 CAPTION = 40
@@ -79,6 +79,9 @@ def make_pack(*, root: Path, output: Path, sources: list[str],
         row = assets.get(key)
         if row is None:
             problems.append(f"not a registered asset: {value}")
+            continue
+        if row.get("retired") or key.startswith(RETIRED):
+            problems.append(f"a retired asset cannot be a pack source: {value}")
             continue
         if not path.is_file() or row.get("sha256") != sha256(path):
             problems.append(f"registered hash does not match the bytes: {value}")

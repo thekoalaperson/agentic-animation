@@ -10,7 +10,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -139,6 +139,7 @@ class SuppliedOriginTests(Project):
         original = png(self.root / "incoming/demo-s001-scan.jpg", fmt="JPEG", size=(128, 72))
         source = png(self.root / "incoming/demo-s001.png", size=(128, 72))
         self.supplied("demo-s001", source, "--original", str(original),
+                      "--conversion", "demo converter, default settings, no crop",
                       "--grounding-fact", "demo-lamp", "--policy", "story/still-policy.json",
                       "--digital-source-type", "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture")
         record = self.record("demo-s001")
@@ -156,6 +157,8 @@ class SuppliedOriginTests(Project):
         self.assertEqual(sidecar["original"]["format"], "jpeg")
         self.assertEqual([sidecar["original"]["width"], sidecar["original"]["height"]], [128, 72])
         self.assertEqual(sidecar["original"]["sha256"], _common.sha256_file(original))
+        self.assertEqual(sidecar["original"]["conversion"], "demo converter, default settings, no crop")
+        self.assertIs(sidecar["original"]["dimensions_match_target"], True)
         table = self.root / "art/canon/demo-table.png"
         self.assertEqual(sidecar["reference_hashes"],
                          [{"ref": "art/canon/demo-table.png", "sha256": _common.sha256_file(table)}])
@@ -186,6 +189,15 @@ class SuppliedOriginTests(Project):
         with self.assertRaisesRegex(SystemExit, "--provider-upload"):
             self.run_cli("demo-s002", str(source), "--origin", "third-party",
                          "--supplied-by", "demo archive", "--rights-basis", "licensed")
+
+    def test_conversion_note_needs_an_original_and_size_changes_show(self) -> None:
+        source = png(self.root / "incoming/demo-s002.png", size=(64, 36))
+        with self.assertRaisesRegex(SystemExit, "pass --original too"):
+            self.supplied("demo-s002", source, "--no-visible-identity", "--conversion", "demo")
+        original = png(self.root / "incoming/demo-s002.webp", fmt="WEBP", size=(128, 72))
+        self.supplied("demo-s002", source, "--no-visible-identity", "--original", str(original))
+        self.assertIs(self.sidecar("demo-s002")["original"]["dimensions_match_target"], False)
+        self.assertNotIn("conversion", self.sidecar("demo-s002")["original"])
 
     def test_jpeg_target_is_refused_with_the_conversion_route(self) -> None:
         source = png(self.root / "incoming/demo-s002.jpg", fmt="JPEG")
@@ -269,6 +281,32 @@ class CanonTests(Project):
                          ["art/stills/demo-s002.png"])
 
 
+class CanonImpactCliTests(Project):
+    def test_impact_lists_canon_dependents_across_projects(self) -> None:
+        canon = self.outside / "series-canon"
+        png(canon / "sheets/demo-sheet.png")
+        second = self.root.parent / "project-two"
+        shutil.copytree(EXAMPLE, second)
+        for project in (self.root, second):
+            manifest = project / "story/generation_manifest.json"
+            doc = json.loads(manifest.read_text())
+            doc["stills"][2]["refs"]["all"] = ["canon:sheets/demo-sheet.png"]
+            manifest.write_text(json.dumps(doc))
+            source = png(self.imagegen / f"{project.name}.png")
+            with redirect_stdout(io.StringIO()):
+                registrar.main(["story/generation_manifest.json", "demo-s002", str(source), "--root",
+                                str(project), "--source-root", str(self.imagegen),
+                                "--no-visible-identity", "--canon-root", str(canon)])
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), mock.patch("sys.argv", [
+                "asset_registry.py", "--impact", "canon:sheets/demo-sheet.png",
+                "--projects", str(self.root), str(second)]):
+            asset_registry.main()
+        result = json.loads(buffer.getvalue())
+        self.assertEqual(result["projects"], {str(self.root): ["art/stills/demo-s002.png"],
+                                              str(second): ["art/stills/demo-s002.png"]})
+
+
 class RetakeAndBatchTests(Project):
     def test_retake_retires_bytes_and_lists_impact(self) -> None:
         self.imagegen_register("demo-table", "--no-visible-identity")
@@ -296,6 +334,38 @@ class RetakeAndBatchTests(Project):
         with self.assertRaisesRegex(SystemExit, "only a registered still"):
             self.run_cli("demo-s002", "--retake")
 
+    def test_retake_refuses_when_impact_cannot_be_read(self) -> None:
+        self.imagegen_register("demo-table", "--no-visible-identity")
+        rival = self.root / "art/canon/demo-table.still.json"
+        rival.write_text(json.dumps({"target_output_path": "art/canon/demo-table.png",
+                                     "target_sha256": "0" * 64}))
+        with self.assertRaisesRegex(SystemExit, "reconcile it before a retake"):
+            self.run_cli("demo-table", "--retake")
+        self.assertTrue((self.root / "art/canon/demo-table.png").is_file())
+        self.assertFalse((self.root / "art/retired").exists())
+        self.assertEqual(self.record("demo-table")["status"], "generated")
+
+    def test_retake_and_batch_refuse_flags_they_would_ignore(self) -> None:
+        for argv in (("demo-table", "--retake", "--policy", "story/still-policy.json"),
+                     ("demo-table", "--retake", "--origin", "human-made"),
+                     ("--batch", "work/batch.json", "--grounding-fact", "demo-lamp"),
+                     ("--batch", "work/batch.json", "--maker", "demo maker")):
+            errors = io.StringIO()
+            with redirect_stderr(errors), self.assertRaises(SystemExit):
+                self.run_cli(*argv)
+            self.assertRegex(errors.getvalue(), "not the command line|takes only --note", argv)
+
+    def test_retired_still_is_no_longer_a_source(self) -> None:
+        self.imagegen_register("demo-table", "--no-visible-identity")
+        digest = _common.sha256_file(self.root / "art/canon/demo-table.png")
+        self.run_cli("demo-table", "--retake")
+        retired = f"art/retired/demo-table/{digest[:12]}/demo-table.png"
+        with self.assertRaisesRegex(registrar.GroundingError, "retired still"):
+            registrar.expand_execution_coverage(self.root, [retired])
+        with self.assertRaisesRegex(ValueError, "retired asset cannot be a pack source"):
+            make_reference_pack.make_pack(root=self.root, output=Path("art/refs/p.png"),
+                                          sources=[retired])
+
     def test_batch_stops_at_the_first_refusal(self) -> None:
         png(self.imagegen / "demo-table.png")
         png(self.imagegen / "demo-s001.png")
@@ -316,13 +386,17 @@ class RetakeAndBatchTests(Project):
 
 
 class DeriveTests(Project):
+    PARENT = "art/canon/demo-table.png"
+
     def setUp(self) -> None:
         super().setUp()
-        self.imagegen_register("demo-table", "--no-visible-identity")
+        # The registered parent is half red, half white, so placements are visible.
         image = Image.new("RGB", (64, 36), "white")
         image.paste((255, 0, 0), (0, 0, 32, 36))
-        image.save(self.root / "incoming-parent.png")
-        self.parent = self.root / "incoming-parent.png"
+        self.imagegen.mkdir(parents=True, exist_ok=True)
+        image.save(self.imagegen / "demo-table.png")
+        self.run_cli("demo-table", str(self.imagegen / "demo-table.png"),
+                     "--source-root", str(self.imagegen), "--no-visible-identity")
 
     def derive(self, *argv: str) -> None:
         with redirect_stdout(io.StringIO()):
@@ -343,6 +417,11 @@ class DeriveTests(Project):
                                                 "parentWidth": 64, "parentHeight": 36,
                                                 "anchor": "left", "x": 0, "y": 0})
         self.assertEqual(sidecar["tool"]["sha256"], _common.sha256_file(Path(derive_still.__file__)))
+        self.assertEqual(sidecar["provider"], "openai_builtin_imagegen")
+        self.assertEqual(sidecar["inherited_from"], "art/canon/demo-table.imagegen.json")
+        self.assertNotIn("rights", sidecar)
+        self.assertEqual(record["grounding_claims"]["exact_identity_claims"], [])
+        self.assertNotIn("still_origin", record)
         with Image.open(target) as written:
             self.assertEqual(written.size, (36, 36))
         assets = asset_registry.load_registry(self.root)
@@ -352,17 +431,78 @@ class DeriveTests(Project):
             self.derive("art/canon/demo-table.png", "--operation", "crop", "--size", "36x36",
                         "--anchor", "left")
 
+    def test_parent_must_be_registered_unchanged_and_current(self) -> None:
+        png(self.root / "incoming-parent.png")
+        with self.assertRaisesRegex(SystemExit, "not a registered asset"):
+            self.derive("incoming-parent.png", "--operation", "scale", "--size", "64x36")
+        table = self.root / self.PARENT
+        original = table.read_bytes()
+        png(table, color=(1, 2, 3))
+        with self.assertRaisesRegex(SystemExit, "does not match its bytes"):
+            self.derive(self.PARENT, "--operation", "scale", "--size", "64x36")
+        table.write_bytes(original)
+        self.run_cli("demo-table", "--retake")
+        retired = next((self.root / "art/retired/demo-table").glob("*/demo-table.png"))
+        with self.assertRaisesRegex(SystemExit, "retired asset"):
+            self.derive(retired.relative_to(self.root).as_posix(), "--operation", "scale",
+                        "--size", "64x36")
+        self.assertFalse((self.root / "art/stills/demo-s002.png").exists())
+        self.assertEqual(self.record("demo-s002")["status"], "generation_ready")
+
+    def test_rights_and_origin_follow_a_supplied_parent_through_a_chain(self) -> None:
+        source = png(self.root / "incoming/demo-s001.png", size=(64, 36))
+        self.run_cli("demo-s001", str(source), "--origin", "third-party",
+                     "--supplied-by", "demo archive", "--rights-basis", "demo licence",
+                     "--provider-upload", "forbidden", "--policy", "story/still-policy.json",
+                     "--grounding-fact", "demo-lamp")
+        self.derive("art/stills/demo-s001.png", "--operation", "crop", "--size", "32x18",
+                    "--anchor", "center", "--policy", "story/still-policy.json",
+                    "--no-visible-identity")
+        derived = self.sidecar("demo-s002")
+        self.assertEqual(derived["rights"], {"basis": "demo licence", "providerUpload": "forbidden"})
+        self.assertEqual((derived["origin"], derived["provider"], derived["supplied_by"]),
+                         ("third-party", "third-party", "demo archive"))
+        self.assertEqual(derived["inherited_from"], "art/stills/demo-s001.still.json")
+        self.assertEqual(self.record("demo-s002")["still_origin"], "third-party")
+        self.assertTrue(self.record("demo-s002")["grounding_claims"]["no_visible_identity"])
+        # A derivative of the derivative still names the registration that declared the rights.
+        doc = json.loads(self.manifest.read_text())
+        doc["stills"].append({"still_id": "demo-s003", "status": "generation_ready",
+                              "prompt": "demo-s003: a lamp", "target_output_path": "art/stills/demo-s003.png",
+                              "refs": {"all": []}})
+        self.manifest.write_text(json.dumps(doc))
+        with redirect_stdout(io.StringIO()):
+            derive_still.main(["story/generation_manifest.json", "demo-s003", "art/stills/demo-s002.png",
+                               "--operation", "scale", "--size", "16x9", "--root", str(self.root)])
+        chained = self.sidecar("demo-s003")
+        self.assertEqual(chained["rights"]["providerUpload"], "forbidden")
+        self.assertEqual(chained["inherited_from"], "art/stills/demo-s001.still.json")
+        self.assertEqual(chained["parent"]["sidecar"]["path"], "art/stills/demo-s002.derive.json")
+
+    def test_grounding_guard_runs_on_a_derived_row(self) -> None:
+        doc = json.loads(self.manifest.read_text())
+        doc["stills"][2]["prompt"] = "demo-s002: the exact identity of the demo table"
+        self.manifest.write_text(json.dumps(doc))
+        with self.assertRaisesRegex(SystemExit, "grounding guard rejected"):
+            self.derive(self.PARENT, "--operation", "scale", "--size", "32x18",
+                        "--policy", "story/still-policy.json")
+        self.derive(self.PARENT, "--operation", "scale", "--size", "32x18",
+                    "--policy", "story/still-policy.json",
+                    "--exact-identity", "demo table=art/canon/demo-table.png")
+        claims = self.record("demo-s002")["grounding_claims"]["exact_identity_claims"]
+        self.assertEqual([(c["name"], c["coverage"]) for c in claims], [("demo table", "direct")])
+
     def test_crop_needs_a_placement_and_scale_keeps_aspect(self) -> None:
         with self.assertRaisesRegex(SystemExit, "explicit --anchor"):
-            self.derive("incoming-parent.png", "--operation", "crop", "--size", "32x32")
+            self.derive(self.PARENT, "--operation", "crop", "--size", "32x32")
         with self.assertRaisesRegex(SystemExit, "aspect ratio"):
-            self.derive("incoming-parent.png", "--operation", "scale", "--size", "64x64")
+            self.derive(self.PARENT, "--operation", "scale", "--size", "64x64")
         self.assertFalse((self.root / "art/stills/demo-s002.png").exists())
-        self.derive("incoming-parent.png", "--operation", "scale", "--size", "32x18")
+        self.derive(self.PARENT, "--operation", "scale", "--size", "32x18")
         self.assertEqual(self.sidecar("demo-s002")["height"], 18)
 
     def test_pad_places_parent_at_anchor(self) -> None:
-        self.derive("incoming-parent.png", "--operation", "pad", "--size", "64x64",
+        self.derive(self.PARENT, "--operation", "pad", "--size", "64x64",
                     "--anchor", "bottom", "--color", "#000000")
         with Image.open(self.root / "art/stills/demo-s002.png") as written:
             self.assertEqual(written.getpixel((0, 0)), (0, 0, 0))
@@ -372,6 +512,9 @@ class DeriveTests(Project):
         clip = self.root / "motion/demo-clip.mp4"
         clip.parent.mkdir(parents=True)
         clip.write_bytes(b"not decoded in this test")
+        accepted = {"provider": "kie.ai", "outputSha256": _common.sha256_file(clip),
+                    "sha256": _common.sha256_file(clip)}
+        (clip.with_suffix(".vid.json")).write_text(json.dumps(accepted))
         with mock.patch.object(_common.sys, "platform", "darwin"):
             with self.assertRaises(_common.MediaWorkerRequired):
                 _common.extract_exact_frame(clip, 0, self.root / "unused.png")
@@ -387,9 +530,10 @@ class DeriveTests(Project):
         derive_still.derive(root=self.root, manifest_path=self.manifest, still_id="demo-s002",
                             parent=clip, operation="exact-frame", frame=3, extractor=fake)
         self.assertEqual(self.sidecar("demo-s002")["operation"], {"name": "exact-frame", "frameIndex": 3})
+        self.assertEqual(self.sidecar("demo-s002")["provider"], "kie.ai")
 
     def test_production_inventory_accepts_a_derived_still(self) -> None:
-        self.derive("incoming-parent.png", "--operation", "scale", "--size", "32x18")
+        self.derive(self.PARENT, "--operation", "scale", "--size", "32x18")
         record = self.record("demo-s002")
         still = self.root / record["target_output_path"]
         sidecar = json.loads((self.root / record["provenance_sidecar"]).read_text())

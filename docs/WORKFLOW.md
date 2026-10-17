@@ -61,9 +61,9 @@ An explicit `--policy` file holds `grounding_guard.identity_authorities`
 (`name`, `aliases`, `sources`) and `grounding_guard.continuity_facts` (`id`,
 `value`, and optionally `still_ids`, `episode`, `line_range`, or `from`/`to`
 still IDs). A range reads the number in a `PROJECT-sNUMBER` ID, including split
-and alternate IDs such as `demo-s010b` and `demo-s010-alt`. A still without a
-number, such as a plate or a canon sheet, skips range facts, and its sidecar
-records each skip. `from`/`to` resolve by the order of an explicit
+and alternate IDs such as `demo-s010b` and `demo-s010-alt`, so range and
+`episode` facts apply to those IDs as well. A still without a number, such as a
+plate or a canon sheet, skips range facts, and its sidecar records each skip. `from`/`to` resolve by the order of an explicit
 `--storyboard`. `asset_registry.py --facts STILL_ID --policy ...` prints the
 facts active at a still. `asset_registry.py --board` with explicit `--policy`,
 `--storyboard` and `--manifest` writes a read-only HTML page under `work/`. For
@@ -86,23 +86,36 @@ The source must sit under the origin's root (`--source-root`, or the profile's
 supplied still with no declared root must be inside the project. The registered
 target is always a PNG. If the image started as a JPEG, WebP, TIFF or other
 file, convert it and pass the unconverted file as `--original`, which records
-its hash and header dimensions. The original follows the same rule as the
-source: under the declared root, or else inside the project. The grounding guard runs the same way for every
-origin.
+its hash and header dimensions and whether they match the PNG's. An optional
+`--conversion` note says how the step was made (the tool, its settings, any crop
+or resample). The original follows the same rule as the source: under the
+declared root, or else inside the project. The grounding guard runs the same
+way for every origin.
 
 `--retake` moves a registered still and its sidecar to
 `art/retired/<still_id>/<short-sha>/` and deletes nothing. It returns the row to
 `needs_changes` with a history entry and prints the assets downstream of it.
-Their hash bindings then fail until each one is remade or re-pointed.
-`--batch FILE` applies the same refusals to a list of registrations and stops at
-the first refusal. `make_reference_pack.py` composes registered images into one
+Reference packs and motion manifests bind its hash and refuse until remade.
+Stills registered against it hold its path; supplied and derived sidecars also
+record the hash it had, but nothing re-checks that, so the downstream list in
+the history entry is the record of which stills to remake or re-point. A
+retired still is refused as a reference, a pack source or a derive parent. A
+retake also refuses while the registry is inconsistent, because its impact
+cannot be read. `--batch FILE` applies the same refusals to a list of
+registrations and stops at the first refusal; per-row options go on the rows,
+and a per-row flag on the command line is refused rather than ignored. `make_reference_pack.py` composes registered images into one
 labelled contact image and writes the `.refpack.json` that the registrar accepts
 as packed coverage. Labels come from the policy's identity authorities.
 
 `derive_still.py` writes a still derived from a registered image or an accepted
-clip into a manifest row. It records the parent path and hash, the operation,
-the tool hash and the output hash in a `.derive.json` sidecar. `exact-frame`
-decodes one frame by index and runs only on the qualified worker. `crop`, `pad`
+clip into a manifest row. The parent must be registered, unretired and
+unchanged since its registration. The `.derive.json` sidecar records the parent
+path and hash, the operation, the tool hash and the output hash, and carries the
+parent's origin, provider, maker or supplier and rights, so a crop of a still
+that may not be uploaded keeps saying so. The grounding guard runs on the row's
+references plus the parent, with the registrar's `--policy`,
+`--exact-identity`, `--grounding-fact` and `--no-visible-identity` flags.
+`exact-frame` decodes one frame by index and runs only on the qualified worker. `crop`, `pad`
 and `scale` run anywhere and need an explicit anchor or offset. Production
 inventory reads a derived row the same way it reads a registered one.
 

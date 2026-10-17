@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Write a still derived from a registered image or an accepted clip.
 
+The parent must be a registered asset (a still sidecar, a reference pack or an
+accepted clip's sidecar) whose recorded hash matches its bytes, and not a
+retired one. Its origin, provider, maker or supplier and rights are carried
+into the derived sidecar, so a crop of a still that may not be uploaded stays
+marked that way. The grounding guard runs on the row's references plus the
+parent, as a registration's does (``--policy``, ``--exact-identity``,
+``--grounding-fact``, ``--no-visible-identity``, ``--storyboard``).
+
 Operations:
   exact-frame  one frame of a video by index (decoded on the qualified GPU worker)
   crop         a WIDTHxHEIGHT region placed by --anchor or by --x/--y
@@ -26,14 +34,18 @@ from typing import Any
 
 if __package__:
     from ._common import atomic_new_bytes, extract_exact_frame, project_root, sha256_file as sha256
+    from .asset_registry import asset_key, load_registry
     from .register_builtin_imagegen import (
-        REGISTERABLE, fail, inside, manifest_record, resolve_manifest,
+        REGISTERABLE, GroundingError, canon_root_path, fail, inside, load_json, manifest_order,
+        manifest_record, parse_claim_assignments, resolve_manifest, validate_registration_claims,
         write_json_atomic, write_json_exclusive,
     )
 else:
     from _common import atomic_new_bytes, extract_exact_frame, project_root, sha256_file as sha256
+    from asset_registry import asset_key, load_registry
     from register_builtin_imagegen import (
-        REGISTERABLE, fail, inside, manifest_record, resolve_manifest,
+        REGISTERABLE, GroundingError, canon_root_path, fail, inside, load_json, manifest_order,
+        manifest_record, parse_claim_assignments, resolve_manifest, validate_registration_claims,
         write_json_atomic, write_json_exclusive,
     )
 
@@ -42,8 +54,9 @@ ANCHORS = {
     "left": (0.0, 0.5), "right": (1.0, 0.5), "top-left": (0.0, 0.0),
     "top-right": (1.0, 0.0), "bottom-left": (0.0, 1.0), "bottom-right": (1.0, 1.0),
 }
-PARENT_SIDECARS = (".imagegen.json", ".still.json", ".derive.json", ".vid.json",
-                   ".ingest.json", ".kie.json")
+# Declarations a derived still inherits from its parent's sidecar, under the
+# names a supplied-still sidecar uses.
+INHERITED = ("origin", "provider", "maker", "supplied_by", "rights", "digital_source_type")
 
 
 def size(value: str) -> tuple[int, int]:
@@ -124,29 +137,71 @@ def tool_record(operation: str) -> dict[str, Any]:
     return record
 
 
-def parent_sidecar(root: Path, parent: Path) -> dict[str, str] | None:
-    stem = parent.with_suffix("")
-    found = [Path(str(stem) + suffix) for suffix in PARENT_SIDECARS
-             if Path(str(stem) + suffix).is_file()]
-    if len(found) > 1:
-        fail(f"parent has more than one sidecar: {[p.name for p in found]}")
-    if not found:
-        return None
-    return {"path": found[0].relative_to(root).as_posix(), "sha256": sha256(found[0])}
+def registered_parent(root: Path, parent: Path, digest: str) -> dict[str, Any]:
+    """Return the parent's registry row, refusing a loose, changed or retired file."""
+    try:
+        assets = load_registry(root)
+    except ValueError as exc:
+        fail(f"asset registry is inconsistent; reconcile it before deriving: {exc}")
+    key = asset_key(parent.relative_to(root).as_posix(), root)
+    row = assets.get(key)
+    if row is None:
+        fail(f"parent is not a registered asset; register it first: {key}")
+    if row.get("retired"):
+        fail(f"parent is a retired asset: {key}")
+    if row.get("sha256") != digest:
+        fail(f"parent's registered hash does not match its bytes: {key}")
+    return row
+
+
+def inherited(root: Path, sidecar_value: str) -> dict[str, Any]:
+    """The origin, provider, maker or supplier and rights the parent declared."""
+    record = load_json(root / sidecar_value)
+    carried = {key: record[key] for key in INHERITED if key in record}
+    carried["inherited_from"] = record.get("inherited_from", sidecar_value)
+    return carried
 
 
 def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, operation: str,
            out_size: tuple[int, int] | None = None, frame: int | None = None,
            anchor: str | None = None, x: int | None = None, y: int | None = None,
            color: str | None = None, note: str | None = None,
+           policy_path: Path | None = None, exact_identity: list[str] | tuple[str, ...] = (),
+           grounding_fact: list[str] | tuple[str, ...] = (), no_visible_identity: bool = False,
+           storyboard: Path | None = None, canon_root: Path | None = None,
            extractor=extract_exact_frame) -> dict[str, Any]:
     parent = (parent if parent.is_absolute() else root / parent).resolve()
     if not inside(parent, root) or not parent.is_file():
         fail("parent must be an existing file inside the project")
+    if no_visible_identity and exact_identity:
+        fail("--no-visible-identity cannot be combined with --exact-identity")
+    parent_digest = sha256(parent)
+    parent_row = registered_parent(root, parent, parent_digest)
+    parent_value = parent.relative_to(root).as_posix()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     record = manifest_record(manifest, still_id)
     if record.get("status") not in REGISTERABLE:
         fail(f"{still_id} has non-registerable status {record.get('status')!r}")
+    policy: dict[str, Any] = {}
+    if policy_path:
+        resolved_policy = (root / policy_path).resolve()
+        if not inside(resolved_policy, root) or not resolved_policy.is_file():
+            fail("Explicit policy must be an existing file inside the project")
+        policy = load_json(resolved_policy)
+    row_refs = list(record.get("imagegen_refs", record.get("refs", {}).get("all", [])))
+    try:
+        grounding = validate_registration_claims(
+            root=root, policy=policy, still_id=still_id,
+            execution_refs=[*row_refs, parent_value],
+            exact_identity_claims=parse_claim_assignments(exact_identity, label="--exact-identity"),
+            continuity_fact_ids=grounding_fact,
+            note=(note or "") if policy_path else "",
+            row=record if policy_path else None,
+            no_visible_identity=no_visible_identity,
+            canon_root=canon_root, order=manifest_order(root, storyboard),
+        )
+    except GroundingError as exc:
+        fail(f"grounding guard rejected {still_id}: {exc}")
     target_value = record.get("target_output_path")
     if not isinstance(target_value, str) or not target_value.endswith(".png"):
         fail(f"{still_id} has invalid PNG target_output_path")
@@ -156,7 +211,6 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
     sidecar = target.with_suffix(".derive.json")
     if target.exists() or sidecar.exists():
         fail(f"refusing to overwrite existing target or sidecar for {still_id}")
-    parent_digest = sha256(parent)
 
     if operation == "exact-frame":
         if frame is None or frame < 0:
@@ -186,8 +240,10 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
         "still_id": still_id,
         "episode": manifest.get("episode"),
         "derived_at": now,
-        "parent": {"path": parent.relative_to(root).as_posix(), "sha256": parent_digest,
-                   "sidecar": parent_sidecar(root, parent)},
+        "parent": {"path": parent_value, "sha256": parent_digest,
+                   "sidecar": {"path": parent_row["sidecar"],
+                               "sha256": sha256(root / parent_row["sidecar"])}},
+        **inherited(root, parent_row["sidecar"]),
         "operation": {"name": operation, **params},
         "tool": tool_record(operation),
         "target_output_path": target.relative_to(root).as_posix(),
@@ -195,7 +251,15 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
         "width": width,
         "height": height,
         "manifest": manifest_path.relative_to(root).as_posix(),
+        "refs": row_refs,
+        "exact_identity_claims": grounding["exact_identity_claims"],
+        "manifest_identity_coverage": grounding["manifest_identity_coverage"],
+        "continuity_facts": grounding["continuity_facts"],
+        "execution_coverage_count": grounding["execution_coverage_count"],
+        "no_visible_identity": no_visible_identity,
     }
+    if "continuity_fact_skips" in grounding:
+        provenance["continuity_fact_skips"] = grounding["continuity_fact_skips"]
     if note:
         provenance["note"] = note
     try:
@@ -204,7 +268,17 @@ def derive(*, root: Path, manifest_path: Path, still_id: str, parent: Path, oper
         record["attempts"] = int(record.get("attempts", 0)) + 1
         record["generated_at"] = now
         record["generation_provider"] = "derived"
+        if "origin" in provenance:
+            record["still_origin"] = provenance["origin"]
         record["provenance_sidecar"] = sidecar.relative_to(root).as_posix()
+        record["grounding_claims"] = {
+            "exact_identity_claims": grounding["exact_identity_claims"],
+            "manifest_identity_coverage": grounding["manifest_identity_coverage"],
+            "continuity_facts": grounding["continuity_facts"],
+            "no_visible_identity": no_visible_identity,
+        }
+        if "continuity_fact_skips" in grounding:
+            record["grounding_claims"]["continuity_fact_skips"] = grounding["continuity_fact_skips"]
         record.pop("last_error", None)
         manifest["updated_at"] = now
         manifest["status_counts"] = dict(Counter(row.get("status") for row in manifest["stills"]))
@@ -234,12 +308,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--y", type=int, help="Crop top offset (with --x)")
     parser.add_argument("--color", help="Pad fill, for example #000000")
     parser.add_argument("--note", help="Optional provenance note")
+    parser.add_argument("--policy", type=Path, help="Optional explicit project policy; no discovery")
+    parser.add_argument("--storyboard", type=Path,
+                        help="Explicit storyboard whose order resolves from/to continuity facts")
+    parser.add_argument("--canon-root", type=Path,
+                        help="Read-only series canon for canon:<path> references (or profile stills.canonRoot)")
+    parser.add_argument("--exact-identity", action="append", default=[], metavar="NAME=SOURCE",
+                        help="Named exact-identity claim and its authority source; repeat as needed")
+    parser.add_argument("--grounding-fact", action="append", default=[], metavar="FACT_ID",
+                        help="Acknowledge a policy continuity fact; repeat for every applicable fact")
+    parser.add_argument("--no-visible-identity", action="store_true",
+                        help="Explicitly declare that the frame contains no identity-bearing character")
     args = parser.parse_args(argv)
     root = project_root(args.root)
     result = derive(root=root, manifest_path=resolve_manifest(root, args.manifest),
                     still_id=args.still_id, parent=args.parent, operation=args.operation,
                     out_size=args.size, frame=args.frame, anchor=args.anchor, x=args.x,
-                    y=args.y, color=args.color, note=args.note)
+                    y=args.y, color=args.color, note=args.note, policy_path=args.policy,
+                    exact_identity=args.exact_identity, grounding_fact=args.grounding_fact,
+                    no_visible_identity=args.no_visible_identity, storyboard=args.storyboard,
+                    canon_root=canon_root_path(args.canon_root))
     print(json.dumps(result, ensure_ascii=False))
 
 
