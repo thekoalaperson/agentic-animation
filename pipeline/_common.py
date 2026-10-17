@@ -209,15 +209,101 @@ class MediaWorkerRequired(RuntimeError):
     """Raised when exact media decoding is attempted off the qualified worker."""
 
 
+def require_media_worker(reason):
+    """Refuse work that genuinely needs CUDA or a qualified model runtime.
+
+    Production media (H3, upscale, model audio, exact-frame extraction,
+    production mixes and qualified typography) stays on the configured GPU
+    worker. Review previews and auditions use preview_host_record instead.
+    Returns the GPU listing so callers can record it.
+    """
+    import shutil, subprocess
+    if sys.platform != 'linux' or not shutil.which('nvidia-smi'):
+        raise MediaWorkerRequired(f'{reason} must run on the qualified GPU worker, not this host')
+    try:
+        listing = subprocess.run(['nvidia-smi', '-L'], check=True, capture_output=True,
+                                 text=True, timeout=60)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise MediaWorkerRequired(f'{reason}: nvidia-smi found no usable GPU on the qualified GPU worker') from exc
+    return listing.stdout.strip()
+
+
+_FFMPEG_CAPABILITIES = None
+
+
+def ffmpeg_capabilities():
+    """The local ffmpeg build: its version line and the filters it offers.
+
+    Read once per process. A missing ffmpeg raises, since every preview needs it.
+    """
+    global _FFMPEG_CAPABILITIES
+    if _FFMPEG_CAPABILITIES is None:
+        import shutil, subprocess
+        binary = shutil.which('ffmpeg')
+        if not binary:
+            raise RuntimeError('ffmpeg is required for review previews and auditions')
+        version = subprocess.run([binary, '-hide_banner', '-version'], check=True,
+                                 capture_output=True, text=True).stdout.splitlines()[0].strip()
+        listing = subprocess.run([binary, '-hide_banner', '-filters'], check=True,
+                                 capture_output=True, text=True).stdout.splitlines()
+        filters = sorted({line.split()[1] for line in listing
+                          if len(line.split()) >= 3 and line[:1] == ' ' and '->' in line})
+        _FFMPEG_CAPABILITIES = {'path': binary, 'version': version, 'filters': filters}
+    return _FFMPEG_CAPABILITIES
+
+
+def needs_complex_shaping(text):
+    """True when text holds a script that renders wrongly without a shaper.
+
+    Covers the Indic blocks, Arabic, Hebrew, Thai and Myanmar. Latin, Greek,
+    Cyrillic and CJK draw correctly with a plain glyph-by-glyph path.
+    """
+    for char in text or '':
+        code = ord(char)
+        if (0x0590 <= code <= 0x08FF or 0x0900 <= code <= 0x0DFF or 0x0E00 <= code <= 0x0EFF
+                or 0x1000 <= code <= 0x109F or 0xA8E0 <= code <= 0xA8FF):
+            return True
+    return False
+
+
+def preview_host_record(font=None):
+    """What a preview or audition was actually made with, for its audit.
+
+    Records the real host, platform, ffmpeg build and the font's hash. It
+    never claims the qualified worker: a preview is labelled not final.
+    """
+    import platform
+    caps = ffmpeg_capabilities()
+    font_path = pathlib.Path(font).resolve() if font else None
+    return {
+        'computeHost': platform.node(),
+        'platform': sys.platform,
+        'ffmpeg': caps['version'],
+        'ffmpegShapingFilters': [name for name in ('ass', 'subtitles', 'drawtext') if name in caps['filters']],
+        'font': ({'path': str(font_path), 'sha256': sha256_file(font_path)} if font_path else None),
+        'finalApproved': False,
+    }
+
+
+def review_font(explicit=None):
+    """A review-sheet font: --font, else the profile's fonts.review, else None."""
+    value = explicit or profile_value('fonts', 'review')
+    if not value:
+        return None
+    path = pathlib.Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f'Review font does not exist: {path}')
+    return path
+
+
 def extract_exact_frame(source, frame_index, destination):
     """Decode one exact frame by index on the qualified GPU worker.
 
     This is the extractor the measured-deficit builder has always used. It
     writes a temporary file and publishes it only once a frame exists.
     """
-    import shutil, subprocess
-    if sys.platform != 'linux' or not shutil.which('nvidia-smi'):
-        raise MediaWorkerRequired('Media extraction must run on the qualified GPU worker, not the Mac')
+    import subprocess
+    require_media_worker('Media extraction')
     destination = pathlib.Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.stem + '.partial.png')
