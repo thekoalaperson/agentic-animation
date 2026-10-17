@@ -1,5 +1,7 @@
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -63,6 +65,42 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
         ]
         return prompt, frame, stem, argv, source_sha, manifest_sha, execution_sha
 
+    # Pinned from the hand-written parser this argparse front end replaced:
+    # recorded pending records keep resuming only if this digest is unchanged.
+    RECORDED_LOCAL_REQUEST_SHA256 = "f0fd525b786d01e6d12d027281d8f15ed14964a32b5441c5e1f554c482ce04b0"
+
+    def test_print_request_is_offline_and_keeps_the_recorded_local_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, stem, argv, *_ = self.fixture(Path(tmp))
+            printed = io.StringIO()
+            with mock.patch.object(VIDEO, "upload_ref") as upload, \
+                 mock.patch.object(VIDEO, "kie") as kie, \
+                 mock.patch.object(VIDEO, "env_key") as credential, \
+                 contextlib.redirect_stdout(printed):
+                VIDEO.main(argv + ["--print-request"])
+            upload.assert_not_called()
+            kie.assert_not_called()
+            credential.assert_not_called()
+            self.assertFalse(stem.with_suffix(".pending.json").exists())
+            shown = json.loads(printed.getvalue())
+            self.assertEqual(shown["localRequestSha256"], self.RECORDED_LOCAL_REQUEST_SHA256)
+            self.assertEqual(shown["endpoint"], "jobs/createTask")
+            body = shown["body"]["input"]
+            self.assertEqual(body["image_urls"], [VIDEO.PLACEHOLDER_URL + "frame.png"])
+            self.assertEqual((body["duration"], body["resolution"], body["aspect_ratio"]),
+                             (6, "720p", "16:9"))
+
+    def test_resume_only_never_creates_a_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, stem, argv, *_ = self.fixture(Path(tmp))
+            with mock.patch.object(VIDEO, "upload_ref") as upload, \
+                 mock.patch.object(VIDEO, "kie") as kie:
+                with self.assertRaisesRegex(SystemExit, "never creates"):
+                    VIDEO.main(argv + ["--resume-only"])
+            upload.assert_not_called()
+            kie.assert_not_called()
+            self.assertFalse(stem.with_suffix(".pending.json").exists())
+
     def test_uncertain_post_is_durable_and_never_auto_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, stem, argv, *_ = self.fixture(Path(tmp))
@@ -107,6 +145,11 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             kie.assert_not_called()
 
     def test_recorded_pending_task_is_polled_without_a_second_generation_post(self):
+        for extra in ([], ["--resume-only"]):
+            with self.subTest(extra=extra):
+                self.recover_recorded_pending_task(extra)
+
+    def recover_recorded_pending_task(self, extra):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prompt, frame, stem, argv, source_sha, manifest_sha, execution_sha = self.fixture(root)
@@ -161,15 +204,18 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
                     self.fail("recovery attempted a second generation POST")
                 self.fail(f"unexpected route: {route}")
 
-            with mock.patch.object(VIDEO, "upload_ref", return_value="https://offline/frame.png"), \
+            with mock.patch.object(VIDEO, "upload_ref", return_value="https://offline/frame.png") as upload, \
                  mock.patch.object(VIDEO, "kie", side_effect=kie), \
                  mock.patch.object(VIDEO, "env_key", return_value="offline"), \
                  mock.patch.object(VIDEO, "download_public_media", return_value=b"recovered-media"), \
                  mock.patch.object(VIDEO.time, "sleep"):
-                VIDEO.main(argv)
+                VIDEO.main(argv + extra)
             self.assertFalse(any(route == "jobs/createTask" for route in calls))
             self.assertTrue(any(route.startswith("jobs/recordInfo") for route in calls))
             self.assertFalse(pending.exists())
+            if extra:
+                upload.assert_not_called()
+                self.assertNotIn("chat/credit", calls)
 
     def test_success_writes_bound_immutable_sidecar_and_validated_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
