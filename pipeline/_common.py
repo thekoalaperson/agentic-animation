@@ -218,6 +218,28 @@ def attempt_records(directory, stem):
             for number, path in sorted(found)]
 
 
+def adopt_legacy_record(directory, stem):
+    """Carry a pre-attempt ``<stem>.json`` into the numbered attempts, once.
+
+    Wrappers older than the attempt files wrote a single ``<stem>.json`` that
+    each run replaced, and ``execution-receipt.json`` is now the attempt index.
+    Before either is written again, an old full record becomes an attempt
+    marked ``legacyRecord`` so the index lists it. The old file is left in
+    place; an index or an already adopted record is not adopted again.
+    """
+    directory = pathlib.Path(directory)
+    path = directory / f'{stem}.json'
+    if not path.is_file():
+        return None
+    record = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(record, dict) and isinstance(record.get('attempts'), list):
+        return None
+    for attempt in attempt_records(directory, stem):
+        if attempt['record'].get('legacyRecord') == path.name:
+            return None
+    return write_attempt_json(directory, stem, {'legacyRecord': path.name, 'record': record})
+
+
 def env_key(name):
     # GPU workers receive approved credentials through SSH stdin and child
     # process memory, without staging a secret file in the production bundle.

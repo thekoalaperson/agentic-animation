@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
-from pipeline._common import (attempt_records, canonical_sha256, project_root,
+from pipeline._common import (adopt_legacy_record, attempt_records, canonical_sha256, project_root,
                               sha256_file as sha256, usd_per_credit, write_attempt_json)
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
@@ -750,6 +750,7 @@ def execute(max_generated_seconds: int, submit: bool,
         estimated_credits = remaining_seconds * plan["pricing"]["creditsPerSecond"]
         if wallet_before < estimated_credits:
             raise PlanError("Insufficient existing Kie credits; no top-up or overage")
+        adopt_legacy_record(HERE, "credit-preflight")
         write_attempt_json(HERE, "credit-preflight", {
             "manifestSha256": plan["manifestSha256"], "availableCredits": wallet_before,
             "estimatedNewCredits": estimated_credits, "pricing": plan["pricing"],

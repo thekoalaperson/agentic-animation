@@ -22,6 +22,24 @@ class AttemptRecordTest(unittest.TestCase):
             self.assertEqual([r["record"]["availableCredits"] for r in records], [90, 60])
             self.assertEqual(_common.attempt_records(folder, "execution-receipt"), [])
 
+    def test_a_single_file_receipt_is_kept_as_a_legacy_attempt_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            old = {"status": "COMPLETED", "walletAfter": 40.0}
+            (folder / "execution-receipt.json").write_text(json.dumps(old))
+            (folder / "credit-preflight.json").write_text(json.dumps({"availableCredits": 90}))
+            for _ in range(2):
+                for stem in ("execution-receipt", "credit-preflight"):
+                    _common.adopt_legacy_record(folder, stem)
+            receipts = _common.attempt_records(folder, "execution-receipt")
+            self.assertEqual([(r["attempt"], r["record"]) for r in receipts],
+                             [(1, {"legacyRecord": "execution-receipt.json", "record": old})])
+            self.assertEqual(len(_common.attempt_records(folder, "credit-preflight")), 1)
+            # Once the name holds the attempt index, it is not adopted as a receipt.
+            _common.atomic_json(folder / "execution-receipt.json", {"attempts": receipts})
+            self.assertIsNone(_common.adopt_legacy_record(folder, "execution-receipt"))
+            self.assertIsNone(_common.adopt_legacy_record(folder, "absent"))
+
 
 
 class UploadLogTest(unittest.TestCase):

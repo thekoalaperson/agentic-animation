@@ -7,7 +7,9 @@ and media verification remain on the GPU worker. No retries or overage.
 
 Each invocation writes a new credit-preflight-attempt-NNN.json and
 execution-receipt-attempt-NNN.json; execution-receipt.json lists every
-attempt's before and after readings.
+attempt's before and after readings. A full execution-receipt.json or
+credit-preflight.json left by the older single-file wrapper is first kept as an
+attempt marked legacyRecord.
 """
 import argparse
 import json
@@ -18,7 +20,7 @@ import sys
 import urllib.request
 
 from eleven_batch_finite import execute, load_plan, _atomic_json, _sha256_file
-from _common import attempt_records, write_attempt_json
+from _common import adopt_legacy_record, attempt_records, write_attempt_json
 
 
 def pending_characters(plan, state_path):
@@ -45,6 +47,9 @@ def main():
         raise SystemExit('This wrapper requires an authority and authoritySha256 binding')
     folder = args.manifest.resolve().parent
     state_path = args.manifest.resolve().with_suffix('.eleven-state.json')
+    # A folder from the single-file wrapper keeps its old receipt as attempt evidence.
+    for stem in ('execution-receipt', 'credit-preflight'):
+        adopt_legacy_record(folder, stem)
     credential = json.load(sys.stdin)
     key = credential['elevenlabsApiKey']
     def get(endpoint):

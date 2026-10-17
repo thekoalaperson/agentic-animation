@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 from kie_music_finite import execute, load_plan, _atomic_json, _sha_file
-from _common import attempt_records, write_attempt_json
+from _common import adopt_legacy_record, attempt_records, write_attempt_json
 
 
 def main():
@@ -41,6 +41,8 @@ def main():
         raise SystemExit("This wrapper requires an authority and authoritySha256 binding")
     key = json.load(sys.stdin)["kieApiKey"]
     folder = manifest.parent
+    for stem in ("execution-receipt", "credit-preflight"):
+        adopt_legacy_record(folder, stem)
 
     def receipt(status, before, after, **extra):
         write_attempt_json(folder, "execution-receipt", {
