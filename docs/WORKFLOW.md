@@ -15,7 +15,7 @@ sequences. Choose the amount of process that helps the work.
 | Read a screenplay into source units | `edit/read_screenplay.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
 | Admit reviewed takes to the timeline | `edit/admit_review_decisions.py` |
-| Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
+| Assemble a measured timeline (its `--help` lists every rhythm control and its default) | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
 | Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
 | Reuse HD picture or change its audio | `open_media/build_hd_range_plan.py`, `open_media/hd_audio_remux.py` |
@@ -48,9 +48,20 @@ that the timeline fills by trimming accepted, hash-bound segments; a shortfall
 is reported like any other coverage deficit. One cost to know before choosing:
 an `unsynced` line in the ElevenLabs lane is a second voice for that character
 and will not match the same character's on-camera Grok voice. The other way to
-put a character's voice over other picture, a Grok take of that speaker used
-for its audio only, needs picture windows the timeline does not have yet, and
-carries its own identity trade-offs.
+put a character's voice over other picture is a Grok take of that speaker
+whose picture is covered, for part of the line or all of it, by a picture
+window: other accepted picture played under the take's own audio. It carries
+its own identity trade-offs.
+
+Where a cut falls is also authored in the timeline inputs, not fixed by row
+order. A dialogue scene may set its own handles, cover seconds of its picture
+with an accepted segment or with another admitted clip's picture outside that
+clip's measured speech, and let its own room sound run on before or after its
+kept window. A boundary may dissolve or dip through a colour instead of cutting,
+and a film may set a matte or a stepped cadence. When a picture window carries
+on the neighbouring picture's frames, the edit plan names the J or L cut. Each
+of these is bounded by frames and audio the reviewed media already holds; when
+none is authored the cut is what it always was.
 
 The screenplay reader lists what the source contains and chooses no shots; how
 rows divide it is the director's call. A storyboard row may cite the units it

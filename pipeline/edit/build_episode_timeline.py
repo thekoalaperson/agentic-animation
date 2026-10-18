@@ -2697,7 +2697,50 @@ documents read, named in timeline-inputs.json (defaults in brackets):
 A dialogue take (dialogueOutputs) or score take (scorePlacements) is admitted
 only through a source-bound schema-2 review export, which
 admit_review_decisions.py writes from a plain decisions file. Accepted verdict
-words: """ + ", ".join(sorted(ACCEPTED)) + "."
+words: """ + ", ".join(sorted(ACCEPTED)) + """.
+
+rhythm controls, in timeline-inputs.json unless named otherwise (default after
+the colon; nothing here is required):
+  dialogueHandles                  air kept around measured speech, film-wide:
+                                   preSeconds 0.70, postSeconds 0.90
+  dialogueOutputs[scene].handles   that scene's own preSeconds/postSeconds and a
+                                   reason: the film-wide handles
+  preserveCompleteDialogueClips    keep every whole native clip: false
+  dialogueOutputs[scene].pictureCrop, pictureCropFrom, pictureCropReason
+                                   an even-pixel crop of the native picture, from
+                                   an optional interior frame: none
+  dialogueOutputs[scene].pictureWindows
+                                   [{from, to, source, sourceSha256, sourceStart,
+                                   role, reason}] seconds of the line covered by
+                                   an accepted speed-1.0 segment or another
+                                   admitted clip's picture outside its measured
+                                   speech; the line's audio stays the clock: none
+  dialogueOutputs[scene].audioLead, audioTail
+                                   {seconds, reason} of the clip's own sound
+                                   heard before or after its kept window: none
+  minimumPictureSegmentSeconds     shorter windows warn, or need a role word: 1.3
+  microCutRoleWords                role words that mark a deliberate short cut:
+                                   """ + ", ".join(sorted(MICRO_CUT_ROLE_WORDS)) + """
+  narrationBreathing               sameBeatSeconds 0.40, beatEndSeconds 0.50,
+                                   beforeDialogueSeconds 0.35, minimumSeconds
+                                   0.35, maximumSeconds 0.55
+  narrationBreathOverrides         {scene: {seconds, reason}}: none
+  storyboard holdSeconds, holdFrames, durationRule
+                                   a wordless row's authored hold: its take
+  ledger segment in, out, speed, role
+                                   the accepted source window: whole take, speed
+                                   1.0 (0.5..4.0 when authored), approved-h3
+  allowCausalBorrowing             a narration or picture event short of its own
+                                   accepted picture borrows its nearest
+                                   neighbour's surplus: true
+  musicBreaths                     [{shots, level, reason}] score dips: none
+  transitions                      [{after, kind, frames, reason}], kind dissolve,
+                                   dip-to-black or dip-to-white: every boundary
+                                   is a cut
+  frameAspect, cadence             a matte inside the 16:9 container, and each
+                                   picture frame held 2 or 3 delivery frames:
+                                   none, 1
+"""
 
 
 def main() -> None:

@@ -2165,5 +2165,20 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertEqual(assembly.frame_filters(None, 1280, 720), ("", ""))
 
 
+    def test_help_lists_every_rhythm_control(self):
+        import contextlib, io
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["build_episode_timeline.py", "--help"]), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as done:
+            timeline.main()
+        self.assertEqual(done.exception.code, 0)
+        for control in ("dialogueHandles", "dialogueOutputs[scene].handles", "preserveCompleteDialogueClips",
+                        "pictureCrop", "pictureCropFrom", "pictureCropReason", "pictureWindows",
+                        "audioLead", "audioTail", "minimumPictureSegmentSeconds", "microCutRoleWords",
+                        "narrationBreathing", "narrationBreathOverrides", "holdSeconds", "allowCausalBorrowing",
+                        "musicBreaths", "transitions", "frameAspect", "cadence"):
+            self.assertIn(control, out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
