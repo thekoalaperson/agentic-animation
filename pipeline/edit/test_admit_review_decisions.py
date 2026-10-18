@@ -262,5 +262,12 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(stop.exception.code, 0)
 
 
+class ScoreBenchExportTest(unittest.TestCase):
+    def test_bench_exports_the_decisions_shape(self):
+        page = (Path(__file__).resolve().parents[1] / "score_candidate_review_template.html").read_text()
+        for field in ("lane:'score'", "reviewedBy", "itemId", "take:", "decision", "reviewedAt"):
+            self.assertIn(field, page)
+
+
 if __name__ == "__main__":
     unittest.main()
