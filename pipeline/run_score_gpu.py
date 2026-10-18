@@ -15,6 +15,10 @@ beside creditsPerRequest (report-only: the Suno poll carries no per-task
 credits), then posts the rest. If this wrapper stops between the two, the
 remainder is posted by kie_music_finite.py --submit (which posts only PLANNED
 cues) and observed with --poll-only here; --poll-only itself never posts.
+
+A cue that extends another waits (WAITING_PARENT) until its parent lands; this
+wrapper keeps posting and observing waves until no cue is left waiting, and
+stops if a wave posts nothing.
 """
 import argparse
 import json
@@ -25,8 +29,11 @@ import sys
 import time
 import urllib.request
 
-from kie_music_finite import execute, load_plan, _atomic_json, _sha_file
+from kie_music_finite import cue_credits, execute, load_plan, _atomic_json, _sha_file
 from _common import adopt_legacy_record, attempt_records, write_attempt_json
+
+
+UNPOSTED = {"PLANNED", "WAITING_PARENT"}
 
 
 def main():
@@ -97,7 +104,7 @@ def main():
             state = json.loads(state_path.read_text())
             statuses = {k: v["status"] for k, v in state["items"].items()}
             print(json.dumps({"poll": result, "statuses": statuses}), flush=True)
-            if all(s in ("DOWNLOADED", "PLANNED") for s in statuses.values()):
+            if all(s in UNPOSTED | {"DOWNLOADED"} for s in statuses.values()):
                 return state, statuses
             time.sleep(15)
         receipt("DEADLINE", before, wallet())
@@ -106,7 +113,7 @@ def main():
     if not a.poll_only:
         print(json.dumps(run("submit")), flush=True)
     state, statuses = observe()
-    planned = [k for k, s in statuses.items() if s == "PLANNED"]
+    planned = [k for k, s in statuses.items() if s in UNPOSTED]
     if planned and a.poll_only:
         receipt("AWAITING_REMAINDER", before, wallet(), notYetPosted=planned)
         landed = "Posted cues have landed" if len(planned) < len(statuses) else "No cue is posted yet"
@@ -123,10 +130,20 @@ def main():
                 creditsPerRequest=rate, observedCreditsPerLandedCue=delta / len(pilot),
                 comparison="report-only: the Suno poll records no per-task credits; "
                            "a shared wallet delta is an observation, not a receipt")
-        if after_pilot < rate * len(planned):
+        available = after_pilot
+    while planned:
+        remaining = sum(cue_credits(doc, cue) for cue in plan["cues"] if cue["id"] in planned)
+        if available < remaining:
             raise SystemExit("Insufficient existing credits for the remaining cues; no top-up/overage")
         print(json.dumps(run("submit")), flush=True)
         state, statuses = observe()
+        still = [k for k, s in statuses.items() if s in UNPOSTED]
+        if still == planned:
+            receipt("AWAITING_REMAINDER", before, wallet(), notYetPosted=still)
+            raise SystemExit("A wave posted nothing; inspect the batch state before submitting")
+        planned = still
+        if planned:
+            available = wallet()
     receipt("COMPLETED", before, wallet(), requests=len(statuses),
             candidates=sum(len(i["candidates"]) for i in state["items"].values()))
 

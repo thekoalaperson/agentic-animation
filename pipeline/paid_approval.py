@@ -220,8 +220,8 @@ LANES = {
         "runner": "kie_music_finite.py",
         "finiteExecution": {
             "requests": "number of frozen cues",
-            "credits": "cues x creditsPerRequest",
-            "sourceSeconds": "sum of each cue's requested duration",
+            "credits": "each cue's price: creditsPerRequest, or creditsPerExtendRequest for an extend",
+            "sourceSeconds": "sum of each cue's requested duration; an extend requests none",
         },
     },
     "media-observation": {
