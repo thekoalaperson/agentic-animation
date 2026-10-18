@@ -58,8 +58,8 @@ and credits, with an empty `operatorResponse`.
 
 An H3 request renders 17n+5 frames. Staging refuses any other `expectedFrames`
 before GPU work. The continuation builder fills a length outside its qualified
-table with an `unqualified` 17n+5 candidate. It snaps up or down only as a
-qualification receipt says. The two-keyframe body (`lastSource`, sent at frame
+table with an `unqualified` 17n+5 candidate. It snaps up or down only as the
+config's `qualifiedRequest.frameSnap` says; no receipt format exists yet. The two-keyframe body (`lastSource`, sent at frame
 index -1) is unexercised at every length until a one-job qualification run is
 recorded.
 

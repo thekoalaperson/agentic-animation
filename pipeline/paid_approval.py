@@ -375,7 +375,9 @@ def main(argv: list[str] | None = None) -> int:
                            "grantFields": list(GRANT_FIELDS), "note": CLI_EPILOG,
                            "version3": "version 2 plus automaticRetryAuthorized true and "
                                        "retryBudget {jobs, credits}, set by the person granting "
-                                       "retries; accepted only by grok-dialogue --retry-failed"}
+                                       "retries; accepted only by the grok-dialogue lane, where it also "
+                                       "authorizes plain --submit and only --retry-failed "
+                                       "spends the retry budget"}
         elif args.command == "draft":
             result = draft_record(args.lane, args.manifest, args.out, args.project)
         else:

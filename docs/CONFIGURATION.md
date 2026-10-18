@@ -88,13 +88,19 @@ failures in a row, or when every job in a concurrency group fails. A retry is a
 new paid POST, so `kie_dialogue_finite.py --submit --retry-failed` runs only
 under a version 3 record. Version 3 is version 2 plus
 `automaticRetryAuthorized: true` and a `retryBudget` of `{jobs, credits}`,
-both set by the person who grants it. Only the dialogue lane accepts version 3. The grant must be in place before the
+both set by the person who grants it. `jobs` counts retry attempts across the
+whole batch, not distinct jobs, and `credits` is checked against the priced
+retries before anything is posted as well as against what lands. Only the
+dialogue lane accepts version 3, and it also authorizes a plain `--submit`. The
+grant must be in place before the
 batch's first submission, because a batch keeps the record it started with.
 The retried request is identical, and the failed record moves to
 `motion/<id>.attempts/attempt-NNN.pending.json`. A job's first attempt counts
-toward `maximumCredits`. Every later attempt counts toward the retry budget.
+toward `maximumCredits`. Every later attempt counts toward the retry budget. If
+a run stops after a record has moved but before its retry was posted, a plain
+`--submit` refuses and names the job; only `--retry-failed` posts it.
 A changed prompt is not a retry. Freeze those jobs as a new manifest
-(`--freeze --only`) with its own approval, and admit its takes through
+(`--freeze --only <ids> --selection-reason`) with its own approval, and admit its takes through
 `dialogueOutputs[scene].executionManifest`.
 
 Old grants and receipts retain their original schema and runner. Migrate paths
