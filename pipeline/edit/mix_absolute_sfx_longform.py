@@ -337,7 +337,18 @@ def validate_render_runs(
         raise MixError("picture render runs do not cover the exact delivery frame count")
     for run in render_runs:
         member_ids = run.get("memberSegmentIds", [])
-        if len(member_ids) > 1:
+        if run.get("role") == "dissolve-transition-run":
+            # Two or more sources overlapped by authored dissolves: the sources'
+            # frames, less each overlap, must be exactly the run's frames.
+            sources, dissolves = run.get("sources"), run.get("dissolves")
+            if (not isinstance(sources, list) or len(sources) < 2 or not isinstance(dissolves, list)
+                    or len(dissolves) != len(sources) - 1
+                    or sum(int(row.get("frames", -1)) for row in sources) - sum(dissolves) != int(run.get("frames", -1))
+                    or sum(int(row.get("shownFrames", -1)) for row in sources) != int(run.get("frames", -1))):
+                raise MixError("dissolve picture run does not account for its sources' frames")
+            if len(run.get("memberRoles", [])) != len(member_ids):
+                raise MixError("coalesced picture run lost semantic role evidence")
+        elif len(member_ids) > 1:
             if run.get("role") != "source-contiguous-role-preserving-render-run":
                 raise MixError("coalesced picture run lacks its continuity declaration")
             if len(run.get("memberRoles", [])) != len(member_ids):

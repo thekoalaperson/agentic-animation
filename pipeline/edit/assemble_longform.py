@@ -213,6 +213,102 @@ def build_picture_segments(ep: Path, plan: dict) -> list[dict]:
     return result
 
 
+TRANSITION_OUT_KEYS = ("fadeOut", "dissolveOut")
+TRANSITION_IN_KEYS = ("fadeIn", "dissolveIn")
+DIP_COLOURS = {"dip-to-black": "black", "dip-to-white": "white"}
+
+
+def apply_transitions(segments: list[dict], transitions: list[dict]) -> None:
+    """Mark the two picture segments on each side of an authored transition.
+
+    A dip fades the outgoing segment's last frames to a colour and the incoming
+    segment's first frames up from it. A dissolve names how many unused frames
+    each side lends to the overlap; ``group_dissolve_runs`` renders the pair
+    as one run. Segments without a transition are left exactly as they were.
+    """
+    for transition in transitions:
+        boundary = transition.get("timelineFrame")
+        cut = next((k for k in range(len(segments) - 1)
+                    if round((segments[k]["timelineStart"] + segments[k]["duration"]) * FPS) == boundary
+                    and round(segments[k + 1]["timelineStart"] * FPS) == boundary), None)
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or cut is None:
+            raise RuntimeError(f"Transition after {transition.get('after')} has no picture cut to sit on")
+        outgoing, incoming = segments[cut], segments[cut + 1]
+        kind, frames = transition.get("kind"), transition.get("frames")
+        shown_out, shown_in = transition.get("outgoingFrames"), transition.get("incomingFrames")
+        tail, head = transition.get("outgoingUnusedTailFrames"), transition.get("incomingUnusedHeadFrames")
+        counts = (frames, shown_out, shown_in, tail, head)
+        if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in counts) or frames < 2
+                or shown_out > outgoing["frames"] or shown_in > incoming["frames"]):
+            raise RuntimeError(f"Transition after {transition.get('after')} has invalid frame counts")
+        if kind in DIP_COLOURS:
+            if (tail, head) != (0, 0) or shown_out + shown_in != frames:
+                raise RuntimeError("A dip uses only frames the cut already shows")
+            if shown_out:
+                outgoing["fadeOut"] = {"frames": shown_out, "colour": DIP_COLOURS[kind]}
+            if shown_in:
+                incoming["fadeIn"] = {"frames": shown_in, "colour": DIP_COLOURS[kind]}
+        elif kind == "dissolve":
+            if tail + head != frames or (shown_out, shown_in) != (head, tail):
+                raise RuntimeError("A dissolve overlaps exactly the unused frames each side lends")
+            outgoing["dissolveOut"] = {"frames": frames, "unusedTailFrames": tail}
+            incoming["dissolveIn"] = {"frames": frames, "unusedHeadFrames": head}
+        else:
+            raise RuntimeError(f"Unknown transition kind {kind!r}")
+
+
+def group_dissolve_runs(runs: list[dict]) -> list[dict]:
+    """Render runs joined by dissolves as one run of two or more sources.
+
+    Each member keeps its own source window and gains only the unused frames
+    it lends to the overlap. The joined run covers exactly the members'
+    delivery frames, so the concat list and the frame-count guard are unchanged.
+    """
+    result: list[dict] = []
+    for run in runs:
+        if result and "dissolveIn" in run:
+            group = result[-1]
+            if "dissolveOut" not in (group["sources"][-1] if "sources" in group else group):
+                raise RuntimeError("Dissolve has no outgoing run beside it")
+            if "sources" not in group:
+                group = {"sources": [dict(group)], "dissolves": []}
+                result[-1] = group
+            group["sources"].append(dict(run))
+            group["dissolves"].append(int(run["dissolveIn"]["frames"]))
+            continue
+        result.append(run)
+    grouped = []
+    for item in result:
+        if "sources" not in item:
+            grouped.append(item)
+            continue
+        parts = []
+        for part in item["sources"]:
+            speed = float(part["speed"])
+            head = int(part.get("dissolveIn", {}).get("unusedHeadFrames", 0))
+            tail = int(part.get("dissolveOut", {}).get("unusedTailFrames", 0))
+            extended = dict(part, sourceStart=float(part["sourceStart"]) - head * speed / FPS,
+                            sourceDuration=float(part["sourceDuration"]) + (head + tail) * speed / FPS,
+                            frames=int(part["frames"]) + head + tail, shownFrames=int(part["frames"]))
+            if extended["sourceStart"] < -1e-9:
+                raise RuntimeError("Dissolve head reaches before its source")
+            parts.append(extended)
+        first, last = item["sources"][0], item["sources"][-1]
+        grouped.append({
+            "id": f"{first['id']}-dissolve-{last['id']}",
+            "role": "dissolve-transition-run",
+            "timelineStart": first["timelineStart"],
+            "duration": sum(float(p["duration"]) for p in item["sources"]),
+            "frames": sum(int(p["frames"]) for p in item["sources"]),
+            "sources": parts,
+            "dissolves": item["dissolves"],
+            "memberSegmentIds": [m for p in item["sources"] for m in p["memberSegmentIds"]],
+            "memberBlocks": [m for p in item["sources"] for m in p["memberBlocks"]],
+            "memberRoles": [m for p in item["sources"] for m in p["memberRoles"]],
+        })
+    return grouped
+
+
 def coalesce_render_segments(segments: list[dict]) -> list[dict]:
     """Merge exact adjacent windows for rendering while preserving the role ledger.
 
@@ -247,10 +343,16 @@ def coalesce_render_segments(segments: list[dict]) -> list[dict]:
             - float(current["timelineStart"])
         ) <= 1e-6
         same_speed = abs(float(prior["speed"]) - float(current["speed"])) <= 1e-9
+        # An authored transition is a boundary the picture must keep.
+        transition_between = any(key in prior for key in TRANSITION_OUT_KEYS) or any(
+            key in current for key in TRANSITION_IN_KEYS)
         if not (same_source and source_contiguous and timeline_contiguous and same_speed
-                and prior.get('crop') == current.get('crop')):
+                and prior.get('crop') == current.get('crop')) or transition_between:
             runs.append(current)
             continue
+        for key in TRANSITION_OUT_KEYS:
+            if key in current:
+                prior[key] = current[key]
         prior["id"] = f"{prior['memberSegmentIds'][0]}-{current['id']}"
         prior["sourceDuration"] = float(prior["sourceDuration"]) + float(
             current["sourceDuration"]
@@ -265,12 +367,18 @@ def coalesce_render_segments(segments: list[dict]) -> list[dict]:
 
 
 def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
-    key = hashlib.sha256(json.dumps({
+    if "sources" in item:
+        return render_dissolve_run(item, cache, width, height)
+    identity = {
         "source": item["sourceSha256"], "start": item["sourceStart"],
         "sourceDuration": item["sourceDuration"], "speed": item["speed"],
         "frames": item["frames"], "width": width, "height": height,
         "crop": item.get("crop"),
-    }, sort_keys=True).encode()).hexdigest()[:20]
+    }
+    fades = {key: item[key] for key in ("fadeIn", "fadeOut") if key in item}
+    if fades:
+        identity["fades"] = fades  # absent for an ordinary cut, so its cache key is unchanged
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     output = cache / f"{item['id']}-{key}.mp4"
     if output.exists():
         return output
@@ -291,7 +399,14 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
         f"{crop_filter}"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-        f"fps={FPS},format=yuv420p"
+        f"fps={FPS},"
+        + "".join(f"fade=t=in:s=0:n={fade['frames']}:c={fade['colour']}," for fade in [item.get("fadeIn")] if fade)
+        # ffmpeg reaches the colour one frame after a fade-out's last frame, so
+        # start one frame earlier: the segment's final frame is then the colour,
+        # as a fade-in's first frame is.
+        + "".join(f"fade=t=out:s={max(0, int(item['frames']) - fade['frames'] - 1)}:n={fade['frames']}:c={fade['colour']},"
+                  for fade in [item.get("fadeOut")] if fade)
+        + "format=yuv420p"
     )
     run([
         "ffmpeg", "-y", "-v", "error", "-ss", item["sourceStart"],
@@ -303,10 +418,44 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
     return output
 
 
+def render_dissolve_run(item: dict, cache: Path, width: int, height: int) -> Path:
+    """Render each source of a dissolve run, then overlap them with ``xfade``."""
+    parts = [render_segment(dict(part, id=f"{item['id']}-s{index}"), cache, width, height)
+             for index, part in enumerate(item["sources"])]
+    key = hashlib.sha256(json.dumps({"parts": [path.name for path in parts], "dissolves": item["dissolves"],
+                                     "frames": item["frames"]}).encode()).hexdigest()[:20]
+    output = cache / f"{item['id']}-{key}.mp4"
+    if output.exists():
+        return output
+    graph, label, length = [], "[i0]", int(item["sources"][0]["frames"])
+    for index in range(len(parts)):
+        graph.append(f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={FPS}[i{index}]")
+    for index, frames in enumerate(item["dissolves"], 1):
+        offset = length - frames
+        graph.append(f"{label}[i{index}]xfade=transition=fade:duration={frames / FPS:.9f}:"
+                     f"offset={offset / FPS:.9f}[x{index}]")
+        label = f"[x{index}]"
+        length += int(item["sources"][index]["frames"]) - frames
+    if length != int(item["frames"]):
+        raise RuntimeError(f"Dissolve run {item['id']} does not cover its delivery frames")
+    partial = output.with_suffix(".partial.mp4")
+    inputs = [arg for path in parts for arg in ("-i", path)]
+    run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex",
+         ";".join(graph) + f";{label}format=yuv420p[out]", "-map", "[out]", "-an",
+         "-frames:v", item["frames"], "-c:v", "libx264", "-preset", "veryfast", "-crf", 18,
+         "-threads", 3, "-g", FPS * 2, "-pix_fmt", "yuv420p", partial])
+    partial.replace(output)
+    return output
+
+
 def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> Path:
     segments = build_picture_segments(ep, plan)
+    if plan.get("transitions"):
+        apply_transitions(segments, plan["transitions"])
     (work / "picture-segments.json").write_text(json.dumps(segments, indent=2) + "\n")
     render_runs = coalesce_render_segments(segments)
+    if plan.get("transitions"):
+        render_runs = group_dissolve_runs(render_runs)
     (work / "picture-render-runs.json").write_text(
         json.dumps(render_runs, indent=2) + "\n"
     )

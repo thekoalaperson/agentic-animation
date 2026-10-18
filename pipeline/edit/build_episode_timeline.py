@@ -644,6 +644,121 @@ def _audio_overlaps(scene_id: str, output: dict[str, Any], measured: bool, start
     return result
 
 
+TRANSITION_KINDS = {"dissolve", "dip-to-black", "dip-to-white"}
+
+
+def _resolve_transitions(
+    raw: Any, events: list[dict[str, Any]], blocks: list[dict[str, Any]], *, episode: Path, repo: Path,
+    config_path: Path, h3_by_scene: dict[str, list[dict[str, Any]]],
+    dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Resolve authored transitions at event boundaries; a boundary not named is a cut.
+
+    A transition sits on a picture cut at the end of the event it names. A dip
+    fades the outgoing picture to a colour and the incoming picture up from it,
+    using only frames the cut already shows. A dissolve overlaps the two
+    pictures, so it needs frames the cut did not show: the outgoing shot's
+    unused tail and the incoming shot's unused head, inside what review
+    accepted and, for dialogue picture, outside its measured speech. It is
+    centred on the cut where both sides hold enough and shifted toward the
+    side that does otherwise; the timeline refuses when the frames do not exist.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("transitions must be an array")
+    placed = []
+    for block in blocks:
+        cursor = round(block["start"] * DELIVERY_FPS)
+        for candidate in block["candidates"]:
+            placed.append((cursor, int(candidate["frames"]), candidate, block))
+            cursor += int(candidate["frames"])
+    index_by_id = {event["id"]: position for position, event in enumerate(events)}
+
+    def bounds(candidate: dict[str, Any], block: dict[str, Any]) -> tuple[float, float, float, list[tuple[float, float]]]:
+        """Accepted source frames around a placed candidate: (low, high, speed, speech ranges)."""
+        window = candidate.get("pictureWindow")
+        sha = candidate["sourceSha256"]
+        path = _resolve_path(episode, repo, config_path, candidate["path"])
+        if window and window["sourceKind"] == "dialogue" or not window and block["kind"] == "dialogue-fixed-sync":
+            donor = window["sourceSceneId"] if window else block["events"][0]
+            _, info, entry, output = dialogue_media[donor]
+            natural = info.video_frames or math.floor((info.video_duration or info.duration) * DELIVERY_FPS + 1e-6)
+            speech = _speech_window(entry, output) if window else None  # an event's own speech is inside its kept window
+            return 0.0, float(natural), 1.0, ([(speech[0] * DELIVERY_FPS, speech[1] * DELIVERY_FPS)] if speech else [])
+        scene = window["sourceSceneId"] if window else candidate.get("sceneId")
+        first = float(candidate["sourceStart"]) * DELIVERY_FPS
+        for raw_candidate in h3_by_scene.get(str(scene), []):
+            if (raw_candidate["path"] == path and raw_candidate["sha256"] == sha
+                    and raw_candidate["sourceStartFrame"] <= first + 1e-6 < raw_candidate["sourceEndFrame"]):
+                return (float(raw_candidate["sourceStartFrame"]), float(raw_candidate["sourceEndFrame"]),
+                        float(raw_candidate["speed"]), [])
+        raise ValueError(f"no accepted source bounds for picture at {candidate['path']}")
+
+    def unused(candidate: dict[str, Any], block: dict[str, Any]) -> tuple[int, int]:
+        """Output frames the cut did not show before (head) and after (tail) this candidate."""
+        low, high, speed, speech = bounds(candidate, block)
+        start = float(candidate["sourceStart"]) * DELIVERY_FPS
+        end = start + int(candidate["frames"]) * speed
+        head, tail = math.floor((start - low) / speed + 1e-6), math.floor((high - end) / speed + 1e-6)
+        for speech_start, speech_end in speech:
+            if speech_start >= end - 1e-6:
+                tail = min(tail, math.floor((speech_start - end) / speed + 1e-6))
+            if speech_end <= start + 1e-6:
+                head = min(head, math.floor((start - speech_end) / speed + 1e-6))
+        return max(head, 0), max(tail, 0)
+
+    result, seen = [], set()
+    for position, row in enumerate(raw):
+        label = f"transition {position}"
+        if (not isinstance(row, dict) or set(row) != {"after", "kind", "frames", "reason"}
+                or row["kind"] not in TRANSITION_KINDS or isinstance(row["frames"], bool)
+                or not isinstance(row["frames"], int) or row["frames"] < 2
+                or not isinstance(row["reason"], str) or not row["reason"].strip()):
+            raise ValueError(f"{label} needs after, kind ({', '.join(sorted(TRANSITION_KINDS))}), "
+                             "a whole number of frames (2 or more) and an authored reason")
+        after = row["after"]
+        if after not in index_by_id or index_by_id[after] == len(events) - 1 or after in seen:
+            raise ValueError(f"{label} must name, once, an event that another event follows")
+        seen.add(after)
+        boundary = round(events[index_by_id[after]]["end"] * DELIVERY_FPS)
+        cut = next((k for k in range(len(placed) - 1)
+                    if placed[k][0] + placed[k][1] == boundary and placed[k + 1][0] == boundary), None)
+        if cut is None:
+            raise ValueError(f"{label}: no picture cut falls at the end of {after}")
+        (_, out_frames, outgoing, out_block), (_, in_frames, incoming, in_block) = placed[cut], placed[cut + 1]
+        if incoming.get("continuationOf") or (
+                outgoing["sourceSha256"] == incoming["sourceSha256"]
+                and abs(float(outgoing["sourceStart"]) * DELIVERY_FPS
+                        + out_frames * float(outgoing.get("speed", 1.0))
+                        - float(incoming["sourceStart"]) * DELIVERY_FPS) < 1e-3):
+            raise ValueError(f"{label}: the picture continues across the end of {after}; there is no cut to soften")
+        frames = row["frames"]
+        if row["kind"] == "dissolve":
+            _, tail_room = unused(outgoing, out_block)
+            head_room, _ = unused(incoming, in_block)
+            head = min(head_room, frames // 2)
+            tail = frames - head
+            if tail > tail_room:
+                tail = tail_room
+                head = frames - tail
+            if head > head_room or tail > tail_room:
+                raise ValueError(f"{label}: a {frames}-frame dissolve needs {frames} unused frames; the outgoing "
+                                 f"shot holds {tail_room} after the cut and the incoming {head_room} before it")
+            shown_out, shown_in = head, tail  # frames of each shot already on screen that the overlap covers
+        else:
+            tail, head = 0, 0
+            shown_out, shown_in = frames - frames // 2, frames // 2
+        if shown_out > out_frames or shown_in > in_frames:
+            raise ValueError(f"{label}: the {frames}-frame {row['kind']} is longer than a shot on one side of the cut")
+        result.append({
+            "after": after, "before": events[index_by_id[after] + 1]["id"], "kind": row["kind"],
+            "frames": frames, "timelineFrame": boundary,
+            "outgoingFrames": shown_out, "incomingFrames": shown_in,
+            "outgoingUnusedTailFrames": tail, "incomingUnusedHeadFrames": head,
+            "reason": row["reason"].strip(),
+        })
+    return sorted(result, key=lambda row: row["timelineFrame"])
+
+
 def _speech_rule(row: dict[str, Any]) -> None:
     scene_id = row.get("still_id")
     if row.get("durationRule") not in (None, "speech") or any(
@@ -2333,6 +2448,18 @@ def build_timeline(
         tail = event.get("audioTail", {}).get("seconds", 0)
         if tail and event["end"] + tail > cursor_frames / DELIVERY_FPS + 1e-6:
             raise TimelineIncomplete(f"Audio tail runs past the end of the film: {event['id']}")
+    transitions = []
+    # Cut positions are known only once every block is covered; a deficit is reported first.
+    if config.get("transitions") is not None and all(
+            block["status"] != "blocked-coverage-deficit" for block in blocks):
+        try:
+            transitions = _resolve_transitions(
+                config["transitions"], events, blocks, episode=episode, repo=repo, config_path=config_path,
+                h3_by_scene=h3_by_scene, dialogue_media=dialogue_media)
+        except ValueError as exc:
+            errors.append({"type": "transition", "error": str(exc)})
+    if transitions:
+        readiness["transitions"] = transitions
 
     # Preserve the exact allocation evidence even when picture coverage is
     # short.  A continuation planner must be able to prove which accepted
@@ -2450,6 +2577,8 @@ def build_timeline(
         "musicBreaths": config.get("musicBreaths", []),
         "sfxManifest": config.get("sfxManifest"),
     }
+    if transitions:
+        edit_plan["transitions"] = transitions
     subtitle_hi = _subtitle_doc("hi", events, fingerprint)
     subtitle_en = _subtitle_doc("en", events, fingerprint)
     explicit_retimes = [

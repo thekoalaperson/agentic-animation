@@ -1986,5 +1986,159 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertFalse(np.any(stem[:round(0.75 * sr)]))
 
 
+    def set_transitions(self, *rows):
+        config = json.loads(self.config.read_text())
+        config["transitions"] = [dict(zip(("after", "kind", "frames", "reason"), row)) for row in rows]
+        self.write_json(self.config, config)
+
+    def test_no_transition_leaves_every_boundary_a_cut(self):
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertNotIn("transitions", plan)
+        self.assertNotIn("transitions", ready)
+
+    def test_dissolve_uses_only_unused_frames_on_each_side(self):
+        # demo-s001 shows 58 frames of a 3.5x segment and leaves 10 unused; demo-s002 starts at its in point.
+        self.set_transitions(("demo-s001", "dissolve", 8, "Let one place become the next."),
+                             ("demo-s002", "dissolve", 8, "Ease into the line."),
+                             ("demo-s003", "dip-to-black", 12, "A breath of dark before the last image."))
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        first, second, dip = plan["transitions"]
+        self.assertEqual((first["outgoingUnusedTailFrames"], first["incomingUnusedHeadFrames"]), (8, 0))
+        self.assertEqual((first["outgoingFrames"], first["incomingFrames"]), (0, 8))
+        # Into the dialogue: demo-s003 keeps frames 7..106, so 7 unused frames precede its window; centred.
+        self.assertEqual((second["outgoingUnusedTailFrames"], second["incomingUnusedHeadFrames"]), (4, 4))
+        self.assertEqual(second["timelineFrame"], round(plan["events"][1]["end"] * 24))
+        self.assertEqual((dip["kind"], dip["outgoingFrames"], dip["incomingFrames"]), ("dip-to-black", 6, 6))
+        self.assertEqual((dip["outgoingUnusedTailFrames"], dip["incomingUnusedHeadFrames"]), (0, 0))
+        self.assertEqual(ready["transitions"], plan["transitions"])
+
+    def test_dissolve_is_refused_where_the_frames_do_not_exist(self):
+        self.set_transitions(("demo-s001", "dissolve", 12, "Longer than the unused tail."))
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "transition" and "unused frames" in e["error"]
+                            for e in self.readiness()["errors"]))
+        # Out of the dialogue its unused tail (14 frames after the kept window) is lent.
+        self.set_transitions(("demo-s003", "dissolve", 8, "Leave on the room."))
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(plan["transitions"][0]["outgoingUnusedTailFrames"], 8)
+        # Without a measured speech window the whole clip is kept, so nothing is unused.
+        config = json.loads(self.config.read_text())
+        del config["dialogueOutputs"]["demo-s003"]["speechWindow"]
+        self.write_json(self.config, config)
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.set_transitions(("demo-s003", "dip-to-white", 8, "A dip needs no unused frames."))
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+
+    def test_transition_rows_name_a_boundary_and_a_reason(self):
+        for rows in ((("demo-s004", "dissolve", 8, "last event"),),
+                     (("demo-s009", "dissolve", 8, "unknown event"),),
+                     (("demo-s001", "wipe", 8, "unknown kind"),),
+                     (("demo-s001", "dissolve", 1, "one frame"),),
+                     (("demo-s001", "dissolve", 8, " "),),
+                     (("demo-s001", "dissolve", 4, "twice"), ("demo-s001", "dissolve", 4, "twice"))):
+            with self.subTest(rows=rows):
+                self.set_transitions(*rows)
+                with self.assertRaises(timeline.TimelineIncomplete):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "transition" for e in self.readiness()["errors"]))
+
+    def test_transition_needs_a_picture_cut_that_is_not_a_continuation(self):
+        path, ledger, child = self._add_continuation_fixture()
+        ledger["entries"]["demo-s001"]["segments"].pop()
+        ledger["entries"]["demo-s002"]["segments"] = [child]
+        self.write_json(path, ledger)
+        def probe(path):
+            if path.name == "demo-s001-hi.mp3":
+                return timeline.MediaProbe(3.6, None, 3.6, None, None, 0, 1)
+            return self.fake_probe(path)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=probe)
+        self.assertTrue(ready["ready"], ready)
+        # demo-s002 opens on the frames that continue demo-s001's shot, so there is no cut to soften.
+        self.set_transitions(("demo-s001", "dissolve", 4, "x"))
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=probe)
+        self.assertTrue(any("no cut to soften" in e.get("error", "") for e in self.readiness()["errors"]))
+
+    def test_transition_needs_a_cut_on_its_boundary(self):
+        # demo-s001 has no picture of its own and borrows demo-s002's, so one shot spans both events.
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s001"]["segments"] = []
+        self.write_json(path, ledger)
+        def probe(path):
+            if path.name == "demo-s001-hi.mp3":
+                return timeline.MediaProbe(0.5, None, 0.5, None, None, 0, 1)
+            return self.fake_probe(path)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(len(plan["pictureBlocks"][0]["candidates"]), 1)
+        self.set_transitions(("demo-s001", "dip-to-black", 4, "x"))
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=probe)
+        self.assertTrue(any("no picture cut" in e.get("error", "") for e in self.readiness()["errors"]))
+
+    def test_assembler_marks_and_groups_transitions_without_moving_frames(self):
+        sys.path.insert(0, str(HERE))
+        import mix_absolute_sfx_longform as mix
+        self.set_transitions(("demo-s001", "dissolve", 8, "x"), ("demo-s003", "dip-to-black", 12, "y"))
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        with mock.patch.object(assembly, "probe_duration", return_value=10.0):
+            segments = assembly.build_picture_segments(self.ep, plan)
+        plain = assembly.coalesce_render_segments(json.loads(json.dumps(segments)))
+        assembly.apply_transitions(segments, plan["transitions"])
+        self.assertEqual(segments[0]["dissolveOut"], {"frames": 8, "unusedTailFrames": 8})
+        self.assertEqual(segments[1]["dissolveIn"], {"frames": 8, "unusedHeadFrames": 0})
+        dialogue = next(i for i, seg in enumerate(segments) if seg["role"] == "dialogue-fixed-sync")
+        self.assertEqual(segments[dialogue]["fadeOut"], {"frames": 6, "colour": "black"})
+        self.assertEqual(segments[dialogue + 1]["fadeIn"], {"frames": 6, "colour": "black"})
+        runs = assembly.group_dissolve_runs(assembly.coalesce_render_segments(segments))
+        joined = runs[0]
+        self.assertEqual(joined["role"], "dissolve-transition-run")
+        self.assertEqual([p["frames"] for p in joined["sources"]], [58 + 8, segments[1]["frames"]])
+        self.assertEqual(joined["frames"], segments[0]["frames"] + segments[1]["frames"])
+        self.assertAlmostEqual(joined["sources"][0]["sourceDuration"], (58 + 8) * 3.5 / 24, places=6)
+        self.assertEqual(sum(r["frames"] for r in runs), sum(r["frames"] for r in plain))
+        self.assertEqual(len(runs), len(plain) - 1)
+        mix.validate_render_runs(segments, runs, sum(r["frames"] for r in plain))
+        broken = json.loads(json.dumps(runs))
+        broken[0]["dissolves"] = [7]
+        with self.assertRaises(mix.MixError):
+            mix.validate_render_runs(segments, broken, sum(r["frames"] for r in plain))
+
+    def test_renderer_fades_and_dissolves_with_explicit_frame_counts(self):
+        source = self.ep / "work/h3/demo-s001.mp4"
+        item = {"id": "p001", "source": str(source), "sourceSha256": "abc", "sourceStart": 0.5,
+                "sourceDuration": 2.0, "speed": 1.0, "frames": 48}
+        cache = self.ep / "work/render-test"
+        cache.mkdir()
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append([str(value) for value in command])
+            Path(command[-1]).write_bytes(b"rendered")
+            return mock.Mock()
+
+        with mock.patch.object(assembly, "run", side_effect=fake_run):
+            plain = assembly.render_segment(item, cache, 1280, 720)
+            faded = assembly.render_segment(dict(item, fadeOut={"frames": 6, "colour": "black"},
+                                                 fadeIn={"frames": 4, "colour": "white"}), cache, 1280, 720)
+            dissolve = {"id": "p001-dissolve-p002", "frames": 90, "dissolves": [6], "sources": [
+                dict(item, frames=54, shownFrames=48), dict(item, id="p002", sourceStart=3.0, frames=42, shownFrames=42)]}
+            joined = assembly.render_dissolve_run(dissolve, cache, 1280, 720)
+        vf = commands[0][commands[0].index("-vf") + 1]
+        self.assertTrue(vf.endswith(",fps=24,format=yuv420p"))  # an ordinary cut renders as before
+        self.assertNotEqual(plain.name, faded.name)
+        vf = commands[1][commands[1].index("-vf") + 1]
+        self.assertIn("fade=t=in:s=0:n=4:c=white,fade=t=out:s=41:n=6:c=black,format=yuv420p", vf)
+        graph = commands[-1][commands[-1].index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=fade:duration=0.250000000:offset=2.000000000", graph)
+        self.assertEqual(commands[-1][commands[-1].index("-frames:v") + 1], "90")
+        self.assertTrue(joined.name.startswith("p001-dissolve-p002-"))
+
+
 if __name__ == "__main__":
     unittest.main()

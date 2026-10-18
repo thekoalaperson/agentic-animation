@@ -49,7 +49,8 @@ def main():
     if platform.system()!='Linux':raise RuntimeError('Rendering belongs on GCP')
     c=json.loads(a.clock.read_text());r=json.loads(a.readiness.read_text())
     ch=sha(a.clock);rh=sha(a.readiness);validate(r,c,ch)
-    plan=dict(c,pictureBlocks=r['pictureBlocks'],pictureOwnershipContracts=ownership_contracts(ep,r))
+    plan=dict(c,pictureBlocks=r['pictureBlocks'],pictureOwnershipContracts=ownership_contracts(ep,r),
+              transitions=r.get('transitions',[]))
     out=a.output.resolve()
     if not out.is_relative_to(ep/'work'):raise RuntimeError('Work-only output required')
     out.mkdir(parents=True,exist_ok=False)
