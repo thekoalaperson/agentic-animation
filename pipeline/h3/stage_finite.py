@@ -13,6 +13,25 @@ class StageError(ValueError):
     """The authored plan cannot be staged without breaking its source binding."""
 
 
+# H3 renders 17n+5 frames. The cited vLLM page now returns 404; the rule is
+# corroborated by every frame count this repository has recorded and by
+# third-party notes. A plan that breaks it would halt only after the GPU had
+# rendered the take, so staging refuses it first.
+H3_FRAME_STEP = 17
+H3_FRAME_OFFSET = 5
+
+
+def frame_rule_problem(frames):
+    """Why ``frames`` cannot be an H3 expectedFrames value, or None."""
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames <= H3_FRAME_OFFSET:
+        return f"expectedFrames must be a whole number above {H3_FRAME_OFFSET}, not {frames!r}"
+    if (frames - H3_FRAME_OFFSET) % H3_FRAME_STEP:
+        below = frames - (frames - H3_FRAME_OFFSET) % H3_FRAME_STEP
+        return (f"expectedFrames {frames} is not 17n+5; the nearest H3 lengths are "
+                f"{below} and {below + H3_FRAME_STEP}")
+    return None
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -20,6 +39,11 @@ def sha(path):
 def stage(plan_path, target):
     plan = json.loads(plan_path.read_text())
     root = Path(plan.pop("sourceRoot")).resolve()
+    for item in plan["items"]:
+        if "expectedFrames" in item:
+            problem = frame_rule_problem(item["expectedFrames"])
+            if problem:
+                raise StageError(f"{item.get('id')}: {problem}")
     target.mkdir(parents=True, exist_ok=True)
     (target / "stills").mkdir(exist_ok=True)
     for item in plan["items"]:

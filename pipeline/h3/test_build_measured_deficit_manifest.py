@@ -266,6 +266,7 @@ class MeasuredDeficitManifestTests(unittest.TestCase):
         self.assertEqual(item["plannedCoverageFramesThisWave"], 24)
         self.assertEqual(item["residualFramesAfterThisWave"], 0)
         self.assertEqual(item["expectedFrames"], 175)
+        self.assertNotIn("expectedFramesQualification", item)
         self.assertEqual(item["usableExpectedFramesAfterAnchorDrop"], 174)
         self.assertEqual(item["anchorSourceFrame"], 47)
         self.assertIs(item["dropConditioningFrameAtAcceptedIngest"], True)
@@ -312,6 +313,33 @@ class MeasuredDeficitManifestTests(unittest.TestCase):
         readiness["measuredClock"]["sha256"] = self.sha(self.clock)
         self.write_json(self.readiness, readiness)
         with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "contains audio"):
+            measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
+
+    def set_qualified(self, **qualified):
+        config = json.loads(self.config.read_text())
+        config["qualifiedRequest"] = {"shortEdge": 768, "aspect": "auto", "steps": 30, **qualified}
+        self.write_json(self.config, config)
+
+    def test_expected_frames_helper_prefers_the_table_and_never_guesses_a_snap(self):
+        helper = measured_deficit.expected_frames_for
+        self.assertEqual(helper(7), (175, None))
+        self.assertEqual(helper(10, {"seconds": 10, "expectedFrames": 243}), (243, None))
+        self.assertEqual(helper(10, {}, "down"), (226, "unqualified"))
+        self.assertEqual(helper(10, {}, "up"), (243, "unqualified"))
+        with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "226 and 243"):
+            helper(10)
+
+    def test_other_lengths_get_an_unqualified_17n_plus_5_candidate(self):
+        self.set_qualified(seconds=10, frameSnap="down")
+        result = measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
+        manifest_path = self.ep / result["manifests"][0]["manifest"]
+        [item] = finite_client.validate_manifest(manifest_path, maximum=1)["items"]
+        self.assertEqual((item["seconds"], item["expectedFrames"]), (10, 226))
+        self.assertEqual(item["expectedFramesQualification"], "unqualified")
+
+    def test_qualified_frames_off_the_h3_grid_are_refused_before_any_gpu_work(self):
+        self.set_qualified(seconds=7, expectedFrames=176)
+        with self.assertRaisesRegex(measured_deficit.DeficitPlanBlocked, "not 17n\\+5"):
             measured_deficit.build(self.ep, self.config, extractor=self.fake_extract)
 
 
