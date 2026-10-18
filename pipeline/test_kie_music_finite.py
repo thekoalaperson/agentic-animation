@@ -125,14 +125,15 @@ class FiniteKieMusicTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self.fixture(root)
+            # _request_json carries every create and record route, legacy and V6.
             with mock.patch.object(finite, "_create") as create, \
-                 mock.patch.object(finite, "_record") as record, \
+                 mock.patch.object(finite, "_request_json") as request_json, \
                  mock.patch.object(finite, "_download") as download:
                 result = finite.execute(manifest, 2, 24)
             self.assertEqual(result["operation"], "DRY_RUN")
             self.assertEqual(result["networkCalls"], 0)
             create.assert_not_called()
-            record.assert_not_called()
+            request_json.assert_not_called()
             download.assert_not_called()
             self.assertFalse(manifest.with_suffix(".state.json").exists())
 
@@ -518,6 +519,18 @@ class ScorePayloadVersionTwoTest(ScoreFixtures):
                              (2, 19, 7))
             self.assertEqual((result["requests"], result["expectedCredits"], result["sourceSeconds"]),
                              (2, 19, 10))
+            # commonPayload reaches the extend cue too, and the refusal says so.
+            for number, common in enumerate(({"customMode": True}, {"prompt": ""})):
+                with self.subTest(common=common):
+                    draft.write_text(json.dumps({
+                        "episode": "DEMO",
+                        "commonPayload": {"model": "V6", "instrumental": True, **common},
+                        "cues": [cue("demo-m1", 1), extend("demo-m2", 2, "demo-m1")]}))
+                    with self.assertRaisesRegex(finite.PlanError,
+                                                "commonPayload is merged into extend cues"):
+                        finite.freeze(draft, root / f"other-{number}/execution-manifest.json",
+                                      credits_per_extend_request=7, **kwargs)
+            self.assertIn("commonPayload reaches extend cues", finite.schema()["sourceDraft"])
 
 
 class DerivedCueTest(ScoreFixtures):
@@ -601,6 +614,13 @@ class DerivedCueTest(ScoreFixtures):
             self.assertEqual((sidecar["derivedFrom"]["audioId"], sidecar["derivedFrom"]["taskId"]),
                              ("a", "task-2"))
             self.assertEqual(sidecar["requestSha256"], item["requestSha256"])
+            posted = finite._sha_bytes(finite._canonical(posts[2]))
+            self.assertEqual((sidecar["postedRequestSha256"], item["postedRequestSha256"]),
+                             (posted, posted))
+            # A cue that derives from nothing keeps today's sidecar and state keys.
+            plain = json.loads(Path(parent["candidates"][0]["sidecar"]).read_text())
+            self.assertFalse({"derivedFrom", "postedRequestSha256"} & set(plain))
+            self.assertFalse({"parent", "postedRequestSha256"} & set(parent))
 
     def test_an_interrupted_extend_is_never_posted_twice(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -126,8 +126,9 @@ def schema() -> dict[str, Any]:
         },
         "payloadRangesV2": {
             "customMode": True, "instrumental": "boolean, always frozen explicitly",
-            "prompt": "the lyrics: empty or absent when instrumental; 1-5000 characters "
-                      "and required on generate when instrumental is false",
+            "prompt": "the lyrics: empty or absent on an instrumental generate, and no prompt "
+                      "key at all on an instrumental extend; 1-5000 characters and required "
+                      "on generate when instrumental is false",
             "title": "1-80 characters (extend 1-100)", "style": "1-1000 characters",
             "duration": "integer 10-360 (generate only)", "negativeTags": "non-empty if present",
             "styleWeight": "0-1, two decimals", "weirdnessConstraint": "0-1, two decimals",
@@ -152,7 +153,10 @@ def schema() -> dict[str, Any]:
         "sungWords": "a sung cue's words are text in the film that the screenplay may not "
                      "contain: record whether they come from the source or were added, and "
                      "whether they are subtitled",
-        "sourceDraft": "{commonPayload, cues}; frozen cues equal each draft cue with commonPayload merged in",
+        "sourceDraft": "{commonPayload, cues}; frozen cues equal each draft cue with commonPayload "
+                       "merged in. commonPayload reaches extend cues too, so when a draft extends, "
+                       "keep generate-only keys (customMode, duration, an instrumental prompt) "
+                       "on each generate cue rather than in commonPayload",
         "ceilings": "cues x their kind's price (creditsPerRequest, creditsPerExtendRequest) must "
                     "fit maxCredits; --max-requests/--max-credits may not exceed the manifest",
         "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
@@ -197,8 +201,10 @@ def _validate_v6_payload(cue_id: str, payload: Any, route: str) -> None:
     missing = fields["required"] - keys
     unknown = keys - fields["required"] - fields["optional"]
     if missing or unknown:
+        hint = (" (commonPayload is merged into extend cues too; keep generate-only keys "
+                "on each generate cue)" if route == "extend-v6" and unknown else "")
         raise PlanError(f"{cue_id}: {route} payload is missing {sorted(missing)} or carries "
-                        f"keys outside its allowlist {sorted(unknown)}")
+                        f"keys outside its allowlist {sorted(unknown)}{hint}")
     if payload["model"] not in V6_FAMILY:
         raise PlanError(f"{cue_id}: {route} needs a model from {sorted(V6_FAMILY)}")
     if "customMode" in payload and payload["customMode"] is not True:
@@ -208,8 +214,11 @@ def _validate_v6_payload(cue_id: str, payload: Any, route: str) -> None:
         raise PlanError(f"{cue_id}: instrumental must be a boolean")
     lyrics = payload.get("prompt")
     if instrumental:
-        if lyrics not in (None, "") or (route == "extend-v6" and "prompt" in payload):
+        if lyrics not in (None, ""):
             raise PlanError(f"{cue_id}: an instrumental cue carries no lyrics prompt")
+        if route == "extend-v6" and "prompt" in payload:
+            raise PlanError(f"{cue_id}: an instrumental extend carries no prompt key, not even "
+                            "an empty one (commonPayload is merged into extend cues too)")
         for key in ("vocalGender", "audioWeight"):
             if key in payload:
                 raise PlanError(f"{cue_id}: {key} does not apply to an instrumental cue")
@@ -923,6 +932,9 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
                            "selectionVerdict": "unreviewed"}
             if "parent" in item:
                 sidecar_doc["derivedFrom"] = item["parent"]
+                # What was actually posted: the frozen payload plus the parent's
+                # audioId and continueAt, hashed before the POST.
+                sidecar_doc["postedRequestSha256"] = item["postedRequestSha256"]
             _atomic_bytes_new(
                 sidecar,
                 (json.dumps(sidecar_doc, ensure_ascii=False, sort_keys=True, indent=2)
