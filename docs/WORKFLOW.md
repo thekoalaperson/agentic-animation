@@ -19,6 +19,7 @@ sequences. Choose the amount of process that helps the work.
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
 | Reuse HD picture or change its audio | `open_media/build_hd_range_plan.py`, `open_media/hd_audio_remux.py` |
 | Package selected deliverables | `edit/package_hindi_delivery.py`, `edit/package_hindi_longform.py` |
+| Draw an optional push from outside the model | `draw_provocations.py` (see [creative notes](CREATIVE.md)) |
 
 These commands expose specific input contracts through `--help`; they are not
 creative instructions. Use an external project directory. Source stills can come
@@ -26,10 +27,12 @@ from any hand: an image model, the filmmaker's own painting or scan, or a
 third party's work. The registrar records which, and does not grant account
 access or provide an image generator.
 
-One established route uses H3 picture, Grok native Hindi dialogue, ElevenLabs
+One worked example uses H3 picture, Grok native Hindi dialogue, ElevenLabs
 narration, Suno/Kie score, and self-hosted effects. The current packaging/subtitle
 preset supports Hindi performance and Hindi/English subtitles. That describes
 what has been implemented and exercised, not what every film should be.
+[Video models](VIDEO-MODELS.md) separates what each motion runner sends and
+enforces from what its provider publishes.
 
 Research, source grounding, animatics, auditions, and reviews are useful when
 they resolve a real uncertainty. They do not need to become rituals. Make an
@@ -48,6 +51,85 @@ Check current provider availability and credits before a paid run. Save concrete
 job state so interruption does not create duplicate work. Delivery and publication
 follow the user's actual request; neither a model response nor a passing test
 supplies creative approval.
+
+## Looking at the work
+
+Each kind of look costs something different and catches something different.
+They come in no fixed order, and any of them may be skipped.
+
+- A cold read of the plan, against its own direction and against the provider
+  facts, costs minutes. It catches a plan that contradicts itself, a request no
+  runner sends, and major choices that were inherited rather than decided.
+- The stills sheet in story order costs nothing beyond the stills. It catches
+  identity, state and continuity errors while they are cheapest to fix.
+- The timed animatic costs a coordinator render. It catches pacing, held
+  silence, late or early music and a reordered memory before any motion spend.
+- A pilot of the riskiest shots costs a few paid clips. It catches route
+  behaviour that no page states.
+- Watching the main batch's takes costs the batch. It catches the performances
+  and the drift that a pilot is too small to show.
+- One continuous watch of the working cut, with sound, costs its runtime. It
+  catches what only accumulates: rhythm, repetition and fatigue.
+
+Review each take against this film's own direction and the technical facts, not
+against any look these docs mention.
+
+## Files and keys
+
+Recurring files, by the role they play:
+
+- `story/storyboard_plan.json`: the rows, in story order. The timeline binds it
+  as a whole file, so free-text notes go on `generation_manifest.json` rows.
+- `story/generation_manifest.json` and a still policy: the stills, their
+  references and continuity facts.
+- `story/GOAL.md`: the dialogue runner's default authority file. Its hash is
+  frozen into each dialogue manifest, so an edit means a new manifest.
+- A frozen execution manifest per paid batch (for example
+  `work/grok-dialogue-v1/execution-manifest.json`), its draft beside it, and a
+  separate approval record bound to the manifest's bytes.
+- `.pending.json`, `.vid.json` and other sidecars: persisted provider task IDs
+  and the provenance of landed media.
+- `work/h3-review-ledger-v1.json`: the accepted H3 segments and their verdicts.
+- Review exports: the source-bound decisions that admit a dialogue clip or a
+  score take to the timeline.
+- `work/assembly-v1/timeline-inputs.json`: the timeline's configuration. Its
+  outputs are `edit-plan.json`, the subtitle timings, `timeline-audit.json`
+  and, from `--dry-run`, `timeline-readiness.json`.
+
+No tool in this checkout writes the frozen dialogue manifest, the approval
+record or the review exports; each runner's `--help` and validator define what
+they must hold.
+
+Keys `build_episode_timeline.py` reads from `timeline-inputs.json`, grouped by
+role:
+
+- Documents: `storyboard`, `narrationManifest`, `dialogueManifest`,
+  `h3ReviewLedger`, `productionOverrides`, `subtitleManuscript`, `scoreManifest`,
+  `sfxManifest`, `outputDirectory`, and `narrationStateEpisodeRoot` and
+  `scoreStateEpisodeRoot` for state recorded under another root.
+- Admission: `dialogueOutputs` (per scene, including its review and an optional
+  `pictureCrop`, `pictureCropFrom` and `pictureCropReason`),
+  `requireApprovedDialogue`, `requireApprovedScore`, `reviewScope`.
+- Rhythm: `dialogueHandles` (`preSeconds`, `postSeconds`),
+  `preserveCompleteDialogueClips`, `minimumPictureSegmentSeconds`,
+  `microCutRoleWords`, `allowCausalBorrowing`, `narrationBreathing`,
+  `narrationBreathOverrides`, and the ledger's per-segment in, out, speed and
+  role.
+- Sound and text: `scorePlacements`, `musicBreaths`, `dialogueSubtitleMode`.
+
+What the tools enforce, as facts rather than a sequence to follow:
+
+- A reference is registered before any still that cites it.
+- A dialogue manifest and an H3 plan bind each still's hash, so a still
+  retaken afterwards refuses them until they are remade.
+- A paid runner submits only against a frozen manifest and its declared limits;
+  a changed prompt or authority file refuses the manifest as well.
+- The timeline admits a dialogue clip or a score take only through a review
+  export bound to its source and sidecar hashes, and H3 picture only through an
+  accepted ledger segment.
+- The assembler, mixer and subtitle exporter read the timeline's outputs and
+  refuse when what they bind has changed.
+- Packaging binds its approvals to the delivered files' hashes.
 
 ## Stills and canon
 
