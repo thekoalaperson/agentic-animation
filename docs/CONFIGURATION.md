@@ -17,6 +17,11 @@ worker paths, and optional tool settings can be read through `profile_value()`
 in `pipeline/_common.py`. Tool-specific CLI parameters remain authoritative.
 Read the relevant command's `--help`; a profile does not override every argument.
 
+Two optional profile keys are read by an agent, not by any tool. `instructions`
+lists private files holding the user's current preferences; an empty list, or
+no key, is normal. `researchCorpus` names the source texts a project draws on.
+Neither grants authority.
+
 Project structure remains small:
 
 ```text
@@ -29,9 +34,19 @@ project/
 ```
 
 Use stable shot and asset IDs across these directories. Cross-project references
-must resolve explicitly, with content hashes. Never discover accepted media by
+must resolve explicitly, with content hashes. Shared series canon is one such
+reference: the profile's `stills.canonRoot` (or `--canon-root`) names a
+read-only root, rows cite `canon:<path>`, and each sidecar records the file's
+SHA-256. Still source roots are `stills.sourceRoots.<provider>`, for example
+`stills.sourceRoots.imagegen`. `imagegen.outputRoot` is still read when no
+`stills.sourceRoots.imagegen` key is set. Never discover accepted media by
 glob: the accepted registry and current source-bound decisions define reuse.
 The content corpus is an input, not an implicit local path or dependency.
+
+Review sheets and animatic previews take a font from `--font`, else the
+optional profile key `fonts.review`, else the worker's DejaVu path where it
+exists. A `fonts.review` that names a missing file is refused. The font's
+SHA-256 goes into each preview's audit.
 
 ## Authority
 

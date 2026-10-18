@@ -1,0 +1,29 @@
+{
+  "episode": "demo",
+  "stills": [
+    {
+      "still_id": "demo-table",
+      "status": "generation_ready",
+      "prompt": "demo-table: a table on its own",
+      "size": "1536x1024",
+      "target_output_path": "art/canon/demo-table.png",
+      "refs": {"all": []}
+    },
+    {
+      "still_id": "demo-s001",
+      "status": "generation_ready",
+      "prompt": "demo-s001: a lamp on a table",
+      "size": "1536x1024",
+      "target_output_path": "art/stills/demo-s001.png",
+      "refs": {"all": ["art/canon/demo-table.png"]}
+    },
+    {
+      "still_id": "demo-s002",
+      "status": "generation_ready",
+      "prompt": "demo-s002: a window",
+      "size": "1536x1024",
+      "target_output_path": "art/stills/demo-s002.png",
+      "refs": {"all": []}
+    }
+  ]
+}

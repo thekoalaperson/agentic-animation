@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from pipeline.paid_approval import PaidApprovalError, validate_paid_approval
-from pipeline._common import canonical_sha256, project_root, sha256_file as sha256
+from pipeline._common import canonical_sha256, image_dimensions, project_root, sha256_file as sha256
 HERE = EPISODE = MANIFEST = DRAFT = NEW_ANGLE_AUDIT = None
 PRODUCTION_OVERRIDES = PROMPT_ROOT = OUTPUT_ROOT = LOCK = AUTHORITY = None
 EPISODE_CODE = None
@@ -150,6 +150,29 @@ def execution_request(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, An
     }
 
 
+def source_geometry_warnings(rows: list[dict[str, Any]], aspect: float = 16 / 9,
+                             tolerance: float = 0.03) -> list[dict[str, Any]]:
+    """Warn, never refuse, when a first-frame still is far from the sent aspect.
+
+    The runner always sends aspect_ratio 16:9. Whether output geometry follows
+    the still on this route is unqualified, so this stays information until a
+    pilot settles it. Dimensions come from the file header; nothing is decoded.
+    """
+    warnings = []
+    for row in rows:
+        try:
+            _, width, height = image_dimensions(row["sourcePath"])
+        except (OSError, ValueError):
+            continue
+        if height and abs(width / height - aspect) > tolerance:
+            warnings.append({
+                "type": "source-aspect", "jobId": row["id"], "width": width, "height": height,
+                "aspect": round(width / height, 4), "sentAspectRatio": "16:9",
+                "hint": "pipeline/derive_still.py can crop, pad or scale a registered still to 16:9",
+            })
+    return warnings
+
+
 def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]:
     if (isinstance(max_generated_seconds, bool)
             or not isinstance(max_generated_seconds, int)
@@ -274,6 +297,7 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         "totalSeconds": total,
         "maxGeneratedSeconds": max_generated_seconds,
         "maximumCredits": maximum_credits, "pricing": pricing,
+        "geometryWarnings": source_geometry_warnings(normalized),
     }
     for row in normalized:
         row["executionRequestSha256"] = canonical_sha256(execution_request(plan, row))
@@ -473,6 +497,42 @@ def preflight(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dic
     return pending, completed
 
 
+def finite_execution(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite scope an approval record must match."""
+    return {"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
+            "credits": plan["maximumCredits"]}
+
+
+def credit_preflight(plan: dict[str, Any], available: float, estimated: float,
+                     concurrency: int) -> dict[str, Any]:
+    """The credit-preflight.json record written before any submission."""
+    return {
+        "manifestSha256": plan["manifestSha256"], "availableCredits": available,
+        "estimatedNewCredits": estimated, "pricing": plan["pricing"],
+        "maximumCredits": plan["maximumCredits"],
+        "concurrency": concurrency, "noTopup": True,
+    }
+
+
+def generation_command(plan: dict[str, Any], row: dict[str, Any]) -> list[str]:
+    """The kie_video.py invocation whose arguments become the sidecar's localRequest."""
+    return [
+        sys.executable,
+        str(ROOT / "pipeline/kie_video.py"),
+        "grok15",
+        str(row["outputPath"]),
+        str(row["promptPath"]),
+        str(row["sourcePath"]),
+        "--res", "720p",
+        "--dur", str(row["durationSeconds"]),
+        "--ar", "16:9",
+        "--job-id", row["id"],
+        "--manifest-sha256", plan["manifestSha256"],
+        "--source-sha256", row["sourceSha256"],
+        "--execution-request-sha256", row["executionRequestSha256"],
+    ]
+
+
 def acquire_lock(path: Path, manifest_sha256: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -493,8 +553,7 @@ def execute(max_generated_seconds: int, submit: bool,
         approval = validate_paid_approval(
             approval_admission, episode=EPISODE_CODE, lane="grok-dialogue",
             manifest_path=plan["manifestPath"], manifest_sha256=plan["manifestSha256"],
-            finite_execution={"jobs": len(plan["jobs"]), "generatedSeconds": plan["totalSeconds"],
-                              "credits": plan["maximumCredits"]},
+            finite_execution=finite_execution(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
@@ -511,6 +570,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "financialAuthorized": authorized,
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
             "manifestSha256": plan["manifestSha256"],
+            "geometryWarnings": plan["geometryWarnings"],
         }
     if not authorized:
         raise PlanError("financialApproval is false; submission is gated")
@@ -538,30 +598,11 @@ def execute(max_generated_seconds: int, submit: bool,
         estimated_credits = remaining_seconds * plan["pricing"]["creditsPerSecond"]
         if wallet_before < estimated_credits:
             raise PlanError("Insufficient existing Kie credits; no top-up or overage")
-        atomic_json(HERE / "credit-preflight.json", {
-            "manifestSha256": plan["manifestSha256"], "availableCredits": wallet_before,
-            "estimatedNewCredits": estimated_credits, "pricing": plan["pricing"],
-            "maximumCredits": plan["maximumCredits"],
-            "concurrency": concurrency, "noTopup": True,
-        })
+        atomic_json(HERE / "credit-preflight.json",
+                    credit_preflight(plan, wallet_before, estimated_credits, concurrency))
         def generate_row(row):
             stem = row["outputPath"]
-            command = [
-                sys.executable,
-                str(ROOT / "pipeline/kie_video.py"),
-                "grok15",
-                str(stem),
-                str(row["promptPath"]),
-                str(row["sourcePath"]),
-                "--res", "720p",
-                "--dur", str(row["durationSeconds"]),
-                "--ar", "16:9",
-                "--job-id", row["id"],
-                "--manifest-sha256", plan["manifestSha256"],
-                "--source-sha256", row["sourceSha256"],
-                "--execution-request-sha256", row["executionRequestSha256"],
-            ]
-            result = subprocess.run(command, cwd=ROOT)
+            result = subprocess.run(generation_command(plan, row), cwd=ROOT)
             if result.returncode:
                 recovery = stem.with_suffix(".pending.json")
                 state = ("durable recovery state exists" if recovery.exists()

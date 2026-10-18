@@ -1,7 +1,19 @@
 {
   "episode": "demo",
   "stills": [
-    {"still_id": "demo-s001", "beat": "opening", "speaker": null},
-    {"still_id": "demo-s002", "beat": "ending", "speaker": null}
+    {
+      "still_id": "demo-s001",
+      "beat": {"number": 1, "title": "opening"},
+      "speaker": null,
+      "narration_hi": "कमरे में एक दीपक जलता है।",
+      "narration_en": "A lamp burns in the room."
+    },
+    {
+      "still_id": "demo-s002",
+      "beat": {"number": 2, "title": "ending"},
+      "speaker": null,
+      "narration_hi": "खिड़की से सुबह की रोशनी आती है।",
+      "narration_en": "Morning light enters through the window."
+    }
   ]
 }

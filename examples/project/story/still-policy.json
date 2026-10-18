@@ -1,0 +1,10 @@
+{
+  "grounding_guard": {
+    "identity_authorities": [
+      {"name": "demo table", "aliases": [], "sources": ["art/canon/demo-table.png"]}
+    ],
+    "continuity_facts": [
+      {"id": "demo-lamp", "line_range": [1, 1], "value": "demo-s001: the lamp is on the table"}
+    ]
+  }
+}

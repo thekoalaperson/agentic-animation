@@ -154,3 +154,167 @@ def upload_ref(p):
         sys.exit('upload gave no URL: ' + json.dumps(r)[:400])
     return url
 
+
+
+def image_dimensions(path):
+    """Return (format, width, height) read from a PNG, JPEG or WebP header.
+
+    No pixels are decoded, so this runs on any host. An unknown or truncated
+    header raises ValueError naming the file.
+    """
+    path = pathlib.Path(path)
+    with path.open('rb') as source:
+        head = source.read(64)
+        if head[:8] == b'\x89PNG\r\n\x1a\n' and head[12:16] == b'IHDR' and len(head) >= 24:
+            return 'png', int.from_bytes(head[16:20], 'big'), int.from_bytes(head[20:24], 'big')
+        if head[:4] == b'RIFF' and head[8:12] == b'WEBP' and len(head) >= 30:
+            chunk = head[12:16]
+            if chunk == b'VP8X':
+                return ('webp', 1 + int.from_bytes(head[24:27], 'little'),
+                        1 + int.from_bytes(head[27:30], 'little'))
+            if chunk == b'VP8 ' and head[23:26] == b'\x9d\x01\x2a':
+                return ('webp', int.from_bytes(head[26:28], 'little') & 0x3FFF,
+                        int.from_bytes(head[28:30], 'little') & 0x3FFF)
+            if chunk == b'VP8L' and head[20] == 0x2F:
+                bits = int.from_bytes(head[21:25], 'little')
+                return 'webp', (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if head[:2] == b'\xff\xd8':
+            source.seek(2)
+            while True:
+                byte = source.read(1)
+                while byte and byte != b'\xff':
+                    byte = source.read(1)
+                while byte == b'\xff':
+                    byte = source.read(1)
+                if not byte:
+                    break
+                marker = byte[0]
+                if marker in (0x01, *range(0xD0, 0xD8)):
+                    continue
+                length = int.from_bytes(source.read(2), 'big')
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    frame = source.read(5)
+                    if len(frame) == 5:
+                        return ('jpeg', int.from_bytes(frame[3:5], 'big'),
+                                int.from_bytes(frame[1:3], 'big'))
+                    break
+                if length < 2:
+                    break
+                source.seek(length - 2, 1)
+    raise ValueError(f'not a readable PNG, JPEG or WebP header: {path}')
+
+
+class MediaWorkerRequired(RuntimeError):
+    """Raised when exact media decoding is attempted off the qualified worker."""
+
+
+def require_media_worker(reason):
+    """Refuse work that genuinely needs CUDA or a qualified model runtime.
+
+    Production media (H3, upscale, model audio, exact-frame extraction,
+    production mixes and qualified typography) stays on the configured GPU
+    worker. Review previews and auditions use preview_host_record instead.
+    Returns the GPU listing so callers can record it.
+    """
+    import shutil, subprocess
+    if sys.platform != 'linux' or not shutil.which('nvidia-smi'):
+        raise MediaWorkerRequired(f'{reason} must run on the qualified GPU worker, not this host')
+    try:
+        listing = subprocess.run(['nvidia-smi', '-L'], check=True, capture_output=True,
+                                 text=True, timeout=60)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise MediaWorkerRequired(f'{reason}: nvidia-smi found no usable GPU on the qualified GPU worker') from exc
+    return listing.stdout.strip()
+
+
+_FFMPEG_CAPABILITIES = None
+
+
+def ffmpeg_capabilities():
+    """The local ffmpeg build: its version line and the filters it offers.
+
+    Read once per process. A missing ffmpeg raises, since every preview needs it.
+    """
+    global _FFMPEG_CAPABILITIES
+    if _FFMPEG_CAPABILITIES is None:
+        import shutil, subprocess
+        binary = shutil.which('ffmpeg')
+        if not binary:
+            raise RuntimeError('ffmpeg is required for review previews and auditions')
+        version = subprocess.run([binary, '-hide_banner', '-version'], check=True,
+                                 capture_output=True, text=True).stdout.splitlines()[0].strip()
+        listing = subprocess.run([binary, '-hide_banner', '-filters'], check=True,
+                                 capture_output=True, text=True).stdout.splitlines()
+        filters = sorted({line.split()[1] for line in listing
+                          if len(line.split()) >= 3 and line[:1] == ' ' and '->' in line})
+        _FFMPEG_CAPABILITIES = {'path': binary, 'version': version, 'filters': filters}
+    return _FFMPEG_CAPABILITIES
+
+
+def needs_complex_shaping(text):
+    """True when text holds a script that renders wrongly without a shaper.
+
+    Covers the Indic blocks, Arabic, Hebrew, Thai and Myanmar. Latin, Greek,
+    Cyrillic and CJK draw correctly with a plain glyph-by-glyph path.
+    """
+    for char in text or '':
+        code = ord(char)
+        if (0x0590 <= code <= 0x08FF or 0x0900 <= code <= 0x0DFF or 0x0E00 <= code <= 0x0EFF
+                or 0x1000 <= code <= 0x109F or 0xA8E0 <= code <= 0xA8FF):
+            return True
+    return False
+
+
+def preview_host_record(font=None):
+    """What a preview or audition was actually made with, for its audit.
+
+    Records the real host, platform, ffmpeg build and the font's hash. It
+    never claims the qualified worker: a preview is labelled not final.
+    """
+    import platform
+    caps = ffmpeg_capabilities()
+    font_path = pathlib.Path(font).resolve() if font else None
+    return {
+        'computeHost': platform.node(),
+        'platform': sys.platform,
+        'ffmpeg': caps['version'],
+        'ffmpegShapingFilters': [name for name in ('ass', 'subtitles', 'drawtext') if name in caps['filters']],
+        'font': ({'path': str(font_path), 'sha256': sha256_file(font_path)} if font_path else None),
+        'finalApproved': False,
+    }
+
+
+def review_font(explicit=None):
+    """A review-sheet font: --font, else the profile's fonts.review, else None."""
+    value = explicit or profile_value('fonts', 'review')
+    if not value:
+        return None
+    path = pathlib.Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f'Review font does not exist: {path}')
+    return path
+
+
+def extract_exact_frame(source, frame_index, destination):
+    """Decode one exact frame by index on the qualified GPU worker.
+
+    This is the extractor the measured-deficit builder has always used. It
+    writes a temporary file and publishes it only once a frame exists.
+    """
+    import subprocess
+    require_media_worker('Media extraction')
+    destination = pathlib.Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.stem + '.partial.png')
+    if temporary.exists():
+        temporary.unlink()
+    subprocess.run(
+        ['ffmpeg', '-v', 'error', '-y', '-i', str(source),
+         '-map', '0:v:0', '-vf', f'select=eq(n\\,{frame_index})',
+         '-frames:v', '1', '-vsync', '0', str(temporary)],
+        check=True,
+    )
+    if not temporary.is_file() or temporary.stat().st_size == 0:
+        raise ValueError(f'Exact frame extraction produced no frame: {source} n={frame_index}')
+    temporary.replace(destination)

@@ -1,0 +1,34 @@
+# Story-neutral directorial constraints for draw_provocations.py.
+# One card per line. Draw with the tool instead of reading this file.
+The film's last image is one it has already shown.
+The climax plays without words.
+One scene is told twice, from two sides.
+Music appears only where no one speaks.
+No music until the film is half over.
+One character is heard and never seen.
+The film opens after the story's first event has already happened.
+Every scene leaves before it ends.
+One scene holds far longer than is comfortable.
+A memory is told rather than shown.
+A memory is shown and never explained.
+The listener, not the speaker, carries the turning point.
+The loudest moment the script implies is silent.
+The film keeps one rule about where the viewer stands, and breaks it once.
+The ending is known from the first scene.
+One place returns at the start, the middle and the end, changed each time.
+There is no narrator.
+The narrator is wrong about something.
+Colour changes only once in the whole film.
+A small object carries the story's change.
+Each scene is lived through a different character.
+The biggest event happens out of sight.
+One line returns later in a different mouth.
+The score is built from one idea that returns changed.
+The sound of the world drops away once and never fully returns.
+The most important scene plays without a cut.
+The film ends on a face that is not the protagonist's.
+Time runs slower in one scene than anywhere else.
+The first image argues against the film's conclusion.
+Two scenes far apart in the story sit side by side in the cut.
+Nobody in the film explains what the viewer has just seen.
+The film's quietest scene is its longest.

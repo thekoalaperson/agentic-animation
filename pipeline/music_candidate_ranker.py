@@ -9,6 +9,11 @@ does not infer emotion, musical meaning, Indian musical quality, or approval.
 Default operation is a zero-write inventory/dry run.  ``--analyze`` decodes
 locally with ffmpeg and writes one hash-bound report below the episode's work
 directory.  There is no network code in this module.
+
+Decoding runs on the qualified GPU worker.  ``--analyze --audition`` decodes on
+any host with ffmpeg instead; that report is written beside the normal one as
+``*-audition-not-final.json``, records the real host and ffmpeg build, and is
+labelled inadmissible.
 """
 
 from __future__ import annotations
@@ -506,8 +511,20 @@ def semantic_target(plan: dict[str, Any], cue: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
-    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
+def audition_report_path(path: Path) -> Path:
+    return path.with_name(path.stem + "-audition-not-final" + path.suffix)
+
+
+def audition_record() -> dict[str, Any]:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import _common
+    return {**_common.preview_host_record(None), "audition": True, "admissible": False,
+            "scope": "Decoded off the qualified worker for listening and comparison only; "
+                     "never a production stem, master or selection record"}
+
+
+def decode_audio(path: Path, sample_rate: int, audition: bool = False) -> np.ndarray:
+    if not audition and (sys.platform != "linux" or not shutil.which("nvidia-smi")):
         raise AnalysisError("Audio processing must run on the qualified GPU worker, not the Mac")
     command = [
         "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1",
@@ -936,7 +953,8 @@ def inventory_result(plan: dict[str, Any], inventory: dict[str, Any]) -> dict[st
     }
 
 
-def analyze(plan: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+def analyze(plan: dict[str, Any], inventory: dict[str, Any],
+            audition: bool = False) -> dict[str, Any]:
     if not inventory["found"]:
         result = inventory_result(plan, inventory)
         result["operation"] = "ANALYZE"
@@ -950,7 +968,8 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
     for cue in plan["cues"]:
         targets[cue["id"]] = semantic_target(plan, cue)
     for binding in inventory["found"]:
-        audio = decode_audio(Path(binding["file"]), int(sampling["sampleRate"]))
+        audio = (decode_audio(Path(binding["file"]), int(sampling["sampleRate"]), audition=True)
+                 if audition else decode_audio(Path(binding["file"]), int(sampling["sampleRate"])))
         features = extract_features(
             audio, int(sampling["sampleRate"]), int(sampling["frameSize"]),
             int(sampling["hopSize"]), int(sampling["trajectoryBins"]),
@@ -1080,9 +1099,13 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
         "rankings": rankings,
         "homogeneityFlags": homogeneity_flags,
     }
+    report_path = plan["reportPath"]
+    if audition:
+        report_path = audition_report_path(report_path)
+        report["auditionRecord"] = audition_record()
     rounded = round_value(report)
-    atomic_json(plan["reportPath"], rounded)
-    return {
+    atomic_json(report_path, rounded)
+    result = {
         "version": ANALYZER_VERSION,
         "operation": "ANALYZE",
         "status": rounded["status"],
@@ -1091,16 +1114,24 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
         "missingMovements": inventory["missingMovements"],
         "homogeneityFlags": len(homogeneity_flags),
         "reportWritten": True,
-        "report": str(plan["reportPath"]),
-        "reportSha256": sha_file(plan["reportPath"]),
+        "report": str(report_path),
+        "reportSha256": sha_file(report_path),
         "advisoryOnly": True,
     }
+    if audition:
+        result["audition"] = True
+    return result
 
 
-def execute(manifest_path: Path, do_analyze: bool = False) -> dict[str, Any]:
+def execute(manifest_path: Path, do_analyze: bool = False,
+            audition: bool = False) -> dict[str, Any]:
     plan = load_plan(manifest_path)
     inventory = discover_candidates(plan)
-    return analyze(plan, inventory) if do_analyze else inventory_result(plan, inventory)
+    if audition and not do_analyze:
+        raise AnalysisError("--audition applies to --analyze")
+    if not do_analyze:
+        return inventory_result(plan, inventory)
+    return analyze(plan, inventory, audition=True) if audition else analyze(plan, inventory)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1108,9 +1139,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--analyze", action="store_true",
                         help="decode candidates and atomically write the advisory report")
+    parser.add_argument("--audition", action="store_true",
+                        help="with --analyze: decode on this host; the report is labelled an inadmissible audition")
     args = parser.parse_args(argv)
     try:
-        result = execute(args.manifest, do_analyze=args.analyze)
+        result = execute(args.manifest, do_analyze=args.analyze, audition=args.audition)
     except AnalysisError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

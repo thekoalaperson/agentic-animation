@@ -126,6 +126,9 @@ def prepared_audio(spec, inputs, decode):
             or not math.isfinite(audit.get('unchangedVoiceRecoveryMaxError', float('nan')))
             or audit['unchangedVoiceRecoveryMaxError'] >= 2e-6):
         raise ValueError('Prepared Short mix lacks linear whole-voice provenance')
+    for name, record in (('mix', audit), ('voice', voice_audit), ('source voice', source_audit)):
+        if str(record.get('kind', '')).endswith('-audition-not-final') or record.get('admissible') is False:
+            raise ValueError(f'Prepared Short {name} receipt is an audition, not a production stem')
     bindings = spec['inputs']
     if (audit['inputs']['clock'] != bindings['clock']
             or audit['inputs']['voice'] != bindings['voice']
