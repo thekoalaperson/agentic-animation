@@ -1151,6 +1151,16 @@ class TimelineBuilderTest(unittest.TestCase):
                 readiness = json.loads(Path(str(raised.exception).rsplit("see ", 1)[1]).read_text())
                 self.assertTrue(any(row["type"] == "score-admission" for row in readiness["errors"]))
 
+    def test_the_dry_run_checks_the_absolute_half_of_an_anchored_placement(self):
+        for timing in ({"anchor": {"event": "demo-s001", "at": "start"}, "timelineDuration": 0},
+                       {"until": {"event": "demo-s001", "at": "end"}, "timelineStart": -5}):
+            with self.subTest(timing=timing):
+                self.place_score(**timing)
+                ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True,
+                                                   probe=self.fake_probe)
+                self.assertFalse(ready["ready"])
+                self.assertTrue(any(row["type"] == "score-admission" for row in ready["errors"]))
+
     def test_an_absolute_score_placement_is_written_as_authored(self):
         placement, _ = self.place_score(timelineStart=0.0, timelineDuration=10.0)
         _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)

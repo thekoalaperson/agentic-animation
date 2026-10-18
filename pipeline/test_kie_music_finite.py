@@ -385,13 +385,13 @@ class FiniteKieMusicTest(unittest.TestCase):
 
 def cue(cue_id, index, **payload):
     base = {"model": "V6", "customMode": True, "instrumental": True,
-            "title": f"Demo {index}", "duration": 10, "style": "demo-cue texture"}
+            "title": f"Demo {index}", "duration": 10, "style": "demo-cue style"}
     return {"id": cue_id, "shots": [index, index], "emotionalArc": "demo arc",
             "payload": {**base, **payload}}
 
 
 def extend(cue_id, index, parent, take=1, continue_at=4.0, **payload):
-    base = {"model": "V6", "instrumental": True, "style": "demo-cue texture"}
+    base = {"model": "V6", "instrumental": True, "style": "demo-cue style"}
     return {"id": cue_id, "shots": [index, index], "emotionalArc": "demo arc",
             "payload": {**base, **payload},
             "derivedFrom": {"cueId": parent, "take": take, "operation": "extend",
@@ -545,7 +545,9 @@ class DerivedCueTest(ScoreFixtures):
             "customMode": [cue("demo-m1", 1), extend("demo-m2", 2, "demo-m1", customMode=True)],
             "take": [cue("demo-m1", 1), extend("demo-m2", 2, "demo-m1", take=3)],
             "continueAt": [cue("demo-m1", 1), extend("demo-m2", 2, "demo-m1", continue_at=0)],
+            "instrumental by omission": [cue("demo-m1", 1), extend("demo-m2", 2, "demo-m1")],
         }
+        del refused["instrumental by omission"][1]["payload"]["instrumental"]
         for label, cues in refused.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
                 manifest = self.fixture(Path(tmp), cues=cues,

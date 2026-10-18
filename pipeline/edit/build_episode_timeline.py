@@ -389,12 +389,21 @@ def _review_approval(
 SCORE_ANCHOR_POINTS = ("start", "speechStart", "speechEnd", "end")
 
 
+def _finite_number(value: Any, floor: float, inclusive: bool) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            and (value >= floor if inclusive else value > floor))
+
+
 def _check_score_anchor_shape(movement: str, placement: dict[str, Any]) -> None:
     """A placement gives anchor instead of timelineStart, and until or timelineDuration."""
     if "anchor" in placement and "timelineStart" in placement:
         raise ValueError(f"{movement}: give anchor or timelineStart, not both")
     if "until" in placement and "timelineDuration" in placement:
         raise ValueError(f"{movement}: give until or timelineDuration, not both")
+    if "anchor" not in placement and not _finite_number(placement.get("timelineStart"), 0, True):
+        raise ValueError(f"{movement}: timelineStart/duration are invalid")
+    if "until" not in placement and not _finite_number(placement.get("timelineDuration"), 0, False):
+        raise ValueError(f"{movement}: timelineStart/duration are invalid")
     for key in ("anchor", "until"):
         spec = placement.get(key)
         if spec is None:

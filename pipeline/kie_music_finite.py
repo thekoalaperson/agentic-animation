@@ -76,8 +76,10 @@ V6_OPTIONAL_FIELDS = frozenset({"prompt", "callBackUrl", "negativeTags", "styleW
 ROUTE_FIELDS = {
     "generate-v6": {"required": frozenset({"model", "customMode", "instrumental", "title", "style"}),
                     "optional": V6_OPTIONAL_FIELDS | {"duration"}},
-    "extend-v6": {"required": frozenset({"model"}),
-                  "optional": V6_OPTIONAL_FIELDS | {"style", "title", "instrumental"}},
+    # instrumental is required here although the provider defaults it to false:
+    # an extend of an instrumental take must not become a sung request by omission.
+    "extend-v6": {"required": frozenset({"model", "instrumental"}),
+                  "optional": V6_OPTIONAL_FIELDS | {"style", "title"}},
 }
 V6_INPUT_NAMES = {"customMode": "custom_mode", "negativeTags": "negative_tags",
                   "styleWeight": "style_weight", "weirdnessConstraint": "weirdness_constraint",
@@ -123,7 +125,7 @@ def schema() -> dict[str, Any]:
                for route, fields in ROUTE_FIELDS.items()},
         },
         "payloadRangesV2": {
-            "customMode": True, "instrumental": "boolean (extend: optional, provider default false)",
+            "customMode": True, "instrumental": "boolean, always frozen explicitly",
             "prompt": "the lyrics: empty or absent when instrumental; 1-5000 characters "
                       "and required on generate when instrumental is false",
             "title": "1-80 characters (extend 1-100)", "style": "1-1000 characters",
@@ -201,7 +203,7 @@ def _validate_v6_payload(cue_id: str, payload: Any, route: str) -> None:
         raise PlanError(f"{cue_id}: {route} needs a model from {sorted(V6_FAMILY)}")
     if "customMode" in payload and payload["customMode"] is not True:
         raise PlanError(f"{cue_id}: customMode must be true")
-    instrumental = payload.get("instrumental", False)
+    instrumental = payload["instrumental"]
     if not isinstance(instrumental, bool):
         raise PlanError(f"{cue_id}: instrumental must be a boolean")
     lyrics = payload.get("prompt")
@@ -212,6 +214,7 @@ def _validate_v6_payload(cue_id: str, payload: Any, route: str) -> None:
             if key in payload:
                 raise PlanError(f"{cue_id}: {key} does not apply to an instrumental cue")
     elif lyrics is not None or route == "generate-v6":
+        # A sung generate needs lyrics; a sung extend may continue from the audio alone.
         if not _short_text(lyrics, 5000):
             raise PlanError(f"{cue_id}: a sung cue freezes its authored lyrics (1-5000 "
                             "characters) in prompt")
