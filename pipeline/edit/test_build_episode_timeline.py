@@ -1029,7 +1029,8 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertTrue(any(row["type"] == "dialogue-admission" for row in ready["errors"]))
 
-    def test_score_requires_finite_state_sidecar_hash_and_review(self):
+    def admitted_score_placement(self):
+        """A reviewed, state-admitted score take; returns its placement and track."""
         score_root = self.ep / "work/music-score-v1"
         sources = score_root / "sources"
         sources.mkdir(parents=True)
@@ -1088,15 +1089,27 @@ class TimelineBuilderTest(unittest.TestCase):
         })
         config = json.loads(self.config.read_text())
         config["scoreManifest"] = str(manifest.relative_to(self.ep))
-        config["scorePlacements"] = [{
+        self.write_json(self.config, config)
+        return {
             "movement": "m1-test", "take": 1,
             "track": str(track.relative_to(self.ep)), "trackSha256": track_sha,
             "sidecar": str(sidecar.relative_to(self.ep)), "sidecarSha256": sidecar_sha,
             "reviewExport": str(review.relative_to(self.ep)),
             "reviewExportSha256": self.sha(review), "reviewFingerprint": fingerprint,
-            "timelineStart": 0.0, "timelineDuration": 10.0,
-        }]
+        }, track
+
+    def place_score(self, **timing):
+        if not hasattr(self, "score_take"):
+            self.score_take = self.admitted_score_placement()
+        placement, track = self.score_take
+        config = json.loads(self.config.read_text())
+        config["scorePlacements"] = [{**placement, **timing}]
         self.write_json(self.config, config)
+        return placement, track
+
+    def test_score_requires_finite_state_sidecar_hash_and_review(self):
+        placement, track = self.place_score(timelineStart=0.0, timelineDuration=10.0)
+        track_sha = placement["trackSha256"]
         ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
         self.assertTrue(ready["ready"])
         self.assertEqual(plan["scorePlacements"][0]["trackSha256"], track_sha)
@@ -1108,6 +1121,42 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertFalse(ready["ready"])
         self.assertIsNone(plan)
         self.assertTrue(any(row["type"] == "score-admission" for row in ready["errors"]))
+
+    def test_a_score_placement_can_be_anchored_to_measured_events(self):
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        events = plan["events"]
+        first, second = events[0], events[1]
+        self.place_score(anchor={"event": first["id"], "at": "speechEnd", "offsetSeconds": 0.25},
+                         until={"event": second["id"], "at": "end"}, allowReprise=False)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"])
+        placed = plan["scorePlacements"][0]
+        start = first["start"] + first["subtitleAudioAt"] + first["subtitleAudioDuration"] + 0.25
+        self.assertAlmostEqual(placed["timelineStart"], round(start, 6), places=6)
+        self.assertAlmostEqual(placed["timelineDuration"], round(second["end"] - start, 6), places=6)
+        self.assertEqual(placed["resolvedFrom"]["until"], {"event": second["id"], "at": "end"})
+        self.assertIs(placed["allowReprise"], False)
+        for timing in ({"anchor": {"event": "demo-missing", "at": "start"}, "timelineDuration": 2.0},
+                       {"anchor": {"event": second["id"], "at": "end"},
+                        "until": {"event": first["id"], "at": "start"}},
+                       {"anchor": {"event": first["id"], "at": "middle"}, "timelineDuration": 2.0},
+                       {"anchor": {"event": first["id"], "at": "start"}, "timelineStart": 0.0,
+                        "timelineDuration": 2.0},
+                       {"anchor": {"event": events[-1]["id"], "at": "end"}, "timelineDuration": 2.0}):
+            with self.subTest(timing=timing):
+                self.place_score(**timing)
+                # Anchors resolve on measured events, which only a full build has.
+                with self.assertRaises(timeline.TimelineIncomplete) as raised:
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                readiness = json.loads(Path(str(raised.exception).rsplit("see ", 1)[1]).read_text())
+                self.assertTrue(any(row["type"] == "score-admission" for row in readiness["errors"]))
+
+    def test_an_absolute_score_placement_is_written_as_authored(self):
+        placement, _ = self.place_score(timelineStart=0.0, timelineDuration=10.0)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        placed = plan["scorePlacements"][0]
+        self.assertNotIn("resolvedFrom", placed)
+        self.assertEqual((placed["timelineStart"], placed["timelineDuration"]), (0.0, 10.0))
 
     def test_renderer_emits_explicit_setpts_speed_and_exact_frame_count(self):
         source = self.ep / "work/h3/demo-s001.mp4"

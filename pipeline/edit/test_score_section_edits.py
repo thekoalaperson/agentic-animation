@@ -43,6 +43,22 @@ class ExplicitScoreSections(unittest.TestCase):
             music.conform_score_section(self.source, dict(timelineDuration=5))
         auto.assert_called_once()
 
+    def test_the_fit_is_recorded_and_a_reprise_refused_only_on_request(self):
+        with patch.object(music, 'SR', 10):
+            fits = [music.conform_score_section(self.source, dict(timelineDuration=d))[2]['fit']
+                    for d in (2, 5, 9)]
+            self.assertEqual(fits, ['trimmed', 'exact', 'extended-reprise'])
+            self.assertEqual(music.conform_score_section(self.source, self.row)[2]['fit'],
+                             'authored-window')
+            # Opting out refuses only the loop; a trim still passes.
+            row = dict(timelineDuration=9, allowReprise=False)
+            with self.assertRaisesRegex(RuntimeError, 'allowReprise is false'):
+                music.conform_score_section(self.source, row)
+            self.assertEqual(music.conform_score_section(
+                self.source, dict(timelineDuration=2, allowReprise=False))[2]['fit'], 'trimmed')
+            with self.assertRaises(RuntimeError):
+                music.conform_score_section(self.source, dict(timelineDuration=2, allowReprise='no'))
+
     def test_post_gain_bus_rejects_pcm_clipping(self):
         with patch.object(music, 'SR', 10):
             out, _, _ = music.conform_score_section(np.full((50,2), .63, np.float32), self.row | dict(gainDb=6))

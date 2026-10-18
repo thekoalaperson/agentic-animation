@@ -386,6 +386,78 @@ def _review_approval(
     }
 
 
+SCORE_ANCHOR_POINTS = ("start", "speechStart", "speechEnd", "end")
+
+
+def _check_score_anchor_shape(movement: str, placement: dict[str, Any]) -> None:
+    """A placement gives anchor instead of timelineStart, and until or timelineDuration."""
+    if "anchor" in placement and "timelineStart" in placement:
+        raise ValueError(f"{movement}: give anchor or timelineStart, not both")
+    if "until" in placement and "timelineDuration" in placement:
+        raise ValueError(f"{movement}: give until or timelineDuration, not both")
+    for key in ("anchor", "until"):
+        spec = placement.get(key)
+        if spec is None:
+            continue
+        if (not isinstance(spec, dict) or not {"event", "at"} <= set(spec)
+                or set(spec) - {"event", "at", "offsetSeconds"}
+                or spec["at"] not in SCORE_ANCHOR_POINTS
+                or isinstance(spec.get("offsetSeconds", 0), bool)
+                or not isinstance(spec.get("offsetSeconds", 0), (int, float))
+                or not math.isfinite(spec.get("offsetSeconds", 0))):
+            raise ValueError(f"{movement}: {key} must be {{event, at: "
+                             f"{'|'.join(SCORE_ANCHOR_POINTS)}, optional offsetSeconds}}")
+
+
+def _anchor_time(spec: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> float:
+    event = by_id.get(str(spec["event"]))
+    if event is None:
+        raise ValueError(f"anchor names no measured event: {spec['event']}")
+    if spec["at"] in ("start", "end"):
+        base = float(event[spec["at"]])
+    else:
+        if "subtitleAudioAt" not in event or "subtitleAudioDuration" not in event:
+            raise ValueError(f"{event['id']} has no measured speech to anchor to")
+        base = float(event["start"]) + float(event["subtitleAudioAt"])
+        if spec["at"] == "speechEnd":
+            base += float(event["subtitleAudioDuration"])
+    return base + float(spec.get("offsetSeconds", 0))
+
+
+def _resolve_score_anchors(placements: list[dict[str, Any]], events: list[dict[str, Any]],
+                           runtime: float) -> list[dict[str, Any]]:
+    """Turn event anchors into measured timelineStart/timelineDuration, recording the basis.
+
+    Absolute placements are left exactly as authored.
+    """
+    by_id = {str(event["id"]): event for event in events}
+    errors = []
+    for placement in placements:
+        if "anchor" not in placement and "until" not in placement:
+            continue
+        movement = placement.get("movement")
+        try:
+            start = (_anchor_time(placement["anchor"], by_id) if "anchor" in placement
+                     else float(placement["timelineStart"]))
+            end = (_anchor_time(placement["until"], by_id) if "until" in placement
+                   else start + float(placement["timelineDuration"]))
+            if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end <= start:
+                raise ValueError(f"resolves to an empty or negative span {start:.6f}..{end:.6f}")
+            if end > runtime + 1e-6:
+                raise ValueError(f"ends at {end:.6f}s, after the film's {runtime:.6f}s")
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append({"type": "score-admission", "error": f"{movement}: anchored placement {exc}"})
+            continue
+        placement["timelineStart"] = round(start, 6)
+        placement["timelineDuration"] = round(end - start, 6)
+        placement["resolvedFrom"] = {
+            key: placement[key] for key in ("anchor", "until") if key in placement}
+        placement["resolvedFrom"]["basis"] = (
+            "measured event clock: start/end are event bounds, speechStart/speechEnd "
+            "the event's measured subtitle window, plus offsetSeconds")
+    return errors
+
+
 def _is_micro_role(role: str, configured: set[str]) -> bool:
     words = set(re.findall(r"[a-z]+", role.lower()))
     return bool(words & configured)
@@ -1196,7 +1268,10 @@ def build_timeline(
                     raise ValueError(f"{movement}: take must be a positive integer")
                 start = placement.get("timelineStart")
                 duration = placement.get("timelineDuration")
-                if (isinstance(start, bool) or not isinstance(start, (int, float))
+                if "anchor" in placement or "until" in placement:
+                    # Resolved on the measured clock once events exist.
+                    _check_score_anchor_shape(movement, placement)
+                elif (isinstance(start, bool) or not isinstance(start, (int, float))
                         or float(start) < 0 or isinstance(duration, bool)
                         or not isinstance(duration, (int, float)) or float(duration) <= 0):
                     raise ValueError(f"{movement}: timelineStart/duration are invalid")
@@ -1707,6 +1782,9 @@ def build_timeline(
     }
     if str(measured_clock_path) not in readiness["outputsWritten"]:
         readiness["outputsWritten"].append(str(measured_clock_path))
+
+    errors.extend(_resolve_score_anchors(validated_score_placements, events,
+                                         cursor_frames / DELIVERY_FPS))
 
     if measure_pending_score:
         readiness['ready'] = False

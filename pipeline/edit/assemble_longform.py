@@ -523,10 +523,24 @@ def conform_score_section(source: np.ndarray, movement: dict) -> tuple[np.ndarra
         conformed, joins = source[first:first + count].copy(), []
         selection = dict(method="authored-recording-section-no-reprise-no-retiming",
                          sourceStartSample=first, sourceSamples=count,
-                         sourceStartSeconds=first/SR, sourceEndSeconds=(first+count)/SR)
+                         sourceStartSeconds=first/SR, sourceEndSeconds=(first+count)/SR,
+                         fit="authored-window")
     else:
+        # A take shorter than its placement is looped at quiet points unless the
+        # placement opts out with allowReprise: false. Which one happened is recorded.
+        allow = movement.get("allowReprise", True)
+        if not isinstance(allow, bool):
+            raise RuntimeError("allowReprise must be true or false")
+        target = round(duration * SR)
+        if len(source) < target and not allow:
+            raise RuntimeError(
+                f"Score take is {len(source)/SR:.3f}s for a {duration:.3f}s placement and "
+                "allowReprise is false; shorten the placement, cut an explicit "
+                "sourceStart/sourceDuration window, or choose a longer take")
         conformed, joins = extend_score(source, duration)
-        selection = dict(method="selected-take-with-quiet-energy-reprise-candidates")
+        selection = dict(method="selected-take-with-quiet-energy-reprise-candidates",
+                         fit=("extended-reprise" if len(source) < target else
+                              "trimmed" if len(source) > target else "exact"))
     gain_db = float(movement.get("gainDb", 0))
     if not math.isfinite(gain_db) or not -24 <= gain_db <= 6:
         raise RuntimeError("Score section gain outside -24..6dB")
@@ -627,6 +641,8 @@ def build_music(ep: Path, work: Path, plan: dict, wave: dict) -> Path:
             "normalization": level_audit,
         })
     env, envelope_audit = wave_envelope(plan, wave, total)
+    envelope_audit["scoreFits"] = [{"movement": row["movement"], "take": row["take"], "fit": row["fit"]}
+                                   for row in decisions]
     stem *= env[:, None]
     envelope_audit['verifiedPcmPeak'] = validate_score_bus(stem)
     envelope_audit['pcmHeadroomGuard'] = 'fail before write above0.98; never hard-clip a working score'
