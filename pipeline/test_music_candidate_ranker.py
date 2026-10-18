@@ -493,6 +493,22 @@ class OpenDimensionTests(unittest.TestCase):
                     with self.assertRaises(ranker.AnalysisError):
                         ranker.load_plan(fixture.manifest_path)
 
+    def test_axis_names_may_be_any_non_blank_text(self) -> None:
+        names = ["demo-tensión", "demo held breath", "демо-даль"]
+        weights = {feature: {"intercept": 0.2, "weights": {names[0]: 0.4, names[1]: -0.1}}
+                   for feature in ranker.TRAJECTORY_FEATURES}
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            author_dimensions(fixture, names, proxyWeights=weights)
+            plan = ranker.load_plan(fixture.manifest_path)
+            self.assertEqual(list(plan["dimensions"]), names)
+            self.assertEqual(plan["dimensionMapping"]["ignored"], [names[2]])
+            for broken in ([*names, names[0]], [names[0], "  "], [names[0], 3]):
+                with self.subTest(broken=broken):
+                    author_dimensions(fixture, broken, proxyWeights=weights)
+                    with self.assertRaisesRegex(ranker.AnalysisError, "non-empty list of unique"):
+                        ranker.load_plan(fixture.manifest_path)
+
     def test_landmarks_place_the_loudest_moment_and_the_tail(self) -> None:
         audio = tone(330.0, seconds=12.0, amplitude=0.05)
         burst = slice(round(6.0 * SAMPLE_RATE), round(6.5 * SAMPLE_RATE))

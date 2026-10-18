@@ -51,7 +51,6 @@ DEFAULT_PROXY_WEIGHTS = {
     "onsetActivity": {"intercept": 0.0, "clip": [0.0, 1.0], "weights": {
         "kinetic": 0.70, "dread": 0.18, "hope": 0.08, "intimacy": -0.18, "grief": -0.12}},
 }
-DIMENSION = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 TRAJECTORY_FEATURES = (
     "rmsEnergy", "lowFrequency", "spectralBrightness", "spectralSpread",
     "onsetActivity",
@@ -198,7 +197,7 @@ def load_plan(manifest_path: Path) -> dict[str, Any]:
     dimensions = anchors.get("dimensions")
     if (not isinstance(dimensions, list) or not dimensions
             or len(set(map(str, dimensions))) != len(dimensions)
-            or not all(isinstance(name, str) and DIMENSION.fullmatch(name) for name in dimensions)):
+            or not all(isinstance(name, str) and name.strip() for name in dimensions)):
         raise AnalysisError("semantic dimensions must be a non-empty list of unique names")
     dimensions = tuple(dimensions)
 
