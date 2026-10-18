@@ -14,6 +14,7 @@ sequences. Choose the amount of process that helps the work.
 | Run H3 jobs and ingest picture | `h3/stage_finite.py`, `h3/box/finite_client.py`, `h3/ingest_finite.py` |
 | Read a screenplay into source units | `edit/read_screenplay.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
+| Admit reviewed takes to the timeline | `edit/admit_review_decisions.py` |
 | Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
 | Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
