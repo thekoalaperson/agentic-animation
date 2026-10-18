@@ -644,6 +644,34 @@ def _audio_overlaps(scene_id: str, output: dict[str, Any], measured: bool, start
     return result
 
 
+def _frame_settings(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the optional film-wide ``frameAspect`` matte and stepped ``cadence``.
+
+    The delivery container stays 16:9 at 24 fps: a matte crops the picture to
+    its shape and letterboxes or pillarboxes it, and a cadence of 2 or 3 holds
+    each picture frame for that many delivery frames.
+    """
+    result: dict[str, Any] = {}
+    aspect = config.get("frameAspect")
+    if aspect is not None:
+        ratio = None
+        if isinstance(aspect, str) and re.fullmatch(r"\d+(\.\d+)?:\d+(\.\d+)?", aspect):
+            width, height = (float(part) for part in aspect.split(":"))
+            ratio = width / height if height else None
+        elif _finite_seconds(aspect):
+            ratio = float(aspect)
+        if ratio is None or not 0.5 <= ratio <= 3.0:
+            raise TimelineIncomplete("frameAspect must be a ratio such as \"4:3\" or a number from 0.5 to 3.0")
+        result.update(aspect=aspect, aspectRatio=round(ratio, 6))
+    cadence = config.get("cadence")
+    if cadence is not None:
+        if cadence not in (1, 2, 3) or isinstance(cadence, bool):
+            raise TimelineIncomplete("cadence holds each picture frame for 1, 2 or 3 delivery frames")
+        if cadence != 1:
+            result["cadence"] = cadence
+    return result or None
+
+
 TRANSITION_KINDS = {"dissolve", "dip-to-black", "dip-to-white"}
 
 
@@ -2045,6 +2073,7 @@ def build_timeline(
     preserve_dialogue = config.get("preserveCompleteDialogueClips", False)
     if type(preserve_dialogue) is not bool:
         raise TimelineIncomplete("preserveCompleteDialogueClips must be a boolean")
+    frame = _frame_settings(config)
 
     events: list[dict[str, Any]] = []
     cursor_frames = 0
@@ -2460,6 +2489,8 @@ def build_timeline(
             errors.append({"type": "transition", "error": str(exc)})
     if transitions:
         readiness["transitions"] = transitions
+    if frame:
+        readiness["frame"] = frame
 
     # Preserve the exact allocation evidence even when picture coverage is
     # short.  A continuation planner must be able to prove which accepted
@@ -2579,6 +2610,8 @@ def build_timeline(
     }
     if transitions:
         edit_plan["transitions"] = transitions
+    if frame:
+        edit_plan["frame"] = frame
     subtitle_hi = _subtitle_doc("hi", events, fingerprint)
     subtitle_en = _subtitle_doc("en", events, fingerprint)
     explicit_retimes = [

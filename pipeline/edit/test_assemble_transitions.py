@@ -85,5 +85,21 @@ class RenderedTransitionTest(unittest.TestCase):
         self.assertGreater(into[-1, :, :, 2].mean(), 200)
 
 
+    def test_matte_and_cadence_keep_the_frame_count(self):
+        frame = {"aspectRatio": 2.39, "cadence": 3}
+        rendered = self.frames(assembly.render_segment(self.item("a", 0, 37), self.cache, WIDTH, HEIGHT, frame))
+        self.assertEqual(rendered.shape, (37, HEIGHT, WIDTH, 3))
+        self.assertLess(rendered[:, :4].mean(), 4)  # letterbox bars are black
+        self.assertGreater(rendered[:, HEIGHT // 2, :, 0].mean(), 200)
+        moving = self.root / "moving.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=256x144:r=24:d=3",
+                        "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", str(moving)], check=True)
+        self.sources["m"] = moving
+        held = self.frames(assembly.render_segment(self.item("m", 0, 37), self.cache, WIDTH, HEIGHT, {"cadence": 3}))
+        changes = [bool(np.abs(held[i] - held[i - 1]).mean() > 1) for i in range(1, len(held))]
+        self.assertEqual(len(held), 37)
+        self.assertEqual(changes, ([False, False, True] * 12)[:36])  # each picture frame held three times
+
+
 if __name__ == "__main__":
     unittest.main()

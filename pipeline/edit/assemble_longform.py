@@ -366,9 +366,33 @@ def coalesce_render_segments(segments: list[dict]) -> list[dict]:
     return runs
 
 
-def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
+def frame_filters(frame: dict | None, width: int, height: int) -> tuple[str, str]:
+    """Filters for an authored film-wide matte and stepped cadence.
+
+    ``aspectRatio`` crops the fitted picture to that shape and letterboxes or
+    pillarboxes it back into the unchanged delivery container. ``cadence``
+    holds each picture frame for that many delivery frames; the delivery clock
+    and frame count are unchanged.
+    """
+    if not frame:
+        return "", ""
+    matte = ""
+    ratio = frame.get("aspectRatio")
+    if ratio is not None:
+        if ratio > width / height:
+            inner = max(2, round(width / ratio / 2) * 2)
+            matte = f"crop={width}:{inner}:0:{(height - inner) // 2},pad={width}:{height}:0:{(height - inner) // 2}:black,"
+        elif ratio < width / height:
+            inner = max(2, round(height * ratio / 2) * 2)
+            matte = f"crop={inner}:{height}:{(width - inner) // 2}:0,pad={width}:{height}:{(width - inner) // 2}:0:black,"
+    cadence = frame.get("cadence")
+    stepped = f"fps={FPS}/{cadence}:eof_action=pass,fps={FPS}," if cadence else ""
+    return matte, stepped
+
+
+def render_segment(item: dict, cache: Path, width: int, height: int, frame: dict | None = None) -> Path:
     if "sources" in item:
-        return render_dissolve_run(item, cache, width, height)
+        return render_dissolve_run(item, cache, width, height, frame)
     identity = {
         "source": item["sourceSha256"], "start": item["sourceStart"],
         "sourceDuration": item["sourceDuration"], "speed": item["speed"],
@@ -378,6 +402,9 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
     fades = {key: item[key] for key in ("fadeIn", "fadeOut") if key in item}
     if fades:
         identity["fades"] = fades  # absent for an ordinary cut, so its cache key is unchanged
+    if frame:
+        identity["frame"] = frame
+    matte, stepped = frame_filters(frame, width, height)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     output = cache / f"{item['id']}-{key}.mp4"
     if output.exists():
@@ -399,7 +426,7 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
         f"{crop_filter}"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-        f"fps={FPS},"
+        f"{matte}fps={FPS},{stepped}"
         + "".join(f"fade=t=in:s=0:n={fade['frames']}:c={fade['colour']}," for fade in [item.get("fadeIn")] if fade)
         # ffmpeg reaches the colour one frame after a fade-out's last frame, so
         # start one frame earlier: the segment's final frame is then the colour,
@@ -418,9 +445,9 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
     return output
 
 
-def render_dissolve_run(item: dict, cache: Path, width: int, height: int) -> Path:
+def render_dissolve_run(item: dict, cache: Path, width: int, height: int, frame: dict | None = None) -> Path:
     """Render each source of a dissolve run, then overlap them with ``xfade``."""
-    parts = [render_segment(dict(part, id=f"{item['id']}-s{index}"), cache, width, height)
+    parts = [render_segment(dict(part, id=f"{item['id']}-s{index}"), cache, width, height, frame)
              for index, part in enumerate(item["sources"])]
     key = hashlib.sha256(json.dumps({"parts": [path.name for path in parts], "dissolves": item["dissolves"],
                                      "frames": item["frames"]}).encode()).hexdigest()[:20]
@@ -463,7 +490,7 @@ def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> 
     cache.mkdir(exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         rendered = list(
-            pool.map(lambda x: render_segment(x, cache, width, height), render_runs)
+            pool.map(lambda x: render_segment(x, cache, width, height, plan.get("frame")), render_runs)
         )
     listing = work / f"concat-{height}p.txt"
     # MP4 format.duration rounds some24fps clips to milliseconds. Repeated
@@ -867,6 +894,7 @@ def main() -> None:
     audit = {
         "episode": plan["episode"], "runtimeSeconds": plan["runtimeSeconds"],
         "resolution": f"{width}x{args.height}", "outputs": outputs,
+        **({"frame": plan["frame"]} if plan.get("frame") else {}),
     }
     (work / f"assembly-components-{args.height}p.json").write_text(json.dumps(audit, indent=2) + "\n")
     print(json.dumps(audit, indent=2))

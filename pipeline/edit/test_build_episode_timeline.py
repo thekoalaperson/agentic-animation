@@ -2140,5 +2140,30 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertTrue(joined.name.startswith("p001-dissolve-p002-"))
 
 
+    def test_matte_and_cadence_are_film_wide_and_recorded(self):
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertNotIn("frame", plan)
+        config = json.loads(self.config.read_text())
+        config.update(frameAspect="2.39:1", cadence=2)
+        self.write_json(self.config, config)
+        ready, matted = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertEqual(matted["frame"], {"aspect": "2.39:1", "aspectRatio": 2.39, "cadence": 2})
+        self.assertEqual(ready["frame"], matted["frame"])
+        self.assertEqual(matted["events"], plan["events"])  # the clock is untouched
+        for invalid in ({"frameAspect": "wide"}, {"frameAspect": 9.0}, {"cadence": 4}, {"cadence": True}):
+            with self.subTest(invalid):
+                self.write_json(self.config, dict(config, **invalid))
+                with self.assertRaises(timeline.TimelineIncomplete):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+
+    def test_renderer_mattes_and_steps_inside_the_unchanged_container(self):
+        letterbox, stepped = assembly.frame_filters({"aspectRatio": 2.39, "cadence": 2}, 1280, 720)
+        self.assertEqual(letterbox, "crop=1280:536:0:92,pad=1280:720:0:92:black,")
+        self.assertEqual(stepped, "fps=24/2:eof_action=pass,fps=24,")
+        pillarbox, none = assembly.frame_filters({"aspectRatio": 4 / 3}, 1280, 720)
+        self.assertEqual((pillarbox, none), ("crop=960:720:160:0,pad=1280:720:160:0:black,", ""))
+        self.assertEqual(assembly.frame_filters(None, 1280, 720), ("", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
