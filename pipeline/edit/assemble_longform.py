@@ -338,6 +338,45 @@ def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> 
     return output
 
 
+def place_audio_overlaps(stem: np.ndarray, source: Path, event: dict, source_start: float,
+                         gain: float) -> dict:
+    """Play an authored lead or tail of the event's own native audio across a cut.
+
+    The kept window is decoded, levelled and placed exactly as without an
+    overlap; each overlap is decoded on its own from the native audio beyond
+    that window, at the same gain, and ramped with the same sine curve as
+    ``fade`` so the bed enters or leaves smoothly. It never exceeds its
+    authored length, so the "voice exceeds event" bound still holds.
+    """
+    placed = {}
+    for key in ("audioLead", "audioTail"):
+        overlap = event.get(key)
+        if not overlap:
+            continue
+        seconds = float(overlap["seconds"])
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise RuntimeError(f"{key} of {event['id']} must be positive")
+        if key == "audioLead":
+            start, timeline_at = source_start - seconds, float(event["start"]) - seconds
+        else:
+            start = source_start + float(event["audioSourceDuration"])
+            timeline_at = float(event["start"]) + float(event["audioSourceDuration"])
+        if start < -1e-9 or timeline_at < -1e-9:
+            raise RuntimeError(f"{key} of {event['id']} reaches before its clip or the film")
+        piece = audio(source, f"atrim=start={max(start, 0):.9f}:duration={seconds:.9f},asetpts=PTS-STARTPTS")
+        room = round(seconds * SR)
+        if len(piece) > room + 1024:
+            raise RuntimeError(f"{key} of {event['id']} exceeds its authored length")
+        piece = piece[:room] * gain
+        n = len(piece)
+        if n:
+            curve = np.sin(np.linspace(0, math.pi / 2, n, dtype=np.float32))[:, None]
+            piece *= curve if key == "audioLead" else curve[::-1]
+        place(stem, piece, timeline_at)
+        placed[key + "Seconds"] = round(n / SR, 6)
+    return placed
+
+
 def build_voice(ep: Path, work: Path, plan: dict) -> Path:
     total = round(plan["runtimeSeconds"] * SR)
     stem = np.zeros((total, 2), np.float32)
@@ -393,7 +432,9 @@ def build_voice(ep: Path, work: Path, plan: dict) -> Path:
         gain = min(10 ** ((-20 - 20 * math.log10(max(rms, 1e-7))) / 20), 0.92 / max(peak, 1e-7), 3.0)
         samples *= gain
         place(stem, samples, event["start"])
-        levels.append({"event": event["id"], "rms": rms, "peak": peak, "gain": gain})
+        level = {"event": event["id"], "rms": rms, "peak": peak, "gain": gain}
+        level.update(place_audio_overlaps(stem, source, event, source_start, gain))
+        levels.append(level)
     output = work / "voice-hi-48k24.wav"
     write_audio(output, stem)
     (work / "voice-levels.json").write_text(json.dumps(levels, indent=2) + "\n")

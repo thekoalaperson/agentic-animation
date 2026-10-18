@@ -1912,5 +1912,79 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertTrue(any(e["type"] == "h3-continuation-contract" for e in self.readiness()["errors"]))
 
 
+    def test_audio_overlaps_carry_native_bed_across_a_cut(self):
+        _, before = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        # Kept window 7..106 of a 5.0 s clip: 7/24 s of native audio before it, 5.0 - 106/24 s after.
+        self.set_output(audioLead={"seconds": 0.25, "reason": "Let the room arrive first."},
+                        audioTail={"seconds": 0.5, "reason": "Let the breath ring under the next shot."})
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        a = next(e for e in before["events"] if e["id"] == "demo-s003")
+        b = next(e for e in plan["events"] if e["id"] == "demo-s003")
+        for field in self.AUDIO_FIELDS:
+            self.assertEqual(a[field], b[field], field)
+        self.assertEqual(b["audioLead"], {"seconds": 0.25, "reason": "Let the room arrive first."})
+        self.assertEqual(b["audioTail"]["seconds"], 0.5)
+        self.assertNotIn("audioTail", a)
+        for invalid in ({"audioLead": {"seconds": 0.5, "reason": "more than exists"}},
+                        {"audioTail": {"seconds": 0.7, "reason": "more than exists"}},
+                        {"audioTail": {"seconds": 0.2}}, {"audioTail": {"seconds": 0, "reason": "x"}}):
+            with self.subTest(invalid):
+                config = json.loads(self.config.read_text())
+                for key in ("audioLead", "audioTail"):
+                    config["dialogueOutputs"]["demo-s003"].pop(key, None)
+                config["dialogueOutputs"]["demo-s003"].update(invalid)
+                self.write_json(self.config, config)
+                with self.assertRaisesRegex(timeline.TimelineIncomplete, "audio(Lead|Tail)"):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        config = json.loads(self.config.read_text())
+        config["dialogueOutputs"]["demo-s003"].update(audioTail={"seconds": 0.2, "reason": "x"})
+        del config["dialogueOutputs"]["demo-s003"]["speechWindow"]
+        self.write_json(self.config, config)
+        with self.assertRaisesRegex(timeline.TimelineIncomplete, "measured speech window"):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+
+    def test_voice_stem_adds_overlaps_without_touching_the_kept_window(self):
+        import numpy as np
+        source = self.ep / "work/grok/demo-s003.mp4"
+        event = {"id": "demo-s003", "kind": "dialogue", "audio": str(source.relative_to(self.ep)),
+                 "audioSha256": self.sha(source), "start": 1.0, "duration": 1.0, "end": 2.0,
+                 "audioSourceStart": 0.5, "audioSourceDuration": 1.0,
+                 "admission": {"sidecar": str(source.with_suffix(".vid.json").relative_to(self.ep)),
+                               "sidecarSha256": self.sha(source.with_suffix(".vid.json")),
+                               "reviewExport": "work/review/dialogue-review.json",
+                               "reviewExportSha256": self.sha(self.ep / "work/review/dialogue-review.json")}}
+        plan = {"runtimeSeconds": 3.0, "events": [event]}
+        decoded = []
+
+        def fake_audio(_path, filters=None):
+            decoded.append(filters)
+            seconds = float(filters.split("duration=")[1].split(",")[0])
+            return np.full((round(seconds * assembly.SR), 2), 0.25, np.float32)
+
+        def render(current):
+            stems = []
+            with mock.patch.object(assembly, "audio", side_effect=fake_audio), \
+                    mock.patch.object(assembly, "write_audio", side_effect=lambda _p, stem: stems.append(stem.copy())):
+                assembly.build_voice(self.ep, self.ep / "work/assembly-v1", current)
+            return stems[0], json.loads((self.ep / "work/assembly-v1/voice-levels.json").read_text())
+
+        plain, plain_levels = render(plan)
+        self.assertEqual(len(decoded), 1)
+        overlapped = dict(event, audioLead={"seconds": 0.25, "reason": "x"}, audioTail={"seconds": 0.5, "reason": "y"})
+        stem, levels = render(dict(plan, events=[overlapped]))
+        sr = assembly.SR
+        np.testing.assert_array_equal(stem[sr:2 * sr], plain[sr:2 * sr])  # kept window unchanged
+        self.assertEqual(levels[0]["gain"], plain_levels[0]["gain"])
+        self.assertEqual((levels[0]["audioLeadSeconds"], levels[0]["audioTailSeconds"]), (0.25, 0.5))
+        self.assertTrue(decoded[-2].startswith("atrim=start=0.250000000:duration=0.250000000"))
+        self.assertTrue(decoded[-1].startswith("atrim=start=1.500000000:duration=0.500000000"))
+        lead, tail = stem[round(0.75 * sr):sr, 0], stem[2 * sr:round(2.5 * sr), 0]
+        self.assertTrue(np.all(np.diff(lead) >= 0) and lead[0] < lead[-1])  # ramps in
+        self.assertTrue(np.all(np.diff(tail) <= 0) and tail[0] > tail[-1])  # ramps out
+        self.assertFalse(np.any(stem[round(2.5 * sr):]))
+        self.assertFalse(np.any(stem[:round(0.75 * sr)]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -615,6 +615,35 @@ def _record_split_edits(blocks: list[dict[str, Any]], events: list[dict[str, Any
                 })
 
 
+def _audio_overlaps(scene_id: str, output: dict[str, Any], measured: bool, start: float,
+                    source_start: float, audio_after: float) -> dict[str, Any]:
+    """Read authored ``audioLead``/``audioTail``: native sound heard across a cut.
+
+    A lead plays the clip's own audio from before its kept window under the
+    previous picture; a tail plays it on after the window under the next. Both
+    are bounded by native audio that exists beyond the kept window and never
+    invented. Because the kept window holds the measured speech, an overlap
+    carries the bed and breath but no words, so an unmeasured clip has none.
+    """
+    result = {}
+    for key, room, label in (("audioLead", min(source_start, start), "before"),
+                             ("audioTail", audio_after, "after")):
+        raw = output.get(key)
+        if raw is None:
+            continue
+        if (not isinstance(raw, dict) or set(raw) != {"seconds", "reason"} or not _finite_seconds(raw["seconds"])
+                or raw["seconds"] <= 0 or not isinstance(raw["reason"], str) or not raw["reason"].strip()):
+            raise TimelineIncomplete(f"{key} needs positive finite seconds and an authored reason: {scene_id}")
+        if not measured:
+            raise TimelineIncomplete(f"{key} needs a measured speech window, so the overlap carries no words: {scene_id}")
+        if raw["seconds"] > room + 1e-6:
+            raise TimelineIncomplete(
+                f"{key} asks for {raw['seconds']}s but only {max(room, 0):.6f}s of native audio exists {label} "
+                f"the kept window of {scene_id} within the film")
+        result[key] = {"seconds": raw["seconds"], "reason": raw["reason"].strip()}
+    return result
+
+
 def _speech_rule(row: dict[str, Any]) -> None:
     scene_id = row.get("still_id")
     if row.get("durationRule") not in (None, "speech") or any(
@@ -2009,6 +2038,8 @@ def build_timeline(
                 "subtitleTextHi": effective_text[scene_id]["hi"],
                 "subtitleTextEn": effective_text[scene_id]["en"],
             }
+            event.update(_audio_overlaps(scene_id, output, speech is not None, start, source_start,
+                                         (info.audio_duration or duration) - source_start - duration))
             cursor_frames += duration_frames
         elif row_kind[scene_id] == "picture":
             rule, hold_frames = picture_rule[scene_id]
@@ -2298,6 +2329,10 @@ def build_timeline(
         index = end_index
 
     _record_split_edits(blocks, events)
+    for event in events:
+        tail = event.get("audioTail", {}).get("seconds", 0)
+        if tail and event["end"] + tail > cursor_frames / DELIVERY_FPS + 1e-6:
+            raise TimelineIncomplete(f"Audio tail runs past the end of the film: {event['id']}")
 
     # Preserve the exact allocation evidence even when picture coverage is
     # short.  A continuation planner must be able to prove which accepted
