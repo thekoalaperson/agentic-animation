@@ -17,7 +17,9 @@ Decisions file (JSON)::
       "decisions": [
         {"itemId": "demo-s003", "decision": "approved",
          "reviewedAt": "2026-01-01T09:00:00Z", "sha256": "<reviewed bytes>",
-         "speechWindow": {"start": 1.0, "end": 3.5}, "note": "free text"}
+         "speechWindowFrom": {"path": "work/grok-dialogue-v1/speech-windows-attempt-001.json",
+                              "itemId": "demo-s003"},
+         "note": "free text"}
       ]
     }
 
@@ -35,7 +37,14 @@ Per lane, a row also carries:
 
 * ``dialogue`` -- ``itemId`` is the job ID in the dialogue manifest, or in the
   row's own ``executionManifest`` for a pilot or correction batch. Optional
-  ``sceneId`` (default ``itemId``), ``reuseReason`` and ``speechWindow``.
+  ``sceneId`` (default ``itemId``) and ``reuseReason``, and at most one of
+  ``speechWindowFrom`` and ``speechWindow``. ``speechWindowFrom`` names a
+  ``speech-windows-attempt-NNN.json`` written by ``prepare_dialogue_review.py
+  --measure-speech-windows`` and the item in it (``itemId`` defaults to the
+  row's); the tool refuses unless that item measured this take's exact bytes
+  and sidecar, copies its window, and records the attempt's path and hash on
+  the review row. ``speechWindow`` (``{start, end}`` in seconds) is a window
+  chosen by ear, recorded as typed.
 * ``score`` -- ``itemId`` is the cue ID and ``take`` its candidate index. A
   placement already authored for that take is pointed at the new record;
   ``timelineStart`` and ``timelineDuration`` on the row add one, named by
@@ -153,6 +162,16 @@ def _number(value: Any, label: str) -> float:
     return float(value)
 
 
+def _window(value: Any, item: str) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise AdmissionError(f"{item}: speechWindow must be {{start, end}} in seconds")
+    start = _number(value.get("start"), f"{item}: speechWindow start")
+    end = _number(value.get("end"), f"{item}: speechWindow end")
+    if not 0 <= start < end:
+        raise AdmissionError(f"{item}: speechWindow must run forward from zero or later")
+    return {"start": start, "end": end}
+
+
 def _review_row(top: dict[str, Any], row: dict[str, Any], item: str) -> dict[str, Any]:
     """The fields every lane records about who decided what, and when."""
     decision = row.get("decision")
@@ -258,15 +277,13 @@ class Admission:
                     raise AdmissionError(f"{item}: the sidecar binds another execution manifest")
                 _seen(row, "sha256", source_sha, item, "take")
                 _seen(row, "sidecarSha256", sidecar_sha, item, "sidecar")
-                window = row.get("speechWindow")
-                if window is not None:
-                    if not isinstance(window, dict):
-                        raise AdmissionError(f"{item}: speechWindow must be {{start, end}} in seconds")
-                    start = _number(window.get("start"), f"{item}: speechWindow start")
-                    end = _number(window.get("end"), f"{item}: speechWindow end")
-                    if not 0 <= start < end:
-                        raise AdmissionError(f"{item}: speechWindow must run forward from zero or later")
-                    record["speechWindow"] = {"start": start, "end": end}
+                if row.get("speechWindowFrom") is not None:
+                    if row.get("speechWindow") is not None:
+                        raise AdmissionError(f"{item}: give speechWindowFrom or speechWindow, not both")
+                    record.update(self.measured_window(row["speechWindowFrom"], item,
+                                                       source_sha, sidecar_sha))
+                elif row.get("speechWindow") is not None:
+                    record["speechWindow"] = _window(row["speechWindow"], item)
                 record.update(itemId=item, source={
                     "path": self.rel(source), "sha256": source_sha,
                     "sidecarPath": self.rel(sidecar), "sidecarSha256": sidecar_sha})
@@ -305,6 +322,26 @@ class Admission:
         if errors:
             raise AdmissionError("; ".join(errors))
         return self.export(reviews, binding_paths), {"dialogueOutputs": outputs}
+
+    def measured_window(self, ref: Any, item: str, source_sha: str, sidecar_sha: str) -> dict[str, Any]:
+        """Copy a measured speech window, bound to the exact take it measured."""
+        if not isinstance(ref, dict) or not ref.get("path"):
+            raise AdmissionError(f"{item}: speechWindowFrom must be {{path, itemId}}")
+        attempt = self.contained(self.path(ref["path"]), item, "speech-windows attempt")
+        doc = _read(attempt, f"{item} speech-windows attempt")
+        if doc.get("kind") != "dialogue-speech-windows":
+            raise AdmissionError(f"{item}: {self.rel(attempt)} is not a speech-windows attempt")
+        measured_id = str(ref.get("itemId") or item)
+        rows = [r for r in doc.get("items") or [] if isinstance(r, dict) and r.get("id") == measured_id]
+        if len(rows) != 1:
+            raise AdmissionError(f"{item}: {self.rel(attempt)} holds no single item {measured_id!r}")
+        measured = rows[0]
+        if measured.get("sourceSha256") != source_sha or measured.get("sidecarSha256") != sidecar_sha:
+            raise AdmissionError(f"{item}: {self.rel(attempt)} item {measured_id!r} measured other bytes "
+                                 "than the take being admitted")
+        return {"speechWindow": _window(measured.get("speechWindow"), item),
+                "speechWindowFrom": {"path": self.rel(attempt), "sha256": sha256_file(attempt),
+                                     "itemId": measured_id}}
 
     # -- score ------------------------------------------------------------
     def score(self) -> tuple[dict[str, Any], dict[str, Any]]:

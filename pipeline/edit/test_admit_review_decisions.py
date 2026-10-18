@@ -79,6 +79,54 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(summary["line"], "dialogue: 1 admitted, 1 agent-reviewed, 0 reviewed by a person")
         self.assertEqual(summary["methods"], {"full playback with sound": 1})
 
+    def speech_windows(self, **item):
+        """A measured attempt beside the manifest, as prepare_dialogue_review.py writes it."""
+        take = self.ep / "work/grok/demo-s003.mp4"
+        path = self.dialogue_manifest.parent / "speech-windows-attempt-001.json"
+        self.write_json(path, {"schemaVersion": 1, "kind": "dialogue-speech-windows",
+                               "manifestSha256": self.sha(self.dialogue_manifest),
+                               "items": [{"id": "demo-s003", "sourceSha256": self.take_sha(),
+                                          "sidecarSha256": self.sha(take.with_suffix(".vid.json")),
+                                          "speechWindow": {"start": 1.0, "end": 3.5}, **item}]})
+        return path
+
+    def test_a_measured_speech_window_is_copied_with_its_attempt(self):
+        self.unadmit_dialogue()
+        attempt = self.speech_windows()
+        rel = str(attempt.relative_to(self.ep))
+        self.admit("dialogue", self.decide([{"itemId": "demo-s003", "decision": "approved", "reviewedAt": AT,
+                                             "speechWindowFrom": {"path": rel}}]))
+        review = self.read(self.ep / "work/review/dialogue-review-v1.json")["reviews"][0]
+        self.assertEqual(review["speechWindow"], {"start": 1.0, "end": 3.5})
+        self.assertEqual(review["speechWindowFrom"],
+                         {"path": rel, "sha256": self.sha(attempt), "itemId": "demo-s003"})
+        self.assertEqual(self.read(self.config)["dialogueOutputs"]["demo-s003"]["speechWindow"],
+                         {"start": 1.0, "end": 3.5})
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready["errors"])
+        event = next(e for e in plan["events"] if e["kind"] == "dialogue")
+        self.assertEqual(event["subtitleAudioAt"], 0.708333)
+
+    def test_a_measured_speech_window_must_describe_the_take(self):
+        self.unadmit_dialogue()
+        good = {"itemId": "demo-s003", "decision": "approved", "reviewedAt": AT}
+        cases = {
+            "measured other bytes": ({"sourceSha256": "0" * 64}, {}),
+            "no single item": ({}, {"itemId": "demo-s099"}),
+            "not both": ({}, {"both": True}),
+        }
+        config_bytes = self.config.read_bytes()
+        for message, (item, ref) in cases.items():
+            attempt = self.speech_windows(**item)
+            row = dict(good, speechWindowFrom={"path": str(attempt.relative_to(self.ep)),
+                                               **({"itemId": ref["itemId"]} if "itemId" in ref else {})})
+            if ref.get("both"):
+                row["speechWindow"] = {"start": 0.0, "end": 1.0}
+            with self.subTest(message), self.assertRaisesRegex(admit.AdmissionError, message):
+                self.admit("dialogue", self.decide([row]))
+        self.assertEqual(self.config.read_bytes(), config_bytes)
+        self.assertEqual(sorted(p.name for p in (self.ep / "work/review").iterdir()), ["decisions.json"])
+
     def test_a_take_changed_after_its_decision_is_inadmissible(self):
         self.unadmit_dialogue()
         self.admit("dialogue", self.decide([{"itemId": "demo-s003", "decision": "approved", "reviewedAt": AT}]))

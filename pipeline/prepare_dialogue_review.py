@@ -8,8 +8,10 @@ build, and writes no observation manifest. When the local ffmpeg has no
 drawtext filter or no font is available, clip IDs and timestamps are not burned
 in; the frame ordinals and times stay in each proof record.
 --measure-speech-windows runs anywhere ffmpeg runs. Each measurement is a new speech-windows-attempt-NNN.json:
-conservative, hash-bound speech windows that a review decision may copy as the
-clip's speechWindow. Earlier attempts stay; speech-windows.json indexes them,
+conservative, hash-bound speech windows. A decisions row for
+edit/admit_review_decisions.py names an attempt and item as speechWindowFrom;
+admission checks the item's sourceSha256 against the take and copies the
+window into the review record. Earlier attempts stay; speech-windows.json indexes them,
 so a second run with transcript evidence, other thresholds or another host adds
 an attempt instead of refusing. With
 --observation-prompt and --observation-max-credits it also writes
@@ -140,8 +142,10 @@ def measure_speech_windows(manifest, root, jobs, *, noise_db, minimum_silence, h
                            transcripts=None):
     """Write one offline, hash-bound speech-windows attempt beside the manifest.
 
-    This is measurement, not admission: the review decisions copy a chosen
-    window into the record the timeline reads as speechWindow. A run whose
+    This is measurement, not admission: a decisions row names this attempt
+    and item as speechWindowFrom, and admit_review_decisions.py copies that
+    window, after checking the item's hashes against the take, into the
+    record the timeline reads as speechWindow. A run whose
     document equals the latest attempt adds nothing; any other run adds an
     attempt and never replaces one. speech-windows.json is the attempt index.
     """

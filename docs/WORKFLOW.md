@@ -161,7 +161,10 @@ Recurring files, by the role they play:
   by hand or brought in, written by `register_supplied_media.py` with its hash,
   maker and declared rights.
 - `speech-windows-attempt-NNN.json` and its index `speech-windows.json`, beside
-  a dialogue manifest: measured speech windows a review decision may copy.
+  a dialogue manifest: measured speech windows, each bound to its clip's hash.
+  A decisions row may name an attempt and item as `speechWindowFrom`, and the
+  admission tool copies that window after checking the hash; a row may instead
+  type a `speechWindow` chosen by ear.
 - `work/h3-review-ledger-v1.json`: the accepted H3 segments and their verdicts.
 - A decisions file, in plain JSON, and the review exports
   `admit_review_decisions.py` writes from it: the source-bound records that
