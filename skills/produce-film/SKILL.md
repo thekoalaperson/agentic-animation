@@ -41,6 +41,14 @@ bound file, edited rarely, because an edit there means a new manifest version.
 Version the note rather than rewriting it, and record departures as dated
 entries.
 
+When the owner has given no creative direction for this film, a good first move
+is to run `pipeline/draw_provocations.py`, and again with `--axes`, before
+forming a look, reading only its output and never its data files. Treat what
+it draws as a starting push: keep, combine, override or reject it freely, and
+record in the direction note what was drawn and what you did with it. This is a
+default, not a gate; nothing validates it, and the owner's direction always
+wins.
+
 When the note exists it outranks the creative and sound notes for this film. It
 never outranks technical integrity, a runner's contract, or the user's own
 latest direction.

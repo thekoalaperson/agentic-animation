@@ -11,16 +11,10 @@ The look is decided in the stills, because every motion route starts from them.
 Choose it early and on purpose, from a reading of this story rather than from a
 previous film or from these notes.
 
-A look is a set of decisions, not an adjective. Its axes include the medium the
-images seem made in, how far faces and bodies are simplified, line and edge,
-surface texture, the logic of colour, where light comes from and how much dark
-the frame may hold, and what is allowed to look strange. None is ranked, the
-list is not complete, and a film may decide an axis that no list names.
-
-The first look that comes to mind is probably the one everyone else would reach
-for too. If a look could move to another story unchanged, it has not yet been
-chosen for this one. Every look gains something and gives something up; know
-what this one gives up.
+A look is a set of decisions, not an adjective. Its axes include medium,
+simplification, line, texture, colour logic, light, and what may look strange.
+None is ranked, the list is not complete, and a film may decide an axis that no
+list names.
 
 Describe the look in terms a renderer can act on rather than in praise words.
 Where a prompt carries a style passage at all, it can come after the subject and
@@ -34,13 +28,8 @@ plates at the times of day the film uses (from as many angles as the director
 wants, including none), props on a sheet of their own, or the first registered
 shot of a figure standing as its authority.
 
-Colour can follow the emotional movement, or hold still while everything else
-moves. When two looks both seem right, a few test frames of one key moment made
-in each can settle it more cheaply than argument.
-
-For sacred material, reverence lives in how figures are treated, not in a
-shading technique. The question is which traditions of telling and of picturing
-the film stands in, or stands against.
+When two looks both seem right, a few test frames of one key moment made in
+each can settle it more cheaply than argument.
 
 ## Consistency without sameness
 
@@ -62,8 +51,7 @@ script is story time, not a grade. Reading the page straight through in order is
 also a decision, and it can be made on purpose.
 
 Some questions to answer before shots: whose experience is this; what does the
-first image argue; what plays without words; what is remembered rather than
-shown; where does escalation give way to stillness.
+first image do; what carries each beat.
 
 ## Staging and performance
 
@@ -72,12 +60,10 @@ and how they hold themselves. When the cut depends on that, decide it in the
 still. The dialogue route animates whatever still it is given, so framing is
 chosen in the still, not by the route.
 
-Staging is a set of decisions with costs: where the viewer stands relative to
-the people, whether a conversation keeps one side or crosses it, distance and
-height as a statement of the relationship, how long a view is held, and whose
-experience the viewer borrows. Acting has its own axes: how much a body moves,
-how codified a gesture is, how much is carried by stillness. How much violence
-is shown, and through what, is a decision too. None of these has a default here.
+Staging has axes: camera position, screen direction, distance, camera height,
+duration of a view, and whose experience the viewer borrows. Acting has its own:
+body, gesture, face. How much violence is shown, and through what, is a decision
+too. None of these has a default here.
 
 A provider refusal is information about the route. Rewording is one response;
 changing what the shot shows, or how it shows it, is another.
@@ -110,18 +96,15 @@ not a universal duration grid. Preserve the source so experiments stay reversibl
 
 ## Cutting
 
-Cutting decisions come in pairs, and neither side is the default: one take for a
-line or several; cut on the question or on the answer; hold the speaker or the
-listener; sound leading picture or picture leading sound; a hard cut or a
-dissolve; a scene that stays put or one that leaves and returns. When nothing
-is authored, the timeline joins picture with hard cuts and plays each line over
-its own clip. A dissolve or a dip through colour, a line heard over other
-picture, and sound that leads or trails its picture can each be authored; the
-[workflow](WORKFLOW.md) names the keys.
+Cutting has axes: takes per line, where a cut falls, whose face is held, whether
+sound or picture leads, how shots join, and whether a scene stays put. None has
+a default here. When nothing is authored, the timeline joins picture with hard
+cuts and plays each line over its own clip. A dissolve or a dip through colour,
+a line heard over other picture, and sound that leads or trails its picture can
+each be authored; the [workflow](WORKFLOW.md) names the keys.
 
-An action line describes an event, not a shot. Camera and cutting can be one
-idea held across the whole film. Notice the patterns that arrived without being
-chosen, and keep the ones you would choose on purpose.
+An action line describes an event, not a shot. Notice the patterns that arrived
+without being chosen, and keep the ones you would choose on purpose.
 
 ## Episodes and serials
 
@@ -169,11 +152,10 @@ different variables; which one is a reading of this take, not a rule.
 ## If you want a push
 
 Optional. `pipeline/draw_provocations.py` draws two story-neutral directorial
-constraints at random from a deck kept beside it. Run it rather than reading the
-deck: a model that reads every card picks the most salient ones, and operators on
-the same model then pick the same ones. Reject, combine or override what it
-draws. Nothing records or validates a draw, and the user's direction always wins.
-
-Beside it, an offer and not a step: it can help to name to yourself the
-competent default adaptation of this story, and then decide where this film
-differs from it.
+constraints at random; with `--axes` it instead assigns one value to each axis
+of look, camera and cutting, performance, and music and sound. Both modes read
+data files kept beside the tool. Read only the tool's output, never the data
+files: a model that reads a whole list picks the most salient entries, and
+operators on the same model then pick the same ones. Keep, combine, override or
+reject what it draws. Nothing records or validates a draw, and the user's
+direction always wins.

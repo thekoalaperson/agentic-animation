@@ -7,14 +7,9 @@ model or every possible production.
 
 ## Music
 
-The instrument vocabulary comes from the film's world, and these notes name
-none. Choices with real costs, none of them recommended: one instrument or an
-ensemble; music that arrives late or a bed that runs through the film; with words
-or without; cues grown from one seed take or written independently; one long cue
-cut to picture or many short ones; music inside the story's world or outside it;
-no score at all. A choice that gives the film continuity usually takes some
-contrast away, and a choice that makes an entrance an event leaves the rest of
-the film to voices and the world.
+These notes name no instruments. Music has axes: instrumentation, density,
+where music is and is not, diegesis, voices, and how cues relate to one another.
+None is ranked and none has a default here.
 
 Give the score meaningful presence, including speech-free moments, or decide it
 has none. Make room for voices deliberately instead of stacking attenuation until
@@ -60,17 +55,14 @@ dimensions are the film's own. The ranker reads any set you declare, given your
 own proxy weights or each cue's own curves, and records the mapping it used.
 The effects renderer keeps the dimensions the wave declares.
 
-In a serial: does a theme belong to a person, a place or an idea? Does it return
-unchanged, or changed by what the story has done? Do some episodes hear none of
-it?
+In a serial, what a theme belongs to, whether and how it returns, and which
+episodes hear it are decisions too.
 
 ## Effects
 
-How literal the world's sound is, how much the score carries instead, how much
-silence the film allows, and whose ears the viewer hears through are decisions
-for this film. Strategies that answer them differently each lose something;
-invent the one this film needs. Sound from outside the frame, and sound
-perspective (near or far, inside a head or out in the room), are tools as well.
+The world's sound has axes: literalness, density, what the score carries
+instead, point of audition, offscreen sound, and sound perspective. They are
+decisions for this film, and none has a default here.
 
 A dialogue clip arrives with its own room under the line, and today that room
 stays with the line through the edit; a scene may let it run on before or after
@@ -117,13 +109,9 @@ What the lanes do today:
   worker transcript with the frozen line; neither judges the voice.
 - A dialogue clip is at most 15 seconds.
 
-Casting is a set of questions. How old does each voice sound, and how near? Which
-register of Hindi does each person speak? Is the narrator a storyteller, a
-witness, a character, or absent? Auditioning two or three genuinely different
+Casting has axes: age, distance from the microphone, register of speech, vocal
+level, and who narrates, if anyone. Auditioning two or three genuinely different
 castings before settling usually costs less than recasting later.
-
-A quiet scene can be whispered or spoken at full voice in a quiet place, and a
-loud one can be shouted or held back; neither is the scene's default.
 
 Subtitles translate rather than explain. When a speech is split across rows, each
 half carries only its own words.

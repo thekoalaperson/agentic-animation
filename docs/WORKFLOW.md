@@ -24,7 +24,7 @@ sequences. Choose the amount of process that helps the work.
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
 | Reuse HD picture or change its audio | `open_media/build_hd_range_plan.py`, `open_media/hd_audio_remux.py` |
 | Package selected deliverables | `edit/package_hindi_delivery.py`, `edit/package_hindi_longform.py` |
-| Draw an optional push from outside the model | `draw_provocations.py` (see [creative notes](CREATIVE.md)) |
+| Draw an optional push from outside the model | `draw_provocations.py`, `--axes` for one value per look, camera, performance and sound axis (see [creative notes](CREATIVE.md)) |
 
 These commands expose specific input contracts through `--help`; they are not
 creative instructions. Use an external project directory. Source stills can come

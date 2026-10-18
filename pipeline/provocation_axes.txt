@@ -1,0 +1,295 @@
+# Axis values for draw_provocations.py --axes. Run the tool instead of reading
+# this file. Each [group: axis] heading is followed by its values, one per line.
+# Order means nothing and no value is preferred; the tool picks one per axis at
+# random. Tradition names in brackets locate a value, they are not a canon.
+
+[look: medium]
+opaque gouache on toned paper
+colour woodblock print with flat areas and visible grain (Japanese ukiyo-e)
+ink wash on silk with large empty areas (Chinese shan shui)
+leather shadow puppets lit through a screen (Javanese wayang kulit, Andhra tholu bommalata)
+cut paper silhouettes on backlit glass (early European silhouette film)
+oil paint on glass, smeared and repainted frame by frame
+oil pastel on black paper
+stop-motion clay with visible thumbprints
+two-colour linocut
+painted cels over watercolour backgrounds (mid-century studio animation)
+hand-made puppets in photographed miniature sets (Czech puppet film)
+panel painting with raised gesso and gold leaf (Tanjore)
+folk scroll painting shown panel by panel (Bengal patachitra, Telangana Cheriyal)
+miniature painting with a tilted ground and patterned borders (Persian)
+mineral pigment mural on cracked plaster (Ajanta, Mexican muralism)
+charcoal on newsprint, erased and redrawn (Eastern European charcoal animation)
+smooth physically lit CG
+cel-shaded 3D with hard flat shadows
+painting on bark paper (Mexican amate)
+embroidered story cloth (Bengal kantha, Hmong paj ntaub)
+sand moved on a light table
+hand-painted cinema poster (Ghanaian)
+lacquer miniature on black ground (Russian Palekh)
+pinscreen relief lit from the side
+
+[look: simplification]
+faces reduced to two dots and a line
+full anatomical realism
+caricature with one feature exaggerated per person
+masks instead of faces
+simplified faces with large detailed eyes (anime)
+faces never shown
+figures in strict profile (Egyptian relief, Mughal durbar painting)
+bodies built from geometric blocks (Constructivist)
+figures built from repeated pattern (Warli, Gond)
+realistic bodies with simplified faces
+a child's drawing
+rubber-hose limbs without joints (1930s cartoon)
+
+[look: line]
+no line at all, only masses
+one heavy brush contour of even weight
+fine hairline outlines (Mughal painting, Franco-Belgian ligne claire)
+scratchy broken line redrawn each frame
+coloured line, never black
+white line on a dark ground
+calligraphic line that swells and tapers (East Asian brush)
+outline only, no fill
+contour printed off-register from the colour
+lines drawn in light, like neon
+cut edges instead of drawn ones
+
+[look: texture]
+perfectly flat digital fill
+paper grain and fibre
+canvas weave and impasto
+film grain and gate weave
+fabric weave
+cracked plaster
+wood grain from a printing block
+halftone dots (newsprint comics)
+crayon wax
+photographic surface
+screentone (manga)
+
+[look: colour logic]
+one colour per character
+black and white with a single colour
+only the pigments of one historical palette
+full saturated primaries
+colour by time of day
+colour chosen per scene for feeling, unrelated to the world
+monochrome tinted per scene (silent-era tinting)
+two complementary colours in conflict in every scene
+colour drains as the film goes on
+colour grows as the film goes on
+palette taken from a single textile
+neon against black
+
+[look: light]
+no light source at all, as in miniature painting
+one hard source and deep shadow (Baroque chiaroscuro, film noir)
+high-key even daylight
+light from below
+backlight that turns figures to silhouettes
+light that moves with feeling rather than with the world
+practical sources only: fire, lamps, screens
+overcast soft light with no shadows
+noon light with short hard shadows
+light broken into pattern through lattice and leaves
+figures that give off their own light
+
+[look: what may look strange]
+scale follows importance, not distance (hierarchical scale)
+several moments of time in one frame (continuous narrative painting)
+perspective tilted until the ground stands like a wall
+gravity is optional
+the frame's border belongs to the world
+characters change colour with mood
+photographed backgrounds behind drawn figures
+the painter's hand appears in the frame
+objects are alive
+nothing: everything obeys the physical world
+the same character drawn by a different hand in each scene
+writing appears inside the image
+
+[camera and cutting: where the camera stands]
+at a standing onlooker's height
+low, near the floor (Japanese domestic drama of the 1950s)
+directly overhead, looking down
+high and far, as from a hill
+inside the action, among the figures
+at the height of whoever holds power in the scene
+one fixed frontal view, like a stage
+next to the scene's most important object
+at a child's height
+at one character's eye level throughout
+never in the same place twice
+
+[camera and cutting: camera movement]
+locked off, never moves
+handheld and breathing (direct cinema)
+slow lateral tracking, like an unrolling scroll
+crane and sweep (studio spectacle)
+pans and tilts from one fixed point only
+multiplane parallax push-ins (classic studio animation)
+whip pans between people
+moves only when a character moves
+a slow push-in on every shot
+a constant floating drift (long-take art cinema)
+zooms instead of moves (1970s Hong Kong and Italian genre film)
+moves exactly once in the film
+
+[camera and cutting: framing]
+wide tableau with whole bodies always in frame
+extreme close-ups of eyes and hands (Italian western)
+medium shots only
+deep focus, near and far both sharp
+faces cut by the frame edge
+symmetrical centre framing
+tall narrow vertical frames
+figures small in a large landscape (Chinese landscape scroll)
+over-the-shoulder conversation coverage (classical Hollywood)
+split screen or comic-book panels side by side
+frames within frames: doorways, windows, arches
+
+[camera and cutting: rhythm]
+very long takes and few cuts
+fast montage with many cuts per line (Soviet montage)
+a cut on every line of dialogue
+jump cuts inside a shot (French New Wave)
+cuts on the beat of the music (song picturisation)
+a different rhythm in each scene
+every shot the same length
+cuts accelerating towards the end
+pauses on empty places between scenes (pillow shots)
+key actions shown three times from three angles (Hong Kong action)
+cut away from the speaker before the line ends
+
+[camera and cutting: joins]
+hard cuts only
+dissolves throughout
+wipes (1950s Japanese period film)
+iris in and out (silent era)
+fades to black between scenes
+match cuts on shape or movement
+a camera move hides each cut
+the image is painted over into the next
+a scroll unrolls into the next scene
+smash cuts from quiet to loud
+single white flash frames
+
+[performance: body]
+very still, only small movements
+broad full-body acting (silent era)
+every movement on a rhythm, as in dance
+everyday naturalism with fidgets and shifts
+jointed and weighted, like a rod puppet (Japanese bunraku)
+squash-and-stretch cartoon physics
+slow ritual pace (Japanese noh)
+movement traced from filmed actors (rotoscope)
+bodies moving together as a chorus
+poses held, then released (kabuki mie)
+
+[performance: gesture]
+codified hand gestures with fixed meanings (Indian classical dance)
+no hand gestures at all
+everyday gesture only
+one gesture per character, repeated
+pantomime that shows the words
+gestures that contradict the words
+touch carries everything
+large outward gestures (opera, Peking opera)
+gestures taken from work: tools, cloth, food
+hands mostly hidden
+
+[performance: face]
+mask-like faces that never change
+large expressive faces with every feeling visible
+the eyes do all the work (abhinaya)
+faces mostly turned away from the camera
+deadpan
+faces in profile only
+reaction shots carry each scene
+small realistic microexpressions
+faces seen only in shadow
+expression jumps between held drawn poses (anime limited animation)
+
+[music and sound: instrumentation]
+one solo instrument
+string quartet
+gamelan
+brass band
+a choir without words
+electronic drones and synthesizers
+a drum ensemble (West African)
+jazz trio
+Carnatic ensemble with violin and mridangam
+fiddle and accordion (European folk)
+full symphony orchestra
+koto and shakuhachi
+oud, qanun and frame drum (Arabic maqam)
+solo piano
+found-object percussion
+charango and panpipes (Andean)
+steel pan band
+plucked drone and voice (Hindustani dhrupad)
+
+[music and sound: density]
+wall to wall, never stopping
+one cue in the whole film
+sparse, a few notes per scene
+thick overlapping layers
+a single held drone throughout
+denser with each scene
+thick at the start, thinning to nothing
+full and empty by alternate scenes
+short stings on cuts only
+one theme stated, then only fragments of it
+
+[music and sound: where music is and is not]
+only under dialogue
+only where no one speaks
+only at the start and the end
+under every scene but one
+only during movement
+only in remembered or imagined passages
+only in the present, never in memory
+from the first frame to the last
+nowhere: the film is unscored
+only across scene changes
+
+[music and sound: diegesis]
+all music comes from a source inside the world
+all music is outside the world
+music starts inside the world and moves outside it
+outside music that a character seems to hear once
+a character hums what the score later plays
+musicians visible in the frame, as in theatre
+sung narration by a ballad singer (griot, bard, kathakar)
+characters sing their thoughts in song (Hindi studio cinema, stage musical)
+music from a recorded device inside the world
+percussion that answers every movement (Peking opera, kabuki geza)
+
+[music and sound: voices]
+full projected stage voices
+intimate close-microphone speech
+whispered throughout
+a narrator who also plays a part
+a chorus speaks some lines together
+voices recorded at a distance, full of room
+deliberately loose sync, as in post-dubbed cinema (Italian, Indian studio era)
+overlapping voices that interrupt each other
+flat uninflected readings (non-professional casting)
+speech half sung (recitative)
+one storyteller voices every character
+no narrator; nothing is said that a character does not say
+
+[music and sound: world sound]
+hyperreal close foley for every touch
+almost no world sound, only voices and music
+the offscreen place heard more than the onscreen one
+every action given a musical sound (cartoon mickey-mousing)
+heard through one character's ears
+loud ambience that voices fight against
+sounds arrive a beat before their pictures
+one recurring sound that changes meaning
+location sound with wind and handling noise (documentary)
+silence broken by single sounds
