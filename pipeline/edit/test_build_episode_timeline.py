@@ -1534,7 +1534,8 @@ class TimelineBuilderTest(unittest.TestCase):
             timing = json.loads((self.ep / f"work/assembly-v1/subtitle-{language}-timing.json").read_text())
             self.assertEqual([s.get("passage") for s in timing["shots"]], [None, "demo-s001", None, None])
         audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
-        self.assertEqual((audit["narrationCount"], audit["dialogueCount"]), (3, 1))
+        # The audit counts utterances, so the two narration halves count once.
+        self.assertEqual((audit["eventCount"], audit["narrationCount"], audit["dialogueCount"]), (4, 2, 1))
 
     def test_passage_must_continue_the_row_before_it_in_the_same_voice(self):
         cases = [

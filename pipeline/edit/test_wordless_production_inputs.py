@@ -78,6 +78,24 @@ class WordlessProductionInputsTest(unittest.TestCase):
         draft = json.loads((self.ep / 'work/alt/dialogue-draft.json').read_text())['items']
         self.assertNotIn('passage', draft[0])  # the paid draft shape is unchanged
 
+    def test_inventory_counts_each_half_of_a_passage_as_its_own_row(self):
+        self.write_board()
+        items = json.loads(self.overrides.read_text())
+        items['items']['demo-s003'] = dict(speaker='Character One', narration_hi='मैं यहाँ हूँ।',
+                                           narration_en='I am here.', reason=REASON)
+        items['items']['demo-s004'] = dict(items['items']['demo-s004'], passage='demo-s003')
+        self.overrides.write_text(json.dumps(items, ensure_ascii=False))
+        argv = ['prepare', str(self.ep), '--inventory-only', '--voice-id', 'demo-voice',
+                '--overrides', str(self.overrides)]
+        with mock.patch.object(sys, 'argv', argv), mock.patch('builtins.print'):
+            production.main()
+        work = self.ep / 'work/production-intake-v1'
+        inventory = json.loads((work / 'inventory.json').read_text())
+        draft = json.loads((work / 'dialogue-draft.json').read_text())['items']
+        # Each half is its own job, so the inventory counts rows, not utterances.
+        self.assertEqual([item['id'] for item in draft], ['demo-s003', 'demo-s004'])
+        self.assertEqual(inventory['dialogueCount'], 2)
+
     def test_inventory_routes_each_delivery(self):
         stills, records = [], []
         for scene in ITEMS:

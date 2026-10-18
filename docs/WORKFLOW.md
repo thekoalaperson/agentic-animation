@@ -55,6 +55,8 @@ The screenplay reader lists what the source contains and chooses no shots; how
 rows divide it is the director's call. A storyboard row may cite the units it
 draws on in `source_units`, and a row that continues the speech of the row
 before it may name that row in `passage`, each half keeping its own words. The
+compiler and timeline audits then count the pair as one utterance, while the
+production inventory still counts each row, since each half is its own job. The
 reader's `--units` report then shows reorderings, cuts, merges and changed
 lines as choices to see, not faults.
 

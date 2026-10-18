@@ -217,6 +217,8 @@ def main():
         if row['id'] in ingested:
             row['silentH3']=ingested[row['id']]
         row['eligibleForProductionPicture']=not bool(row['speaker'])
+    # The inventory counts rows, one job each, so both halves of a passage count here;
+    # the compiler's and the timeline's counts are utterances and count a passage once.
     save(work/'inventory.json',dict(episode=manifest['episode'],
          **({'storyboard':str(board_path.relative_to(ep))} if alternate_board else {}),
          boardSha256=sha(board_path),manifestSha256=sha(manifest_path),

@@ -2104,8 +2104,8 @@ def build_timeline(
         "timelineFingerprint": fingerprint,
         "runtimeSeconds": edit_plan["runtimeSeconds"],
         "eventCount": len(events),
-        "narrationCount": sum(row["kind"] == "narration" for row in events),
-        # A passage's second half continues an utterance rather than starting one.
+        # Both counts are utterances: a passage's second half continues one rather than starting one.
+        "narrationCount": sum(row["kind"] == "narration" and not row.get("passage") for row in events),
         "dialogueCount": sum(row["kind"] == "dialogue" and not row.get("passage") for row in events),
         **({"pictureCount": sum(row["kind"] == "picture" for row in events)}
            if any(row["kind"] == "picture" for row in events) else {}),
