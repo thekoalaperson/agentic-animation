@@ -775,7 +775,8 @@ def _resolve_transitions(
         else:
             tail, head = 0, 0
             shown_out, shown_in = frames - frames // 2, frames // 2
-        if shown_out > out_frames or shown_in > in_frames:
+        # A dip's fade-out reaches its colour on the shot's last frame, so it needs one frame before it.
+        if shown_out > out_frames - (row["kind"] != "dissolve") or shown_in > in_frames:
             raise ValueError(f"{label}: the {frames}-frame {row['kind']} is longer than a shot on one side of the cut")
         result.append({
             "after": after, "before": events[index_by_id[after] + 1]["id"], "kind": row["kind"],

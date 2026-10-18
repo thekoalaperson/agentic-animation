@@ -242,8 +242,8 @@ def apply_transitions(segments: list[dict], transitions: list[dict]) -> None:
                 or shown_out > outgoing["frames"] or shown_in > incoming["frames"]):
             raise RuntimeError(f"Transition after {transition.get('after')} has invalid frame counts")
         if kind in DIP_COLOURS:
-            if (tail, head) != (0, 0) or shown_out + shown_in != frames:
-                raise RuntimeError("A dip uses only frames the cut already shows")
+            if (tail, head) != (0, 0) or shown_out + shown_in != frames or shown_out >= outgoing["frames"]:
+                raise RuntimeError("A dip uses only frames the cut already shows, ending on its colour")
             if shown_out:
                 outgoing["fadeOut"] = {"frames": shown_out, "colour": DIP_COLOURS[kind]}
             if shown_in:
@@ -280,6 +280,9 @@ def group_dissolve_runs(runs: list[dict]) -> list[dict]:
     grouped = []
     for item in result:
         if "sources" not in item:
+            # An authored dissolve renders or refuses; it never falls back to a cut.
+            if any(key in item for key in ("dissolveIn", "dissolveOut")):
+                raise RuntimeError(f"Dissolve at {item['id']} has no run on its other side")
             grouped.append(item)
             continue
         parts = []

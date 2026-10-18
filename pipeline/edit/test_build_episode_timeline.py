@@ -1801,6 +1801,20 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertNotIn("sceneId", covered[0])  # never counted as its source scene's own picture
         self.assertEqual(sum(seg["frames"] for seg in segments), round(plan["runtimeSeconds"] * 24))
 
+    def test_picture_window_may_use_a_segment_listed_on_the_dialogue_row(self):
+        reaction = self.ep / "work/h3/demo-s003-reaction.mp4"
+        reaction.write_bytes(b"silent-reaction")
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s003"]["segments"] = [{
+            "source": str(reaction.relative_to(self.ep)), "sourceSha256": self.sha(reaction),
+            "in": 0, "out": 3, "role": "reaction", "verdict": "approved"}]
+        self.write_json(path, ledger)
+        self.set_output(pictureWindows=[self.window(1.0, 2.5, str(reaction.relative_to(self.ep)), 0.5)])
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        window = next(e for e in plan["events"] if e["id"] == "demo-s003")["pictureWindows"][0]
+        self.assertEqual((window["sourceKind"], window["sourceSceneId"]), ("segment", "demo-s003"))
+
     def test_picture_windows_are_refused_outside_accepted_frames_or_rules(self):
         h3 = "work/h3/demo-s004.mp4"
         cases = {
@@ -2108,6 +2122,22 @@ class TimelineBuilderTest(unittest.TestCase):
         broken[0]["dissolves"] = [7]
         with self.assertRaises(mix.MixError):
             mix.validate_render_runs(segments, broken, sum(r["frames"] for r in plain))
+        # A dissolve mark without a run on its other side refuses rather than becoming a cut.
+        unpaired = assembly.coalesce_render_segments(json.loads(json.dumps(segments)))
+        del unpaired[1]["dissolveIn"]
+        with self.assertRaisesRegex(RuntimeError, "no run on its other side"):
+            assembly.group_dissolve_runs(unpaired)
+
+    def test_dip_must_end_on_its_colour_inside_the_outgoing_shot(self):
+        # demo-s002 shows 33 frames; a 66-frame dip would fade all 33 and never reach black on the last.
+        self.set_transitions(("demo-s002", "dip-to-black", 66, "x"))
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any("longer than a shot" in e.get("error", "") for e in self.readiness()["errors"]))
+        self.set_transitions(("demo-s002", "dip-to-black", 64, "x"))
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(plan["transitions"][0]["outgoingFrames"], 32)
 
     def test_renderer_fades_and_dissolves_with_explicit_frame_counts(self):
         source = self.ep / "work/h3/demo-s001.mp4"
