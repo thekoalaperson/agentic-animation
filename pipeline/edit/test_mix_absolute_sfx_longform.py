@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -413,6 +415,83 @@ class MixerFixture(unittest.TestCase):
                                  "-f", "null", "-"], capture_output=True, check=True)
         record = mixer.second_pass_record(mixer.parse_loudnorm(result.stderr), 11.0)
         self.assertEqual(record["normalizationType"], "dynamic")
+
+    def test_plan_following_flags_only_contradictions_of_the_plan(self) -> None:
+        events = [{"id": f"demo-s00{i}", "shot": i, "kind": "narration", "start": float(i - 1),
+                   "end": float(i)} for i in range(1, 5)]
+        levels = {"voice": [-20, -20, -20, -20], "music": [-30, -34, -28, -40],
+                  "premaster": [-19, -19, -19, -19], "master": [-14, -14, -11, -14]}
+
+        def measure(path: Path):
+            values = levels[path.name]
+            return [(round(t / 10 - 0.3, 6), round(t / 10 + 0.1, 6), values[min(3, int(t // 10))])
+                    for t in range(0, 40)]
+
+        buses = {name: Path(name) for name in levels}
+        result = mixer.plan_following(
+            events, buses, [{"shots": [4, 4], "level": 0, "reason": "a held breath"}],
+            [{"shot": i, "envelopeTarget": v} for i, v in enumerate((0.3, 0.6, 0.6, 0.2), 1)],
+            measure=measure)
+        self.assertEqual([row["musicLufs"] for row in result["events"]], [-30.0, -34.0, -28.0, -40.0])
+        kinds = {(flag["event"], flag["kind"]) for flag in result["flags"]}
+        self.assertEqual(kinds, {("demo-s002", "authored-rise-falls"), ("demo-s004", "zero-breath-sounds"),
+                                 ("demo-s003", "mastering-moved-event-level")})
+        self.assertIsNone(result["listeningVerdict"])
+
+    def test_momentary_loudness_reads_ffmpeg_and_hears_silence(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is unavailable")
+        path = self.work / "tone-then-silence.wav"
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "aevalsrc='if(lt(t,2),0.1*sin(2*PI*440*t),0)':s=48000:d=4",
+                        "-ac", "2", str(path)], check=True)
+        windows = mixer.momentary_loudness(path)
+        tone = mixer.event_loudness(windows, 0.0, 2.0)
+        self.assertTrue(-30 < tone < -15, tone)
+        self.assertLessEqual(mixer.event_loudness(windows, 2.0, 4.0), mixer.SILENT_LUFS)
+        self.assertIsNone(mixer.event_loudness(windows, 1.0, 1.2))
+
+    def real_media(self) -> dict:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or b"libx264" not in subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                                          capture_output=True).stdout:
+            self.skipTest("ffmpeg with libx264 is unavailable")
+        quiet = "-v", "error", "-y"
+        subprocess.run([ffmpeg, *quiet, "-f", "lavfi", "-i", "color=c=gray:s=1280x720:r=24",
+                        "-t", "6", "-c:v", "libx264", "-an", str(self.picture)], check=True)
+        for path, expression, codec in ((self.voice, "0.2*sin(2*PI*220*t)", "pcm_s24le"),
+                                        (self.music, "0.05*sin(2*PI*330*t)", "pcm_s24le"),
+                                        (self.sfx_stem, "0", "pcm_f32le")):
+            subprocess.run([ffmpeg, *quiet, "-f", "lavfi", "-i", f"aevalsrc='{expression}':s=48000:d=6",
+                            "-ac", "2", "-c:a", codec, str(path)], check=True)
+        self.sfx_contract["sfxStem"]["sha256"] = mixer.sha256_file(self.sfx_stem)
+        write_json(self.sfx_contract_path, self.sfx_contract)
+        return self.build()
+
+    def test_execute_records_the_second_pass_and_refuses_dynamic_only_when_asked(self) -> None:
+        contract = self.real_media()
+        contract_path = self.assembly / "absolute-mix-contract.json"
+        write_json(contract_path, contract)
+        warnings = io.StringIO()
+        with contextlib.redirect_stderr(warnings):
+            audit = mixer.execute_mix(self.episode, contract_path, contract)
+        second = audit["loudnormSecondPass"]
+        self.assertEqual("dynamic gain" in warnings.getvalue(), second["normalizationType"] == "dynamic")
+        self.assertIn(second["normalizationType"], ("linear", "dynamic"))
+        self.assertEqual(second["targetLra"], 11.0)
+        bus = json.loads((self.assembly / "absolute-mix-bus-audit.json").read_text())
+        self.assertEqual([row["event"] for row in bus["planFollowing"]["events"]],
+                         ["scene-1", "scene-2", "scene-3"])
+        self.assertIsNone(bus["planFollowing"]["listeningVerdict"])
+        if second["normalizationType"] == "dynamic":
+            master = self.episode / contract["outputs"]["bodyMaster"]
+            master.unlink()
+            refusing = copy.deepcopy(contract)
+            refusing["settings"] = mixer.validate_settings({"settingsVersion": 2, "refuseDynamicMastering": True})
+            with self.assertRaisesRegex(mixer.MixError, "dynamic gain"):
+                mixer.execute_mix(self.episode, contract_path, refusing)
+            self.assertFalse(master.exists())
 
     def test_render_run_must_preserve_semantic_segments_exactly_once(self) -> None:
         path = self.assembly / "picture-render-runs.json"

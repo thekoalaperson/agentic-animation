@@ -858,6 +858,104 @@ def intelligibility(voice: Path, premaster: Path, events: list[dict[str, Any]]) 
     }
 
 
+SILENT_LUFS = -70.0  # BS.1770's absolute gate: anything quieter counts as silence
+
+
+def momentary_loudness(path: Path) -> list[tuple[float, float, float]]:
+    """BS.1770 momentary (400 ms) loudness every 100 ms, from ffmpeg's ebur128.
+
+    Returns ``(windowStart, windowEnd, lufs)`` in seconds on the file's clock.
+    """
+    result = run([
+        "ffmpeg", "-nostats", "-hide_banner", "-v", "error", "-i", str(path), "-map", "0:a:0",
+        "-af", "aresample=48000,asetnsamples=n=4800:p=0,ebur128=metadata=1,"
+               "ametadata=mode=print:key=lavfi.r128.M:file=-",
+        "-f", "null", "-",
+    ])
+    rows, at = [], None
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("frame:"):
+            at = float(line.rsplit("pts_time:", 1)[1])
+        elif line.startswith("lavfi.r128.M=") and at is not None:
+            # The value attached to the 100 ms frame starting at ``at`` covers
+            # the 400 ms that end when that frame ends.
+            rows.append((round(at - 0.3, 6), round(at + 0.1, 6), float(line.split("=", 1)[1])))
+    return rows
+
+
+def event_loudness(windows: list[tuple[float, float, float]], start: float, end: float) -> float | None:
+    """Energy mean of the momentary windows wholly inside one event, in LUFS.
+
+    ``None`` when the event is shorter than one window; ``SILENT_LUFS`` or
+    below means nothing measurable sounded there.
+    """
+    inside = [lufs for first, last, lufs in windows if first >= start - 1e-6 and last <= end + 1e-6]
+    if not inside:
+        return None
+    power = float(np.mean([10 ** ((value + 0.691) / 10) for value in inside]))
+    return round(-0.691 + 10 * math.log10(max(power, 1e-30)), 3)
+
+
+def plan_following(events: list[dict[str, Any]], buses: dict[str, Path], breaths: list[dict[str, Any]],
+                   wave_targets: list[dict[str, Any]] | None,
+                   measure: Callable[[Path], list[tuple[float, float, float]]] = momentary_loudness,
+                   ) -> dict[str, Any]:
+    """Measure each event on each bus and flag only contradictions of the plan.
+
+    A flag is raised when an authored zero-level breath still sounds on the
+    score bus, when the authored wave rises into an event but the score bus
+    falls, or when mastering moved one event's level against the rest. Nothing
+    here judges whether the mix sounds right.
+    """
+    measured = {name: measure(path) for name, path in buses.items()}
+    rows = []
+    for event in events:
+        row = {"event": event["id"], "kind": event["kind"]}
+        for name, windows in measured.items():
+            row[name + "Lufs"] = event_loudness(windows, float(event["start"]), float(event["end"]))
+        rows.append(row)
+    flags = []
+    zero_breath_shots = {shot for breath in breaths if float(breath.get("level", 1)) == 0
+                         for shot in range(int(breath["shots"][0]), int(breath["shots"][1]) + 1)}
+    for event, row in zip(events, rows):
+        music = row.get("musicLufs")
+        if event.get("shot") in zero_breath_shots and music is not None and music > SILENT_LUFS:
+            flags.append({"event": event["id"], "kind": "zero-breath-sounds",
+                          "detail": f"an authored level-0 breath measures {music} LUFS on the score bus"})
+    if wave_targets is not None and len(wave_targets) == len(rows):
+        for previous, current, before, after in zip(wave_targets, wave_targets[1:], rows, rows[1:]):
+            rise = float(current.get("envelopeTarget") or 0) / max(float(previous.get("envelopeTarget") or 0), 1e-9)
+            heard = (None if before.get("musicLufs") is None or after.get("musicLufs") is None
+                     or min(before["musicLufs"], after["musicLufs"]) <= SILENT_LUFS
+                     else after["musicLufs"] - before["musicLufs"])
+            if rise >= 1.12 and heard is not None and heard < -1.0:
+                flags.append({"event": after["event"], "kind": "authored-rise-falls",
+                              "detail": f"the wave raises the score {20 * math.log10(rise):.1f} dB into this event "
+                                        f"but the score bus falls {-heard:.1f} LU"})
+    if "premaster" in measured and "master" in measured:
+        offsets = [row["masterLufs"] - row["premasterLufs"] for row in rows
+                   if row.get("masterLufs") is not None and row.get("premasterLufs") is not None
+                   and min(row["masterLufs"], row["premasterLufs"]) > SILENT_LUFS]
+        if offsets:
+            median = float(np.median(offsets))
+            for row in rows:
+                if (row.get("masterLufs") is not None and row.get("premasterLufs") is not None
+                        and min(row["masterLufs"], row["premasterLufs"]) > SILENT_LUFS
+                        and abs(row["masterLufs"] - row["premasterLufs"] - median) > 1.0):
+                    flags.append({"event": row["event"], "kind": "mastering-moved-event-level",
+                                  "detail": f"mastering changed this event by "
+                                            f"{row['masterLufs'] - row['premasterLufs']:.1f} LU against the "
+                                            f"film's {median:.1f} LU"})
+    return {
+        "method": ("BS.1770 momentary loudness (ffmpeg ebur128), energy-averaged over the 400 ms windows "
+                   "wholly inside each event; the score bus is the music stem before sidechain ducking"),
+        "silentBelowLufs": SILENT_LUFS,
+        "events": rows,
+        "flags": flags,
+        "listeningVerdict": None,
+    }
+
+
 def packet_hash(path: Path) -> str:
     result = run(
         [
@@ -976,6 +1074,12 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
         or finite(delivered.get("input_tp"), "delivered true peak") > settings["targetTruePeakDbtp"] + 0.5
     ):
         raise MixError("delivered loudness or true peak is outside the acceptance window")
+    wave_targets = None
+    if "musicWaveAudit" in evidence:
+        wave_path = episode_path(episode, evidence["musicWaveAudit"]["path"], "music wave audit")
+        verify_hash(wave_path, evidence["musicWaveAudit"].get("sha256"), "music wave audit")
+        wave_audit = read_json(wave_path, "music wave audit")
+        wave_targets = wave_audit.get("eventTargets") if isinstance(wave_audit, dict) else None
     bus_audit = {
         "schemaVersion": 1,
         "mixerVersion": MIXER_VERSION,
@@ -990,6 +1094,11 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
             "loudness": first_pass,
         },
         "intelligibility": intelligibility(paths["voice"], outputs["premaster"], plan["events"]),
+        "planFollowing": plan_following(
+            plan["events"],
+            {"voice": paths["voice"], "music": paths["music"], "sfx": paths["sfxStem"],
+             "premaster": outputs["premaster"], "master": outputs["bodyMaster"]},
+            plan.get("musicBreaths", []), wave_targets),
         "scoreNotchAutomationAppliedOnlyToMusicBus": contract["scoreNotchAutomation"],
         "creativeApprovalGranted": False,
     }
