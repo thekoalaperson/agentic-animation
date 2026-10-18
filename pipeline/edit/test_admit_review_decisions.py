@@ -76,7 +76,7 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(event["admission"]["reviewExport"], "work/review/dialogue-review-v1.json")
         self.assertEqual(event["subtitleAudioAt"], 0.708333)  # the decided speech window was read
         summary = ready["reviewSummary"]["dialogue"]
-        self.assertEqual(summary["line"], "dialogue: 1 admitted, 1 agent-reviewed, 0 watched by a person")
+        self.assertEqual(summary["line"], "dialogue: 1 admitted, 1 agent-reviewed, 0 reviewed by a person")
         self.assertEqual(summary["methods"], {"full playback with sound": 1})
 
     def test_a_take_changed_after_its_decision_is_inadmissible(self):
@@ -180,7 +180,7 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(placement["reviewExport"], "work/review/score-review-v1.json")
         self.assertEqual(placement["reviewer"], {"kind": "human", "name": "a named listener"})
         self.assertEqual(ready["reviewSummary"]["score"]["line"],
-                         "score: 1 admitted, 0 agent-reviewed, 1 watched by a person")
+                         "score: 1 admitted, 0 agent-reviewed, 1 reviewed by a person")
 
     def test_score_decision_without_a_placement_is_reported_unplaced(self):
         self.make_score()

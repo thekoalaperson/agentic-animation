@@ -628,7 +628,7 @@ def _review_summary(lanes: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
                 if isinstance(method, str) and method.strip():
                     methods[method] = methods.get(method, 0) + 1
         parts = [f"{len(records)} admitted", f"{agent} agent-reviewed",
-                 f"{person} watched by a person"]
+                 f"{person} reviewed by a person"]
         if unrecorded:
             parts.append(f"{unrecorded} with no reviewer recorded")
         summary[lane] = {"admitted": len(records), "agentReviewed": agent,
