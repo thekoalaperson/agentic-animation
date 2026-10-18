@@ -8,14 +8,20 @@ import argparse
 import hashlib
 import json
 import math
-import platform
 import re
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _common import MediaWorkerRequired, require_media_worker
+
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
 
 
 def sha(path):
@@ -55,8 +61,7 @@ def main():
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args()
     tool_path=Path(__file__).resolve(); tool_sha=sha(tool_path)
-    assert platform.system()=='Linux', 'Production media decoding must run on GCP, not Mac'
-    run(['nvidia-smi','--query-gpu=name','--format=csv,noheader'])
+    gpu=require_media_worker('Seam audit media decoding')
     ep=a.episode.resolve(); review=(ep/a.review).resolve(); out=(ep/a.output).resolve()
     out.relative_to(ep/'work')
     assert not (out/'seam-audit.json').exists(), 'Version completed evidence rather than overwrite'
@@ -121,7 +126,7 @@ def main():
     assert sha(review)==review_sha
     assert sha(tool_path)==tool_sha, 'Seam tool changed during execution'
     result=dict(kind='source-bound-native-continuation-seam-audit',reviewSha256=review_sha,
-        toolSha256=tool_sha,computeHost=socket.gethostname(),
+        toolSha256=tool_sha,computeHost=socket.gethostname(),gpu=gpu,
         computeMethod='Software FFmpeg decoding/encoding on qualified GPU worker; no Mac media processing',
         continuousPlaybackPerformed=False,creativeApproval=False,
         limitations='Adjacent-frame differences and full decode are technical diagnostics, not perceptual smoothness certification.',

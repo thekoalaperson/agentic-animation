@@ -7,6 +7,9 @@ from pathlib import Path
 
 from export_bilingual_subtitles import build_synchronized_cues
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
 
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 

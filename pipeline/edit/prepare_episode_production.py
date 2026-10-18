@@ -19,6 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import _common
 from _common import profile_value
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
 WORKER_FONT = Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
 PREVIEW_SHEETS = 'sheets-preview-not-final'
 

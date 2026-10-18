@@ -9,6 +9,9 @@ import hashlib
 import json
 from pathlib import Path
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
 
 def build(ep, root, source_manifests, selected=None):
     families = {}

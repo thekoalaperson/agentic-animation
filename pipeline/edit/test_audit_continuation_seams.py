@@ -81,11 +81,19 @@ class ContinuationSeamContractTests(unittest.TestCase):
         values = np.arange(start, end) + (174 if path == self.child else 0)
         return np.broadcast_to(values[:, None, None, None], (end-start, 2, 2, 3)).astype(np.uint8)
 
+    @staticmethod
+    def worker(system):
+        def check(reason):
+            if system != "Linux":
+                raise seams.MediaWorkerRequired(reason + " must run on the qualified GPU worker")
+            return "GPU 0: synthetic"
+        return check
+
     def execute(self, rows=None, system="Linux"):
         self.review.write_text(json.dumps({"items": rows if rows is not None else [self.row]}))
         args = SimpleNamespace(episode=self.ep, review=self.review, output=self.out)
         with mock.patch.object(seams.argparse.ArgumentParser, "parse_args", return_value=args), \
-                mock.patch.object(seams.platform, "system", return_value=system), \
+                mock.patch.object(seams, "require_media_worker", side_effect=self.worker(system)), \
                 mock.patch.object(seams, "run", side_effect=self.command), \
                 mock.patch.object(seams, "probe", return_value={
                     "width": 1344, "height": 768, "nb_frames": "175", "avg_frame_rate": "24/1"}), \
@@ -119,6 +127,9 @@ class ContinuationSeamContractTests(unittest.TestCase):
             self.execute(system="Darwin")
         self.assertEqual(self.commands, [])
         self.assertEqual(self.frame_calls, [])
+
+    def test_worker_listing_is_recorded(self):
+        self.assertEqual(self.execute()["gpu"], "GPU 0: synthetic")
 
     def test_stale_source_hash_is_refused_before_decode(self):
         self.row["sourceBinding"]["parentSilentSourceSha256"] = "0" * 64
