@@ -344,15 +344,21 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.SubtitleExportError, "no voice or subtitle text"):
             self.export()
 
-    def link_passage(self, *, timing: bool = True) -> None:
+    def link_passage(self, *, timing: bool = True, dialogue: bool = False) -> None:
         plan = read_json(self.plan_path)
         plan["events"][2]["passage"] = "demo-s002"
+        if dialogue:
+            for event in plan["events"][1:3]:
+                event["kind"] = "dialogue"
         write_json(self.plan_path, plan)
-        if timing:
-            for path in (self.hi_path, self.en_path):
-                doc = read_json(path)
+        for path in (self.hi_path, self.en_path):
+            doc = read_json(path)
+            if timing:
                 doc["shots"][2]["passage"] = "demo-s002"
-                write_json(path, doc)
+            if dialogue:
+                for shot in doc["shots"][1:3]:
+                    shot.update(dialogue=True, speaker="CHARACTER ONE")
+            write_json(path, doc)
         sync = read_json(self.sync_path)
         sync["planSha256"] = exporter.sha256_file(self.plan_path)
         write_json(self.sync_path, sync)
@@ -368,6 +374,20 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         cues = english.read_text().split("\n\n")
         self.assertTrue(any("This is scene number 3." in cue for cue in cues))
         self.assertFalse(any("number 2." in cue and "number 3." in cue for cue in cues))
+
+    def test_dialogue_passage_halves_keep_their_own_cues_and_are_recorded(self) -> None:
+        self.link_passage(dialogue=True)
+        audit = self.export()
+        rows = {row["id"]: row for row in audit["coverage"]}
+        self.assertEqual(rows["demo-s003"]["passage"], "demo-s002")
+        self.assertNotIn("passage", rows["demo-s002"])
+        for language, second, first in (("hi", "संख्या 3 ", "संख्या 2 "), ("en", "number 3.", "number 2.")):
+            [subtitles] = self.output.glob(f"*-{language}.srt")
+            cues = subtitles.read_text().split("\n\n")
+            # The second half's cues carry only its own words, never the first half's.
+            own = [cue for cue in cues if second in cue]
+            self.assertTrue(own, language)
+            self.assertFalse(any(first in cue for cue in own), language)
 
     def test_timing_document_must_carry_the_plans_passage(self) -> None:
         self.link_passage(timing=False)

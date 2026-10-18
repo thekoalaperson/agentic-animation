@@ -212,7 +212,7 @@ class TimelineBuilderTest(unittest.TestCase):
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
 
-    def refresh_provenance(self):
+    def refresh_provenance(self, scene="demo-s003", review_name="dialogue-review.json"):
         narration_manifest = self.ep / "work/narration-hi-v1/manifest.json"
         narration = json.loads(narration_manifest.read_text())
         narration_state = {
@@ -230,12 +230,12 @@ class TimelineBuilderTest(unittest.TestCase):
 
         config = json.loads(self.config.read_text())
         canonical_dialogue_manifest = self.ep / config["dialogueManifest"]
-        dialogue_manifest = self.ep / config["dialogueOutputs"]["demo-s003"].get(
+        dialogue_manifest = self.ep / config["dialogueOutputs"][scene].get(
             "executionManifest", config["dialogueManifest"]
         )
         dialogue = json.loads(dialogue_manifest.read_text())
-        job = dialogue["jobs"][0]
-        output = self.ep / config["dialogueOutputs"]["demo-s003"]["path"]
+        job = dialogue["jobs"][0] if scene == "demo-s003" else next(j for j in dialogue["jobs"] if j["id"] == scene)
+        output = self.ep / config["dialogueOutputs"][scene]["path"]
         output_sha = self.sha(output)
         request = {
             "model": dialogue["model"],
@@ -279,7 +279,7 @@ class TimelineBuilderTest(unittest.TestCase):
                 "path": str(override.relative_to(self.ep)), "sha256": self.sha(override)
             })
         fingerprint = self.canonical_sha({"bindings": bindings, "media": output_sha})
-        review = self.ep / "work/review/dialogue-review.json"
+        review = self.ep / "work/review" / review_name
         self.write_json(review, {
             "schemaVersion": 2, "reviewType": "dialogue",
             "reviewFingerprint": fingerprint, "sourceBindings": bindings,
@@ -317,7 +317,7 @@ class TimelineBuilderTest(unittest.TestCase):
             if name == "demo-s001.mp4":
                 return timeline.MediaProbe(10.0, 10.0, None, 240, 24.0, 1, 0)
             return timeline.MediaProbe(3.0, 3.0, None, 72, 24.0, 1, 0)
-        if name == "demo-s003.mp4":
+        if name in ("demo-s002.mp4", "demo-s003.mp4"):
             return timeline.MediaProbe(5.0, 5.0, 5.0, 120, 24.0, 1, 1)
         raise AssertionError(path)
 
@@ -1535,6 +1535,53 @@ class TimelineBuilderTest(unittest.TestCase):
             self.assertEqual([s.get("passage") for s in timing["shots"]], [None, "demo-s001", None, None])
         audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
         # The audit counts utterances, so the two narration halves count once.
+        self.assertEqual((audit["eventCount"], audit["narrationCount"], audit["dialogueCount"]), (4, 2, 1))
+
+    def _speak_second_row_as_dialogue(self):
+        """Make demo-s002 a second reviewed dialogue job, so demo-s003 can continue it."""
+        self.rows[1]["speaker"] = "Character One"
+        self.write_rows(self.rows)
+        narration_manifest = self.ep / "work/narration-hi-v1/manifest.json"
+        narration = json.loads(narration_manifest.read_text())
+        narration["items"] = [item for item in narration["items"] if item["shotId"] != "demo-s002"]
+        self.write_json(narration_manifest, narration)
+        ledger_path = self.ep / "work/h3-review-ledger-v1.json"
+        ledger = json.loads(ledger_path.read_text())
+        ledger["entries"]["demo-s002"] = {"pictureRoute": "grok-dialogue", "segments": []}
+        self.write_json(ledger_path, ledger)
+        prompt = self.ep / "work/grok-dialogue-v1/prompts/demo-s002.txt"
+        prompt.write_text("offline prompt two", encoding="utf-8")
+        manifest = json.loads(self.dialogue_manifest.read_text())
+        manifest["jobs"].append(dict(manifest["jobs"][0], id="demo-s002", hindi="मैं यहाँ हूँ।",
+                                     prompt=str(prompt.relative_to(self.ep)), promptSha256=self.sha(prompt),
+                                     outputStem="work/grok/demo-s002"))
+        self.write_json(self.dialogue_manifest, manifest)
+        (self.ep / "work/grok/demo-s002.mp4").write_bytes(b"dialogue-two")
+        config = json.loads(self.config.read_text())
+        config["dialogueOutputs"]["demo-s002"] = {"path": "work/grok/demo-s002.mp4", "verdict": "approved",
+                                                  "speechWindow": {"start": 1.0, "end": 3.5}}
+        self.write_json(self.config, config)
+        self.refresh_provenance()
+        self.refresh_provenance("demo-s002", "dialogue-review-two.json")
+
+    def test_dialogue_passage_counts_once_and_keeps_each_halfs_words(self):
+        self._speak_second_row_as_dialogue()
+        rows = [dict(r) for r in self.rows]
+        rows[2]["passage"] = "demo-s002"
+        self.write_rows(rows)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        first, second = plan["events"][1:3]
+        self.assertEqual((first["kind"], second["kind"]), ("dialogue", "dialogue"))
+        self.assertNotIn("passage", first)
+        self.assertEqual(second["passage"], "demo-s002")
+        self.assertEqual((first["subtitleTextHi"], second["subtitleTextHi"]), ("हिन्दी demo-s002", "हिन्दी demo-s003"))
+        self.assertEqual((first["audio"], second["audio"]), ("work/grok/demo-s002.mp4", "work/grok/demo-s003.mp4"))
+        for language in ("hi", "en"):
+            timing = json.loads((self.ep / f"work/assembly-v1/subtitle-{language}-timing.json").read_text())
+            self.assertEqual([s.get("passage") for s in timing["shots"]], [None, None, "demo-s002", None])
+            self.assertEqual([s["dialogue"] for s in timing["shots"]], [False, True, True, False])
+        audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
         self.assertEqual((audit["eventCount"], audit["narrationCount"], audit["dialogueCount"]), (4, 2, 1))
 
     def test_passage_must_continue_the_row_before_it_in_the_same_voice(self):
