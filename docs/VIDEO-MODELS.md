@@ -16,11 +16,11 @@ operators or third parties, not confirmed here).
 |---|---|---|
 | Stills | The registered target is a PNG; the row's `size` is recorded, not enforced. | |
 | H3 picture | 1344x768 or 768x1344, short edge 768. Staging warns when a source's aspect is more than 0.03 from the planned output. | Self-hosted; see H3 below. |
-| Grok dialogue | Sends `resolution: 720p` and `aspect_ratio: 16:9` with one still. After the clip is paid for, refuses any landed clip narrower than 1200x675 or more than 0.03 from 16:9. The dry run warns when a still is more than 0.03 from 16:9. | `aspect_ratio` "is invalid if it is a single image" (page, 2026-10-18). Whether output follows the still's geometry is not stated and has not been qualified here. |
+| Grok dialogue | A version 2 manifest sends `resolution: 720p` and `aspect_ratio: 16:9`; a version 3 manifest sends the resolution and ratio it froze from the runner's table. After the clip is paid for, refuses a landed clip below 0.9375 of the nominal size (1200x675 at 720p 16:9) or more than 0.03 from the frozen ratio. The dry run warns when a still is more than 0.03 from that ratio. | `aspect_ratio` "is invalid if it is a single image" (page, 2026-10-18). Whether output follows the still's geometry is not stated and has not been qualified here. |
 | Delivery | 1920x1080 long form, 1080x1920 Short. | |
 
-Because the dialogue route sends one image, a still far from 16:9 risks a clip
-that is refused after payment. `pipeline/derive_still.py` can crop, pad or
+Because a job without references sends one image, a still far from the frozen
+ratio risks a clip that is refused after payment. `pipeline/derive_still.py` can crop, pad or
 scale a registered still first.
 
 ## H3 picture (self-hosted)
@@ -29,10 +29,13 @@ Runner (code: `h3/stage_finite.py`, `h3/box/finite_client.py`):
 
 - One non-empty prompt per item, 4 to 15 seconds, short edge 768,
   `steps` of 20, 30 or 50, and an output of 1344x768 or 768x1344.
-- `expectedFrames` is at most 400 and within 0.75 s of `seconds` at 24 fps. The
-  landed clip must have exactly that many frames. When a project names no
+- `expectedFrames` is at most 400, within 0.75 s of `seconds` at 24 fps, and on
+  the 17n+5 grid; staging refuses any other count before GPU work. The landed
+  clip must have exactly that many frames. When a project names no
   `qualifiedRequest`, `build_measured_deficit_manifest.py` defaults to 7 seconds
-  at 175 frames; that is a default, not the only length.
+  at 175 frames; that is a default, not the only length. For a length outside
+  its qualified table it writes an `unqualified` 17n+5 candidate, snapping down
+  or up only as `qualifiedRequest.frameSnap` says.
 - The client sends `task: fl2va` with the first still as a keyframe at
   `frame_index` 0, `flow_shift` 12.0 and `audio_flow_shift` 3.0. Generated
   audio is stripped later.
@@ -44,7 +47,8 @@ Runner (code: `h3/stage_finite.py`, `h3/box/finite_client.py`):
 
 Provider: operators report that valid lengths follow 17n+5 frames (175 = 17x10+5)
 and that a wrong count fails only after the GPU has rendered it (*unverified*;
-the primary page cited for it was unavailable). Kie also hosts H3 as
+the primary page cited for it was unavailable). The runner enforces the grid on
+that report; the rule's source remains unconfirmed here. Kie also hosts H3 as
 `minimax-h3/image-to-video`: 4 to 15 s, `768P` or `2K`, first or last frame,
 audio always on, prompt up to 7000 characters (page, 2026-10-18). No runner here
 sends to it.
@@ -59,13 +63,26 @@ path ending on an authored endpoint are equals; neither is the default.
 
 Runner (code: `kie_dialogue_finite.py`, `dialogue_provenance.py`):
 
-- Route `grok15` (`grok-imagine-video-1-5-preview`), `720p`, `16:9`, integer
-  `durationSeconds` from 1 to 15, one still, no references, no last frame.
-  The provenance check requires an empty reference list.
+- Route `grok15` (`grok-imagine-video-1-5-preview`), integer `durationSeconds`
+  from 1 to 15, no last frame. A version 2 manifest is fixed at `720p` and
+  `16:9` with one still. A version 3 manifest reads its model, resolution and
+  aspect ratio from a dated table in the runner (`--print-schema` shows it, with
+  each value marked exercised or provider-published); only 720p and 16:9 are
+  exercised.
+- A version 3 job may send up to six `references` after its first frame, each
+  hash-bound. They are recorded as provenance version 3, and the timeline
+  admits the take only with exactly those hashes in order. A job without
+  references keeps the version 2 request byte for byte. The dry run reports,
+  without refusing, references at 1080p (the page allows one image there) and
+  every unexercised value; references stay unqualified until a one-clip pilot.
 - The prompt file must contain the job's exact Devanagari line and stay within
-  4096 characters. The still must be at most 20 MB.
+  4096 characters. Each image must be at most 20 MB.
 - After landing: the clip must hold picture and audio, decode fully, last 0.8 to
-  1.25 times the requested seconds, and pass the geometry check above.
+  1.25 times the requested seconds, and pass the geometry check above. Its
+  technical audit records how far frame 0 is from the still, as a number with
+  no threshold.
+- `--print-requests` adds each provider body to the dry run with placeholder
+  URLs and uploads nothing.
 
 Provider (page, 2026-10-18, `docs.kie.ai/market/grok-imagine/1-5-preview`):
 `image_urls` up to 7, only one at 1080p, JPEG/PNG/WebP up to 20 MB; `duration`
@@ -75,8 +92,8 @@ generated and spoken from dialogue in the prompt; no last-frame input; prompt up
 to 4096 characters. The page does not document `@image(n)` prompt syntax for
 this model; the older `grok-imagine/image-to-video` page does.
 
-References, 1080p and other aspects would each change what the runner sends and
-what the timeline admits, so each needs a paid pilot before a batch relies on it.
+References, 1080p and other aspects are sendable under a version 3 manifest but
+none is exercised, so each needs a paid pilot before a batch relies on it.
 
 What one dialogue job sends, with thin demo content and a placeholder URL:
 
@@ -98,6 +115,9 @@ What one dialogue job sends, with thin demo content and a placeholder URL:
 Each is callable directly through `kie_video.py`. No finite runner or approval
 lane in this checkout uses them, and none is exercised for Hindi. Every line is
 *code*; re-verify the provider page before a first paid call.
+`kie_video.py --print-request` shows the body a call would send, with
+placeholder URLs, and touches no credential, wallet or recovery record;
+`--resume-only` polls a task already recorded and never creates one.
 
 - `grok`: `grok-imagine/image-to-video`; first frame plus `--ref` images in
   `image_urls`; aspect forced to 16:9 when references are present. Page
@@ -134,8 +154,11 @@ lane in this checkout uses them, and none is exercised for Hindi. Every line is
 - **Pending record mismatch or legacy pending record.** The inputs or options
   changed after a paid POST. Resolve the recorded task before changing anything.
 - **Provider failure.** The record becomes `GENERATION_FAILED` with the
-  provider's response. The dialogue runner halts the batch rather than posting
-  again; a retry is a new paid request.
+  provider's response. The dialogue runner skips that job, appends its facts to
+  `refusals.jsonl`, finishes the others and reports `PARTIAL`; it still stops
+  after three definite failures in a row or when a whole concurrency group
+  fails. A retry is a new paid request: `--retry-failed` posts it only under a
+  version 3 approval record with a retry budget.
 - **Refused after landing.** Wrong geometry, length or missing audio. The clip
   was paid for; keep it and its sidecar, and change the still or the request
   before another attempt.

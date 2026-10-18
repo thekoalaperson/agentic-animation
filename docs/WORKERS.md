@@ -12,9 +12,13 @@ media runs anywhere ffmpeg runs, through the explicit `--preview` and
 Hosted provider calls are HTTP work: `kie_dialogue_finite.py`,
 `kie_music_finite.py` and `eleven_batch_finite.py` are the canonical entry points
 and the `run_*_gpu.py` wrappers a remote convenience. Today dialogue submission
-and those wrappers still check for the worker. The dialogue runner and both
-wrappers check the authority hash and write a credit preflight and an execution
-record; the music and narration finite runners check no authority hash.
+and those wrappers still check for the worker; dry runs, freezes, `--print-schema`
+and dialogue `--print-requests` run anywhere. All three finite runners check a
+manifest's authority hash when it binds one, in the dry run as well as before
+submission, and the two wrappers refuse a manifest that binds none. The
+dialogue runner and both wrappers write attempt-numbered credit preflights, and
+the wrappers attempt-numbered execution receipts, so a resume adds a record
+instead of replacing one.
 Model runtimes remain separate:
 
 | Lane | Runtime requirements |

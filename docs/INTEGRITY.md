@@ -49,9 +49,15 @@ it, the rights basis, and `rights.providerUpload`. That sidecar is a
 declaration. Its maker and rights fields make a false claim a recorded false
 statement; they are not proof and not a bypass of any measured or review check.
 `providerUpload: forbidden` makes the shared uploader refuse the file, which
-guards against an accidental upload and is not DRM. It checks only the exact
+guards against an accidental upload and is not DRM. The same refusal reads the
+rights a still's `.imagegen.json`, `.still.json` or `.derive.json` sidecar
+declares. It checks only the exact
 path handed to the uploader: an extracted frame, a conformed or stripped copy,
-or any other file derived from it carries no sidecar and is not refused.
+or any other file derived from it carries no sidecar and is not refused, except
+a still made by `derive_still.py`, whose sidecar carries its parent's rights.
+Supplied picture reaches the cut through a version-2 ledger segment whose
+origin names its sidecar; a supplied voice take or score cue has no admission
+route into the timeline yet.
 
 ## Jobs and spending
 
@@ -67,7 +73,9 @@ frozen bytes, so none of them may change between the freeze and the last
 reconciled task. Change a bound file and you are making a new manifest, which
 needs its own approval record. Each runner's `--freeze` writes the manifest
 with these hashes, and a pilot is simply a smaller frozen manifest. A later
-manifest may list it under `siblingManifests` so that no job is paid for twice.
+dialogue manifest may list it under `siblingManifests`, and the runner then
+refuses any job ID or output path the two share, so that no job is paid for
+twice.
 
 A price is evidence with a source. Record the provider's own page for the exact
 model and resolution, its URL, and the UTC time you read it. Once a batch lands,
