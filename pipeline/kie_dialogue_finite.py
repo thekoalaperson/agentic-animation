@@ -94,6 +94,39 @@ FIXED_HEADER = {
 }
 PRICING_FIELDS = {"creditsPerSecond", "verifiedAtUtc", "evidence"}
 
+# Version 3 reads the model, resolution and aspect ratio from the manifest,
+# drawn from this table, and its pricing block names the model and resolution
+# the rate was read for. Version 2 keeps FIXED_HEADER exactly. Values the
+# provider publishes but no batch has run are labelled so; adding one needs a
+# dated reading of the provider's page, never a guess.
+V3_PRICING_FIELDS = PRICING_FIELDS | {"model", "resolution"}
+REFERENCE_FIELDS = {"path", "sha256"}
+ROUTE_VALUES = {
+    "grok-imagine-video-1-5-preview": {
+        "route": "grok15",
+        "providerPage": "https://docs.kie.ai/market/grok-imagine/1-5-preview (read 2026-10-18)",
+        "resolutions": {"720p": "exercised",
+                        "480p": "provider-published, unexercised",
+                        "1080p": "provider-published, unexercised"},
+        "aspectRatios": {"16:9": "exercised",
+                         "9:16": "provider-published, unexercised",
+                         "1:1": "provider-published, unexercised",
+                         "3:2": "provider-published, unexercised",
+                         "2:3": "provider-published, unexercised"},
+        # The page allows seven images; the first frame is one of them.
+        "maxReferences": 6,
+        "notes": [
+            "The provider page says aspect_ratio is ignored for a single image, so a "
+            "no-reference clip's geometry follows its still; a 4:3 film needs 4:3 stills.",
+            "The provider page says only one image is supported at 1080p. References at "
+            "1080p are reported by the dry run, not refused, until a pilot settles it.",
+            "Whether image 1 still pins the first frame when references are sent, and how "
+            "@image(n) prompt syntax behaves, are unqualified until a one-clip paid pilot.",
+            "auto is not offered: the runner checks landed geometry against the frozen ratio.",
+        ],
+    },
+}
+
 
 def schema() -> dict[str, Any]:
     """The frozen execution manifest contract, read from the validator's own sets."""
@@ -123,6 +156,18 @@ def schema() -> dict[str, Any]:
         "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
         "approvalLane": APPROVAL_LANE,
         "approvalScope": ["jobs", "generatedSeconds", "credits"],
+        "version3": {
+            "meaning": "model, resolution and aspectRatio are read from the manifest; version 2 "
+                       "keeps fixedValues exactly",
+            "fixedValues": {"provider": FIXED_HEADER["provider"],
+                            "language": FIXED_HEADER["language"]},
+            "allowedValues": ROUTE_VALUES,
+            "pricingFields": sorted(V3_PRICING_FIELDS),
+            "optionalJobFields": {
+                "references": "[{path, sha256}] project images sent after the first frame, "
+                              "in order (at most maxReferences); recorded as provenance version 3",
+            },
+        },
     }
 
 
@@ -180,19 +225,76 @@ def require_sha(value: Any, label: str) -> str:
 
 
 def execution_request(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    request = {
         "version": 1,
         "jobId": row["id"],
         "executionManifestSha256": plan["manifestSha256"],
-        "model": "grok-imagine-video-1-5-preview",
+        "model": plan["model"],
         "sourceSha256": row["sourceSha256"],
         "promptSha256": row["promptSha256"],
         "durationSeconds": row["durationSeconds"],
-        "resolution": "720p",
-        "aspectRatio": "16:9",
+        "resolution": plan["resolution"],
+        "aspectRatio": plan["aspectRatio"],
         "audio": True,
         "outputStem": row["outputStem"],
     }
+    if row["referenceSha256s"]:
+        # Absent references keep the version 1 request byte for byte.
+        request.update(version=2, referenceSha256s=list(row["referenceSha256s"]))
+    return request
+
+
+def record_version(row: dict[str, Any]) -> int:
+    """kie_video.py writes provenance version 3 exactly when references are sent."""
+    return 3 if row["referenceSha256s"] else 2
+
+
+def check_header(doc: dict[str, Any]) -> tuple[int, set[str]]:
+    """Validate the manifest header; return its version and the job field sets allowed."""
+    version = doc.get("version")
+    if version == 2:
+        for key, expected in {**FIXED_HEADER, "episode": EPISODE_CODE}.items():
+            if doc.get(key) != expected:
+                raise PlanError(f"execution manifest {key} must be {expected!r}")
+        return 2, PRICING_FIELDS
+    if version != 3:
+        raise PlanError("execution manifest version must be 2 (fixed 720p 16:9) or 3 (frozen values)")
+    fixed = {key: FIXED_HEADER[key] for key in ("provider", "language")}
+    for key, expected in {**fixed, "episode": EPISODE_CODE}.items():
+        if doc.get(key) != expected:
+            raise PlanError(f"execution manifest {key} must be {expected!r}")
+    values = ROUTE_VALUES.get(doc.get("model"))
+    if values is None:
+        raise PlanError(f"execution manifest model must be one of {sorted(ROUTE_VALUES)}")
+    if doc.get("route") != values["route"]:
+        raise PlanError(f"execution manifest route must be {values['route']!r} for {doc['model']}")
+    if doc.get("resolution") not in values["resolutions"]:
+        raise PlanError(f"resolution must be one of {sorted(values['resolutions'])}")
+    if doc.get("aspectRatio") not in values["aspectRatios"]:
+        raise PlanError(f"aspectRatio must be one of {sorted(values['aspectRatios'])}")
+    return 3, V3_PRICING_FIELDS
+
+
+def check_references(value: Any, job_id: str, maximum: int) -> list[tuple[Path, str]]:
+    if not isinstance(value, list) or not value:
+        raise PlanError(f"{job_id}: references must be a non-empty list; omit the field for none")
+    if len(value) > maximum:
+        raise PlanError(f"{job_id}: at most {maximum} references follow the first frame")
+    found: list[tuple[Path, str]] = []
+    for position, entry in enumerate(value):
+        label = f"{job_id}.references[{position}]"
+        if not isinstance(entry, dict) or set(entry) != REFERENCE_FIELDS:
+            raise PlanError(f"{label} must be exactly {{path, sha256}}")
+        path = project_path(entry["path"], label, EPISODE)
+        digest = require_sha(entry["sha256"], f"{label}.sha256")
+        if not path.is_file() or sha256(path) != digest:
+            raise PlanError(f"{label} missing or hash changed: {path}")
+        if path.stat().st_size > 20 * 1024 * 1024:
+            raise PlanError(f"{label} exceeds provider image limit")
+        if path in {known for known, _ in found}:
+            raise PlanError(f"{label} repeats a reference")
+        found.append((path, digest))
+    return found
 
 
 def check_siblings(value: Any, manifest_path: Path, ids: set[str], stems: set[Path]) -> None:
@@ -235,18 +337,18 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
         missing = sorted(ROOT_FIELDS - set(doc))
         extra = sorted(set(doc) - ROOT_FIELDS - OPTIONAL_ROOT_FIELDS)
         raise PlanError(f"execution manifest schema mismatch; missing={missing}, extra={extra}")
-    expected_header = {**FIXED_HEADER, "episode": EPISODE_CODE}
-    for key, expected in expected_header.items():
-        if doc.get(key) != expected:
-            raise PlanError(f"execution manifest {key} must be {expected!r}")
+    version, pricing_fields = check_header(doc)
     if not isinstance(doc.get("financialApproval"), bool):
         raise PlanError("financialApproval must be boolean")
     if not isinstance(doc.get("financialState"), str) or not doc["financialState"]:
         raise PlanError("financialState must be a non-empty string")
 
     pricing = doc.get("pricing")
-    if not isinstance(pricing, dict) or set(pricing) != PRICING_FIELDS:
-        raise PlanError("pricing must bind a verified rate, UTC date and evidence")
+    if not isinstance(pricing, dict) or set(pricing) != pricing_fields:
+        raise PlanError("pricing must bind a verified rate, UTC date and evidence"
+                        + (", and the model and resolution it was read for" if version == 3 else ""))
+    if version == 3 and (pricing["model"], pricing["resolution"]) != (doc["model"], doc["resolution"]):
+        raise PlanError("pricing was read for a different model or resolution than this manifest sends")
     rate = pricing["creditsPerSecond"]
     if (isinstance(rate, bool) or not isinstance(rate, (int, float))
             or not math.isfinite(rate) or rate <= 0):
@@ -282,8 +384,11 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
     normalized: list[dict[str, Any]] = []
     total = 0
     for position, raw in enumerate(jobs):
-        if not isinstance(raw, dict) or set(raw) != JOB_FIELDS:
-            raise PlanError(f"job {position} fields must be exactly {sorted(JOB_FIELDS)}")
+        if not isinstance(raw, dict) or not (
+                set(raw) == JOB_FIELDS
+                or (version == 3 and set(raw) == JOB_FIELDS | {"references"})):
+            raise PlanError(f"job {position} fields must be exactly {sorted(JOB_FIELDS)}"
+                            + (" plus optional references" if version == 3 else ""))
         job_id = raw.get("id")
         if not isinstance(job_id, str) or not ID.fullmatch(job_id) or job_id in ids:
             raise PlanError(f"job {position} has duplicate or malformed id: {job_id!r}")
@@ -315,8 +420,13 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
             raise PlanError(f"{job_id}: exact Hindi missing or provider prompt limit exceeded")
         if source.stat().st_size > 20 * 1024 * 1024:
             raise PlanError(f"{job_id}: source exceeds provider image limit")
+        references = (check_references(raw["references"], job_id,
+                                       ROUTE_VALUES[doc["model"]]["maxReferences"])
+                      if "references" in raw else [])
         row = dict(raw)
-        row.update(sourcePath=source, promptPath=prompt, outputPath=stem)
+        row.update(sourcePath=source, promptPath=prompt, outputPath=stem,
+                   referencePaths=[path for path, _ in references],
+                   referenceSha256s=[digest for _, digest in references])
         normalized.append(row)
         total += duration
 
@@ -335,6 +445,8 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
     plan = {
         "manifestPath": manifest_path,
         "manifestSha256": sha256(manifest_path),
+        "version": version, "model": doc["model"],
+        "resolution": doc["resolution"], "aspectRatio": doc["aspectRatio"],
         "financialApproval": doc["financialApproval"],
         "financialState": doc["financialState"],
         "jobs": normalized,
@@ -347,7 +459,21 @@ def load_plan(manifest_path: Path, max_generated_seconds: int) -> dict[str, Any]
     return plan
 
 
-def validate_media(path: Path, expected_duration: int) -> dict[str, Any]:
+def minimum_geometry(resolution: str, aspect_ratio: str) -> tuple[float, float]:
+    """The smallest landed width and height accepted for a frozen resolution and ratio.
+
+    The nominal short edge is the resolution's number; 0.9375 of each nominal
+    side is the margin version 2 always allowed (1200x675 for 720p 16:9).
+    """
+    short = int(resolution.rstrip("p"))
+    across, down = (int(part) for part in aspect_ratio.split(":"))
+    ratio = across / down
+    nominal = (short * ratio, short) if ratio >= 1 else (short, short / ratio)
+    return nominal[0] * 0.9375, nominal[1] * 0.9375
+
+
+def validate_media(path: Path, expected_duration: int, resolution: str = "720p",
+                   aspect_ratio: str = "16:9") -> dict[str, Any]:
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of",
@@ -364,8 +490,11 @@ def validate_media(path: Path, expected_duration: int) -> dict[str, Any]:
                 f"duration {duration:.3f}s does not match requested {expected_duration}s: {path}")
         width = int(video[0].get("width") or 0)
         height = int(video[0].get("height") or 0)
-        if width < 1200 or height < 675 or abs(width / max(height, 1) - 16 / 9) > 0.03:
-            raise PlanError(f"video is not a valid 720p-class 16:9 result: {path}")
+        min_width, min_height = minimum_geometry(resolution, aspect_ratio)
+        across, down = (int(part) for part in aspect_ratio.split(":"))
+        if (width < min_width or height < min_height
+                or abs(width / max(height, 1) - across / down) > 0.03):
+            raise PlanError(f"video is not a valid {resolution}-class {aspect_ratio} result: {path}")
         subprocess.run(
             ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
              "-map", "0:a:0", "-f", "null", "-"], check=True,
@@ -416,7 +545,7 @@ def validate_request_envelope(record: dict[str, Any], expected: dict[str, Any],
 
 
 def validate_local_envelope(record: dict[str, Any], expected: dict[str, Any],
-                            label: str) -> None:
+                            label: str, references: list[str] = ()) -> None:
     local = record.get("localRequest")
     local_sha = record.get("localRequestSha256")
     if (not isinstance(local, dict) or not isinstance(local_sha, str)
@@ -441,19 +570,22 @@ def validate_local_envelope(record: dict[str, Any], expected: dict[str, Any],
     input_hashes = local.get("inputHashes")
     if not isinstance(input_hashes, dict) or input_hashes.get("primary") != expected["sourceSha256"]:
         raise PlanError(f"{label}: local primary source hash is invalid")
+    if (input_hashes.get("references") != list(references) or input_hashes.get("last") is not None
+            or input_hashes.get("videos") != []):
+        raise PlanError(f"{label}: local input hashes differ from the frozen still and references")
 
 
 def expected_record(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     return {
-        "model": "grok-imagine-video-1-5-preview",
+        "model": plan["model"],
         "jobId": row["id"],
         "executionManifestSha256": plan["manifestSha256"],
         "executionRequestSha256": row["executionRequestSha256"],
         "sourceSha256": row["sourceSha256"],
         "promptSha256": row["promptSha256"],
         "durationSeconds": row["durationSeconds"],
-        "resolution": "720p",
-        "aspectRatio": "16:9",
+        "resolution": plan["resolution"],
+        "aspectRatio": plan["aspectRatio"],
         "audio": True,
         "promptText": row["promptPath"].read_text(encoding="utf-8").strip(),
     }
@@ -466,16 +598,16 @@ def validate_completed(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, A
     meta = read_object(sidecar, f"{row['id']} sidecar")
     expected = expected_record(plan, row)
     fields = {
-        "provenanceVersion": 2,
+        "provenanceVersion": record_version(row),
         "provider": "kie.ai",
         **{key: value for key, value in expected.items() if key != "promptText"},
     }
     for key, value in fields.items():
         if meta.get(key) != value:
             raise PlanError(f"{row['id']}: sidecar {key} does not match frozen job")
-    validate_local_envelope(meta, expected, row["id"])
+    validate_local_envelope(meta, expected, row["id"], row["referenceSha256s"])
     _, fingerprint = validate_request_envelope(meta, expected, row["id"])
-    media = validate_media(video, row["durationSeconds"])
+    media = validate_media(video, row["durationSeconds"], plan["resolution"], plan["aspectRatio"])
     if meta.get("outputSha256") != media["sha256"] or meta.get("sha256") != media["sha256"]:
         raise PlanError(f"{row['id']}: output bytes do not match the sidecar")
     task_id = meta.get("taskId")
@@ -483,7 +615,33 @@ def validate_completed(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         raise PlanError(f"{row['id']}: sidecar lacks taskId")
     return {"id": row["id"], **media, "taskId": task_id,
             "requestFingerprint": fingerprint, "resumed": True,
-            "credits": meta.get("credits"), "creditsSource": meta.get("creditsSource")}
+            "credits": meta.get("credits"), "creditsSource": meta.get("creditsSource"),
+            "firstFrame": first_frame_difference(video, row["sourcePath"])}
+
+
+FRAME_SCALE = (480, 270)
+
+
+def first_frame_difference(video: Path, still: Path) -> dict[str, Any]:
+    """How far landed frame 0 is from the source still; a report, never a refusal.
+
+    The arithmetic is the continuation seam audit's: both images scaled to
+    480x270 RGB and compared by mean absolute channel difference (0-255).
+    """
+    import numpy as np
+    width, height = FRAME_SCALE
+    def decode(path: Path, *frame_args: str):
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), *frame_args, "-frames:v", "1",
+             "-vf", f"scale={width}:{height}", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"],
+            check=True, capture_output=True).stdout
+        return np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3)).astype(np.float32)
+    try:
+        difference = float(np.mean(np.abs(decode(video) - decode(still))))
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        return {"method": "unmeasured", "error": str(exc)[-300:]}
+    return {"method": "mean absolute RGB difference at 480x270, frame 0 against the source still",
+            "meanAbsoluteDifference": round(difference, 4), "note": "report only; no threshold"}
 
 
 PRICE_VARIANCE_REPORT_TOLERANCE = 1.25
@@ -524,6 +682,23 @@ def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) ->
     return report
 
 
+def plan_warnings(plan: dict[str, Any]) -> list[str]:
+    """Facts worth reading before paying; none of them refuses."""
+    warnings = []
+    referenced = [row["id"] for row in plan["jobs"] if row["referenceSha256s"]]
+    if referenced and plan["resolution"] == "1080p":
+        warnings.append("the provider page says only one image is supported at 1080p; these jobs "
+                        f"send references: {referenced}")
+    labels = ROUTE_VALUES[plan["model"]]
+    for kind, value in (("resolutions", plan["resolution"]), ("aspectRatios", plan["aspectRatio"])):
+        if labels[kind][value] != "exercised":
+            warnings.append(f"{value} is {labels[kind][value]} on this route")
+    if referenced:
+        warnings.append("references are unqualified on this route until a one-clip pilot "
+                        "records how image 1 and the references behave")
+    return warnings
+
+
 def estimated_cost(plan: dict[str, Any]) -> dict[str, Any]:
     credits = plan["totalSeconds"] * plan["pricing"]["creditsPerSecond"]
     usd = usd_per_credit()
@@ -537,7 +712,7 @@ def validate_pending(plan: dict[str, Any], row: dict[str, Any], path: Path,
     record = read_object(path, f"{row['id']} pending recovery record")
     expected = expected_record(plan, row)
     fields = {
-        "provenanceVersion": 2,
+        "provenanceVersion": record_version(row),
         "jobId": row["id"],
         "model": expected["model"],
         "executionManifestSha256": plan["manifestSha256"],
@@ -548,7 +723,7 @@ def validate_pending(plan: dict[str, Any], row: dict[str, Any], path: Path,
     for key, value in fields.items():
         if record.get(key) != value:
             raise PlanError(f"{row['id']}: pending {key} does not match frozen job")
-    validate_local_envelope(record, expected, row["id"])
+    validate_local_envelope(record, expected, row["id"], row["referenceSha256s"])
     validate_request_envelope(record, expected, row["id"])
     task_id = record.get("taskId")
     allowed_statuses = allowed_statuses or {"PENDING"}
@@ -616,14 +791,14 @@ def kie_video_command(plan: dict[str, Any], row: dict[str, Any]) -> list[str]:
         str(row["outputPath"]),
         str(row["promptPath"]),
         str(row["sourcePath"]),
-        "--res", "720p",
+        "--res", plan["resolution"],
         "--dur", str(row["durationSeconds"]),
-        "--ar", "16:9",
+        "--ar", plan["aspectRatio"],
         "--job-id", row["id"],
         "--manifest-sha256", plan["manifestSha256"],
         "--source-sha256", row["sourceSha256"],
         "--execution-request-sha256", row["executionRequestSha256"],
-    ]
+    ] + [argument for path in row["referencePaths"] for argument in ("--ref", str(path))]
 
 
 def upload_env() -> dict[str, str]:
@@ -721,6 +896,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "financialAuthorized": authorized,
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
             "manifestSha256": plan["manifestSha256"],
+            **({"warnings": plan_warnings(plan)} if plan_warnings(plan) else {}),
             **({"requests": print_requests(plan),
                 "requestNote": "image URLs are placeholders; nothing was uploaded"}
                if show_requests else {}),
@@ -846,13 +1022,17 @@ def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
            omit_from: list[Path] | None = None, selection_reason: str | None = None,
            no_source_audit: bool = False, no_production_overrides: bool = False,
            episode_code: str | None = None, production_overrides: Path | None = None,
-           authority_path: Path | None = None) -> dict[str, Any]:
+           authority_path: Path | None = None, resolution: str | None = None,
+           aspect_ratio: str | None = None) -> dict[str, Any]:
     """Write execution-manifest.json from a draft with every hash computed.
 
     The field list comes from ROOT_FIELDS and JOB_FIELDS, so the writer and the
     validator cannot drift. The price is the operator's own live reading; the
     tool never supplies a rate. financialApproval is always false: only a
     separate approval record, drafted after this freeze, authorizes spending.
+    A draft item's optional ``references`` (project image paths), or a
+    resolution or aspect ratio other than version 2's, writes version 3; the
+    price is then recorded for that model and resolution.
     """
     if EPISODE is None:
         raise PlanError("freeze needs --project (or AGENTIC_PROJECT_ROOT)")
@@ -871,6 +1051,12 @@ def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
         raise PlanError("--price-verified-at must be a UTC time such as 2026-01-01T12:00:00Z")
     if not isinstance(price_evidence, str) or not price_evidence.strip():
         raise PlanError("--price-evidence must say where the live price was read")
+    values = ROUTE_VALUES[FIXED_HEADER["model"]]
+    resolution = resolution or FIXED_HEADER["resolution"]
+    aspect_ratio = aspect_ratio or FIXED_HEADER["aspectRatio"]
+    if resolution not in values["resolutions"] or aspect_ratio not in values["aspectRatios"]:
+        raise PlanError(f"--resolution must be one of {sorted(values['resolutions'])} and "
+                        f"--aspect-ratio one of {sorted(values['aspectRatios'])}")
     items = draft.get("items")
     if not isinstance(items, list) or not items:
         raise PlanError("draft items must be a non-empty list")
@@ -925,14 +1111,33 @@ def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
                 found.append(f"{job_id}: source still missing at {source}")
         except PlanError as exc:
             found.append(str(exc))
+        references = []
+        if "references" in item:
+            raw_refs = item["references"]
+            if (not isinstance(raw_refs, list) or not raw_refs
+                    or len(raw_refs) > values["maxReferences"]):
+                found.append(f"{job_id}: references must list 1-{values['maxReferences']} images")
+                raw_refs = []
+            for value in raw_refs:
+                try:
+                    ref = _draft_source({"id": job_id, "source": value})
+                    if not ref.is_file():
+                        found.append(f"{job_id}: reference missing at {ref}")
+                    references.append(ref)
+                except PlanError as exc:
+                    found.append(str(exc))
         problems.extend(found)
         if found:
             continue
-        jobs.append({"id": job_id, "speaker": item["speaker"], "hindi": line,
-                     "durationSeconds": duration, "source": _relative(source),
-                     "sourceSha256": sha256(source), "prompt": _relative(prompt),
-                     "promptSha256": sha256(prompt),
-                     "outputStem": _relative(here / "motion" / job_id)})
+        job = {"id": job_id, "speaker": item["speaker"], "hindi": line,
+               "durationSeconds": duration, "source": _relative(source),
+               "sourceSha256": sha256(source), "prompt": _relative(prompt),
+               "promptSha256": sha256(prompt),
+               "outputStem": _relative(here / "motion" / job_id)}
+        if references:
+            job["references"] = [{"path": _relative(ref), "sha256": sha256(ref)}
+                                 for ref in references]
+        jobs.append(job)
     if problems:
         raise PlanError("cannot freeze yet: " + "; ".join(problems))
 
@@ -962,8 +1167,13 @@ def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
 
     total = sum(job["durationSeconds"] for job in jobs)
     ceiling = total * credits_per_second if maximum_credits is None else maximum_credits
+    version3 = (any("references" in job for job in jobs)
+                or (resolution, aspect_ratio) != (FIXED_HEADER["resolution"], FIXED_HEADER["aspectRatio"]))
+    header = {**FIXED_HEADER, "episode": code}
+    if version3:
+        header.update(version=3, resolution=resolution, aspectRatio=aspect_ratio)
     doc = {
-        **FIXED_HEADER, "episode": code,
+        **header,
         "financialApproval": False,
         "financialState": "frozen; awaiting a hash-bound approval record",
         "draftManifest": _relative(draft_copy), "draftManifestSha256": sha256(draft_copy),
@@ -972,12 +1182,14 @@ def freeze(draft_path: Path, manifest_path: Path, *, credits_per_second: float,
         "authority": _relative(authority), "authoritySha256": sha256(authority),
         "jobCount": len(jobs), "maximumGeneratedSeconds": total, "jobs": jobs,
         "pricing": {"creditsPerSecond": credits_per_second, "verifiedAtUtc": price_verified_at,
-                    "evidence": price_evidence.strip()},
+                    "evidence": price_evidence.strip(),
+                    **({"model": header["model"], "resolution": resolution} if version3 else {})},
         "maximumCredits": ceiling,
     }
     if siblings:
         doc["siblingManifests"] = siblings
-    if set(doc) - OPTIONAL_ROOT_FIELDS != ROOT_FIELDS or any(set(job) != JOB_FIELDS for job in jobs):
+    if (set(doc) - OPTIONAL_ROOT_FIELDS != ROOT_FIELDS
+            or any(set(job) - {"references"} != JOB_FIELDS for job in jobs)):
         raise PlanError("freeze produced fields the validator does not accept")
     _write_new_json(manifest_path, doc)
     try:
@@ -1041,6 +1253,8 @@ def main(argv: list[str] | None = None) -> int:
                           help="omit jobs another frozen manifest already holds, and bind it "
                                "as a sibling so no job is paid for twice")
     freezing.add_argument("--selection-reason", help="why this subset; kept in selection-note.json")
+    freezing.add_argument("--resolution", help="resolution to send (writes version 3 unless 720p)")
+    freezing.add_argument("--aspect-ratio", help="aspect ratio to send (writes version 3 unless 16:9)")
     freezing.add_argument("--no-source-audit", action="store_true",
                           help="record that no new-angle source audit was performed")
     freezing.add_argument("--no-production-overrides", action="store_true",
@@ -1066,7 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
                 no_source_audit=args.no_source_audit,
                 no_production_overrides=args.no_production_overrides,
                 episode_code=args.episode_code, production_overrides=args.production_overrides,
-                authority_path=args.authority_file)
+                authority_path=args.authority_file, resolution=args.resolution,
+                aspect_ratio=args.aspect_ratio)
         except (PlanError, ValueError) as exc:
             raise SystemExit(f"REFUSED: {exc}") from exc
         print(json.dumps({"frozen": str(args.manifest.resolve()), **result},

@@ -71,6 +71,110 @@ class DialogueFiniteTest(unittest.TestCase):
         self.assertEqual(result['networkCalls'],0)
         self.assertEqual(result['generatedSeconds'],7)
 
+    def test_version_two_request_and_record_digests_are_pinned(self):
+        # Recorded pending records and sidecars bind these digests; a v2
+        # manifest must keep producing them byte for byte.
+        plan = RUNNER.load_plan(self.manifest, 7)
+        [row] = plan['jobs']
+        self.assertEqual(plan['manifestSha256'],
+                         '6519700e5780d078c56451ef77709c0374d6f4f52ff856641a1f60a90066af63')
+        self.assertEqual(row['executionRequestSha256'],
+                         'de2e8a89dbae770913ea8e94d0c737ef7f8f272af0aa590063aa90b04963afa0')
+        self.assertEqual(RUNNER.canonical_sha256(RUNNER.expected_record(plan, row)),
+                         '5cc7d4950ae8e227963991b9b4c4f96793f99a4e8e9604dac57fd2f453ed1f7e')
+        command = RUNNER.kie_video_command(plan, row)
+        self.assertEqual(command[6:12], ['--res', '720p', '--dur', '7', '--ar', '16:9'])
+        self.assertNotIn('--ref', command)
+
+    def version_three(self, references=2, **header):
+        refs = []
+        for number in range(references):
+            ref = self.ep / f'art/refs/demo-ref-{number}.png'
+            ref.parent.mkdir(parents=True, exist_ok=True)
+            ref.write_bytes(f'offline reference {number}'.encode())
+            refs.append(dict(path=str(ref.relative_to(self.ep)), sha256=RUNNER.sha256(ref)))
+        self.doc.update(version=3, **header)
+        self.doc['pricing'].update(model=self.doc['model'], resolution=self.doc['resolution'])
+        if refs:
+            self.doc['jobs'][0]['references'] = refs
+        self.save()
+        return refs
+
+    def test_version_three_sends_frozen_references_after_the_first_frame(self):
+        refs = self.version_three()
+        plan = RUNNER.load_plan(self.manifest, 7)
+        [row] = plan['jobs']
+        self.assertEqual(row['referenceSha256s'], [ref['sha256'] for ref in refs])
+        request = RUNNER.execution_request(plan, row)
+        self.assertEqual((request['version'], request['referenceSha256s']),
+                         (2, row['referenceSha256s']))
+        self.assertEqual(RUNNER.record_version(row), 3)
+        command = RUNNER.kie_video_command(plan, row)
+        self.assertEqual(command[-4:], ['--ref', str(self.ep / refs[0]['path']),
+                                        '--ref', str(self.ep / refs[1]['path'])])
+        dry = RUNNER.execute(7, False)
+        self.assertTrue(any('unqualified' in warning for warning in dry['warnings']))
+
+    def test_version_three_without_references_keeps_the_version_one_request(self):
+        self.version_three(references=0)
+        plan = RUNNER.load_plan(self.manifest, 7)
+        request = RUNNER.execution_request(plan, plan['jobs'][0])
+        self.assertEqual(request['version'], 1)
+        self.assertNotIn('referenceSha256s', request)
+        self.assertNotIn('warnings', RUNNER.execute(7, False))
+
+    def test_version_two_never_accepts_references_or_other_values(self):
+        self.doc['jobs'][0]['references'] = [dict(path='art/stills/demo-s1001.png',
+                                                  sha256=RUNNER.sha256(self.source))]
+        self.save()
+        with self.assertRaisesRegex(RUNNER.PlanError, 'fields must be exactly'):
+            RUNNER.load_plan(self.manifest, 7)
+        del self.doc['jobs'][0]['references']
+        self.doc['resolution'] = '1080p'
+        self.save()
+        with self.assertRaisesRegex(RUNNER.PlanError, "resolution must be '720p'"):
+            RUNNER.load_plan(self.manifest, 7)
+
+    def test_version_three_values_and_price_are_bound_together(self):
+        refs = self.version_three(resolution='1080p')
+        plan = RUNNER.load_plan(self.manifest, 7)
+        self.assertEqual(RUNNER.kie_video_command(plan, plan['jobs'][0])[6:8], ['--res', '1080p'])
+        warnings = RUNNER.execute(7, False)['warnings']
+        self.assertTrue(any('only one image is supported at 1080p' in w for w in warnings))
+        self.doc['pricing']['resolution'] = '720p'
+        self.save()
+        with self.assertRaisesRegex(RUNNER.PlanError, 'different model or resolution'):
+            RUNNER.load_plan(self.manifest, 7)
+        del self.doc['pricing']['resolution']
+        self.save()
+        with self.assertRaisesRegex(RUNNER.PlanError, 'model and resolution it was read for'):
+            RUNNER.load_plan(self.manifest, 7)
+        self.doc['pricing']['resolution'] = '1080p'
+        for key, value, message in (('resolution', '4k', 'resolution must be one of'),
+                                    ('aspectRatio', 'auto', 'aspectRatio must be one of'),
+                                    ('model', 'demo-model', 'model must be one of')):
+            with self.subTest(key=key):
+                saved = self.doc[key]
+                self.doc[key] = value
+                self.save()
+                with self.assertRaisesRegex(RUNNER.PlanError, message):
+                    RUNNER.load_plan(self.manifest, 7)
+                self.doc[key] = saved
+        self.doc['jobs'][0]['references'] = refs * 4
+        self.save()
+        with self.assertRaisesRegex(RUNNER.PlanError, 'at most 6 references'):
+            RUNNER.load_plan(self.manifest, 7)
+        self.doc['jobs'][0]['references'] = refs
+        self.save()
+        (self.ep / refs[1]['path']).write_bytes(b'changed reference')
+        with self.assertRaisesRegex(RUNNER.PlanError, r'references\[1\] missing or hash changed'):
+            RUNNER.load_plan(self.manifest, 7)
+
+    def test_landed_geometry_follows_the_frozen_values(self):
+        self.assertEqual(RUNNER.minimum_geometry('720p', '16:9'), (1200.0, 675.0))
+        self.assertEqual(RUNNER.minimum_geometry('1080p', '9:16'), (1012.5, 1800.0))
+        self.assertEqual(RUNNER.minimum_geometry('480p', '1:1'), (450.0, 450.0))
+
     def test_changed_source_refused(self):
         self.source.write_bytes(b'changed')
         with self.assertRaisesRegex(RUNNER.PlanError,'source missing or hash changed'):

@@ -46,6 +46,15 @@ MODELS = {'grok': 'grok-imagine/image-to-video',
 
 SHA256 = re.compile(r'[0-9a-f]{64}\Z')
 PENDING_VERSION = 2
+# A request that sends --ref images is recorded as version 3, so a reader that
+# knows only the single-still contract refuses it; without references the
+# records stay version 2 byte for byte. Both versions resume.
+PENDING_VERSION_WITH_REFS = 3
+RECORD_VERSIONS = {PENDING_VERSION, PENDING_VERSION_WITH_REFS}
+
+
+def record_version(refs):
+    return PENDING_VERSION_WITH_REFS if refs else PENDING_VERSION
 
 
 def download_public_media(url):
@@ -181,8 +190,9 @@ def validate_landed_pair(video, sidecar, pending, expected_local,
     if not video.exists():
         return False
     meta = read_json(sidecar, 'video sidecar')
+    if meta.get('provenanceVersion') not in RECORD_VERSIONS:
+        sys.exit(f'landed sidecar mismatch for provenanceVersion: {sidecar}')
     required = {
-        'provenanceVersion': PENDING_VERSION,
         'model': expected_local['model'],
         'jobId': expected_local['jobId'],
         'executionManifestSha256': expected_local['executionManifestSha256'],
@@ -504,7 +514,7 @@ def main(argv=None):
     # querying a wallet. Only an already-recorded taskId is safe to poll.
     if landed_pending.exists():
         early_orphan = read_json(landed_pending, 'pending recovery record')
-        if early_orphan.get('provenanceVersion') != PENDING_VERSION:
+        if early_orphan.get('provenanceVersion') not in RECORD_VERSIONS:
             sys.exit(f'legacy pending record requires manual reconciliation: '
                      f'{landed_pending}')
         if early_orphan.get('localRequestSha256') != local_request_sha256:
@@ -550,7 +560,7 @@ def main(argv=None):
     pending.parent.mkdir(parents=True, exist_ok=True)
     if pending.exists():
         orphan = read_json(pending, 'pending recovery record')
-        if orphan.get('provenanceVersion') != PENDING_VERSION:
+        if orphan.get('provenanceVersion') not in RECORD_VERSIONS:
             sys.exit(f'legacy pending record requires manual reconciliation: {pending}')
         if orphan.get('localRequestSha256') != local_request_sha256:
             sys.exit(f'pending task payload mismatch at {pending} — resolve it '
@@ -582,7 +592,7 @@ def main(argv=None):
         }
         request_fingerprint = canonical_sha256(request)
         orphan = {
-            'provenanceVersion': PENDING_VERSION,
+            'provenanceVersion': record_version(refs),
             'status': 'POSTING_UNCERTAIN',
             'taskId': None,
             'jobId': job_id,
@@ -655,7 +665,7 @@ def main(argv=None):
         if before is not None:
             credits = max(0, float(before) - float(kie('chat/credit')))
             credits_source = 'wallet-delta'
-    meta = {'provenanceVersion': PENDING_VERSION,
+    meta = {'provenanceVersion': orphan['provenanceVersion'],
             'provider': 'kie.ai', 'model': model, 'taskId': task,
             'jobId': job_id,
             'executionManifestSha256': manifest_sha256,

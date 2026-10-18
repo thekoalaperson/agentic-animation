@@ -136,6 +136,37 @@ class DialogueFreezeTest(unittest.TestCase):
         self.assertEqual(record["manifests"][0]["finiteExecution"],
                          {"jobs": 3, "generatedSeconds": 19, "credits": 95})
 
+    def test_freeze_without_new_inputs_stays_version_two(self):
+        target = self.batch / "execution-manifest.json"
+        self.freeze(target)
+        doc = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual({key: doc[key] for key in RUNNER.FIXED_HEADER}, RUNNER.FIXED_HEADER)
+        self.assertEqual(set(doc["pricing"]), RUNNER.PRICING_FIELDS)
+        self.assertTrue(all(set(job) == RUNNER.JOB_FIELDS for job in doc["jobs"]))
+
+    def test_freeze_binds_references_and_geometry_as_version_three(self):
+        draft = json.loads(self.draft.read_text(encoding="utf-8"))
+        ref = self.ep / "art/refs/demo-ref.png"
+        ref.parent.mkdir(parents=True)
+        ref.write_bytes(b"offline reference")
+        draft["items"][1]["references"] = ["art/refs/demo-ref.png"]
+        self.draft.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+        target = self.batch / "execution-manifest.json"
+        result = self.freeze(target, resolution="1080p")
+        doc = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual((doc["version"], doc["resolution"], doc["aspectRatio"]), (3, "1080p", "16:9"))
+        self.assertEqual((doc["pricing"]["model"], doc["pricing"]["resolution"]),
+                         (doc["model"], "1080p"))
+        with_refs = [job for job in doc["jobs"] if "references" in job]
+        self.assertEqual([job["id"] for job in with_refs], ["demo-s002"])
+        self.assertEqual(with_refs[0]["references"],
+                         [{"path": "art/refs/demo-ref.png", "sha256": RUNNER.sha256(ref)}])
+        self.assertTrue(any("1080p" in warning for warning in result["warnings"]))
+
+    def test_freeze_refuses_values_outside_the_allowed_set(self):
+        with self.assertRaisesRegex(RUNNER.PlanError, "--resolution must be one of"):
+            self.freeze(self.batch / "execution-manifest.json", resolution="4k")
+
 
 if __name__ == "__main__":
     unittest.main()

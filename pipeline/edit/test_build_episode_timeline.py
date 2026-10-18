@@ -212,7 +212,7 @@ class TimelineBuilderTest(unittest.TestCase):
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
 
-    def refresh_provenance(self):
+    def refresh_provenance(self, references=False):
         narration_manifest = self.ep / "work/narration-hi-v1/manifest.json"
         narration = json.loads(narration_manifest.read_text())
         narration_state = {
@@ -250,6 +250,9 @@ class TimelineBuilderTest(unittest.TestCase):
             "resolution": dialogue["resolution"], "aspectRatio": dialogue["aspectRatio"],
             "audio": True, "outputStem": job["outputStem"],
         }
+        reference_hashes = [ref["sha256"] for ref in job.get("references", [])] if references else []
+        if reference_hashes:
+            execution_request.update(version=2, referenceSha256s=reference_hashes)
         request_sha = self.canonical_sha(request)
         sidecar = output.with_suffix(".vid.json")
         self.write_json(sidecar, bind_fixture({
@@ -264,7 +267,7 @@ class TimelineBuilderTest(unittest.TestCase):
             "audio": True, "taskId": "offline-task",
             "request": request, "requestSha256": request_sha,
             "requestFingerprint": request_sha,
-        }, (self.ep / job['prompt']).read_text()))
+        }, (self.ep / job['prompt']).read_text(), reference_hashes))
         bindings = [{
             "path": str(canonical_dialogue_manifest.relative_to(self.ep)),
             "sha256": self.sha(canonical_dialogue_manifest),
@@ -348,6 +351,22 @@ class TimelineBuilderTest(unittest.TestCase):
         choice.update(sourceSceneId="demo-s003", reuseReason="Same event quoted in the opening; complete native performance.")
         config["dialogueOutputs"]["demo-s005"] = choice
         self.write_json(self.config, config)
+
+    def test_dialogue_take_with_frozen_references_is_admitted_only_with_them(self):
+        manifest = json.loads(self.dialogue_manifest.read_text())
+        reference = self.ep / "work/grok-dialogue-v1/demo-ref.png"
+        reference.write_bytes(b"reference-still")
+        manifest["jobs"][0]["references"] = [{"path": str(reference.relative_to(self.ep)),
+                                              "sha256": self.sha(reference)}]
+        self.write_json(self.dialogue_manifest, manifest)
+        self.refresh_provenance(references=True)
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready.get("errors"))
+        self.refresh_provenance(references=False)
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        readiness = (self.ep / "work/assembly-v1/timeline-readiness.json").read_text()
+        self.assertIn("dialogue sidecar mismatch: executionRequestSha256", readiness)
 
     def test_reused_dialogue_keeps_original_job_provenance(self):
         self._reuse_dialogue_in_another_scene()

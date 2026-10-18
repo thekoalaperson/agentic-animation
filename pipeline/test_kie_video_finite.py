@@ -313,12 +313,14 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             self.assertEqual((meta["creditsSource"], meta["cost_usd"]), ("receipt", 0.27))
             self.assertFalse(stem.with_suffix(".pending.json").exists())
 
-            plan = {"manifestSha256": manifest_sha}
+            plan = {"manifestSha256": manifest_sha, "model": "grok-imagine-video-1-5-preview",
+                    "resolution": "720p", "aspectRatio": "16:9"}
             row = {
                 "id": "demo-s1001", "sourceSha256": source_sha,
                 "promptSha256": expected_fields["promptSha256"],
                 "durationSeconds": 6, "promptPath": prompt, "outputPath": stem,
-                "executionRequestSha256": execution_sha,
+                "executionRequestSha256": execution_sha, "sourcePath": root / "frame.png",
+                "referencePaths": [], "referenceSha256s": [],
             }
             verified = DIALOGUE.validate_completed(plan, row)
             self.assertEqual(verified["sha256"], output_sha)
@@ -329,6 +331,94 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             upload.assert_not_called()
             kie.assert_not_called()
             self.assertEqual(len(creates), 1)
+
+    def test_references_land_as_version_three_and_bind_their_hashes(self):
+        from dialogue_provenance import validate_dialogue_request
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt, frame, stem, argv, source_sha, manifest_sha, execution_sha = self.fixture(root)
+            refs = []
+            for name in ("demo-ref-a.png", "demo-ref-b.png"):
+                (root / name).write_bytes(name.encode())
+                refs.append(root / name)
+            argv = argv + [argument for ref in refs for argument in ("--ref", str(ref))]
+            media_path = root / "provider.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=24:d=6",
+                "-f", "lavfi", "-i", "sine=frequency=330:duration=6",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(media_path),
+            ], check=True)
+            creates = []
+
+            def kie(route, payload=None):
+                if route == "chat/credit":
+                    return 1000
+                if route == "jobs/createTask":
+                    creates.append(payload)
+                    return {"taskId": "task-offline-refs"}
+                return {"state": "success", "creditsConsumed": 30,
+                        "resultJson": json.dumps({"resultUrls": ["https://offline/result.mp4"]})}
+
+            with mock.patch.object(VIDEO, "upload_ref", side_effect=lambda path, log: f"https://offline/{Path(path).name}"), \
+                 mock.patch.object(VIDEO, "kie", side_effect=kie), \
+                 mock.patch.object(VIDEO, "download_public_media", return_value=media_path.read_bytes()), \
+                 mock.patch.object(VIDEO, "usd_per_credit", return_value=None), \
+                 mock.patch.object(VIDEO.time, "sleep"):
+                VIDEO.main(argv)
+            [create] = creates
+            self.assertEqual(create["input"]["image_urls"], [
+                "https://offline/frame.png", "https://offline/demo-ref-a.png",
+                "https://offline/demo-ref-b.png"])
+            meta = json.loads(stem.with_suffix(".vid.json").read_text(encoding="utf-8"))
+            ref_hashes = [hashlib.sha256(ref.read_bytes()).hexdigest() for ref in refs]
+            self.assertEqual(meta["provenanceVersion"], 3)
+            self.assertEqual(meta["localRequest"]["inputHashes"]["references"], ref_hashes)
+
+            plan = {"manifestSha256": manifest_sha, "model": "grok-imagine-video-1-5-preview",
+                    "resolution": "720p", "aspectRatio": "16:9"}
+            row = {"id": "demo-s1001", "sourceSha256": source_sha,
+                   "promptSha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                   "durationSeconds": 6, "promptPath": prompt, "outputPath": stem,
+                   "executionRequestSha256": execution_sha, "sourcePath": frame,
+                   "referencePaths": refs, "referenceSha256s": ref_hashes}
+            self.assertEqual(DIALOGUE.validate_completed(plan, row)["taskId"], "task-offline-refs")
+            expected = {**{key: meta[key] for key in (
+                "jobId", "model", "sourceSha256", "promptSha256", "executionManifestSha256",
+                "executionRequestSha256", "resolution", "aspectRatio", "durationSeconds", "audio")},
+                "referenceSha256s": ref_hashes}
+            validate_dialogue_request(meta, expected, prompt.read_text(encoding="utf-8"))
+            for wrong in (ref_hashes[::-1], []):
+                with self.subTest(references=wrong):
+                    with self.assertRaises(DIALOGUE.PlanError):
+                        DIALOGUE.validate_completed(plan, {**row, "referenceSha256s": wrong})
+                    with self.assertRaisesRegex(ValueError, "frozen still and references"):
+                        validate_dialogue_request(meta, {**expected, "referenceSha256s": wrong},
+                                                  prompt.read_text(encoding="utf-8"))
+            # The same request resumes without a second POST.
+            with mock.patch.object(VIDEO, "upload_ref") as upload, mock.patch.object(VIDEO, "kie") as call:
+                VIDEO.main(argv)
+            upload.assert_not_called()
+            call.assert_not_called()
+
+    def test_first_frame_difference_is_measured_against_the_source_still(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video, black, red = root / "clip.mp4", root / "black.png", root / "red.png"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                            "color=c=black:s=1280x720:r=24:d=1", "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p", str(video)], check=True)
+            for path, colour in ((black, "black"), (red, "red")):
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                                f"color=c={colour}:s=1280x720", "-frames:v", "1", str(path)],
+                               check=True)
+            same = DIALOGUE.first_frame_difference(video, black)
+            other = DIALOGUE.first_frame_difference(video, red)
+            self.assertLess(same["meanAbsoluteDifference"], 2)
+            self.assertGreater(other["meanAbsoluteDifference"], 50)
+            self.assertEqual(DIALOGUE.first_frame_difference(video, root / "missing.png")["method"],
+                             "unmeasured")
 
 
 if __name__ == "__main__":

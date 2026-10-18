@@ -41,7 +41,10 @@ def validate_dialogue_request(record: dict, expected: dict, prompt_text: str) ->
         if local.get(key) != expected[key]:
             raise ValueError("dialogue local request mismatch: " + key)
     hashes = local.get("inputHashes", {})
-    if hashes != {"primary": expected["sourceSha256"], "last": None, "references": [], "videos": []}:
-        raise ValueError("dialogue local input hashes differ from the single-still route")
+    # Exactly the frozen reference hashes, in order; none for a single-still job.
+    references = list(expected.get("referenceSha256s", []))
+    if hashes != {"primary": expected["sourceSha256"], "last": None, "references": references,
+                  "videos": []}:
+        raise ValueError("dialogue local input hashes differ from the frozen still and references")
     if local.get("referenceOnly") is not False or local.get("multiClip") is not False:
         raise ValueError("dialogue local mode differs from the frozen single-still route")

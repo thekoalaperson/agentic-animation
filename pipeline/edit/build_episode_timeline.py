@@ -1033,6 +1033,9 @@ def build_timeline(
                     "audio": True,
                     "outputStem": execution_entry.get("outputStem"),
                 }
+                references = [ref.get("sha256") for ref in execution_entry.get("references") or []]
+                if references:  # mirrors kie_dialogue_finite.execution_request
+                    execution_request.update(version=2, referenceSha256s=references)
                 expected_sidecar = {
                     "jobId": source_scene_id,
                     "executionManifestSha256": _sha256(execution_path),
@@ -1058,7 +1061,7 @@ def build_timeline(
                     raise ValueError(f"{scene_id}: dialogue request fingerprint is invalid")
                 if source_doc.get("requestFingerprint") != request_sha:
                     raise ValueError(f"{scene_id}: dialogue request digest aliases disagree")
-                validate_dialogue_request(source_doc, expected_sidecar,
+                validate_dialogue_request(source_doc, {**expected_sidecar, "referenceSha256s": references},
                                           prompt_path.read_text(encoding='utf-8'))
                 if not isinstance(source_doc.get("taskId"), str) or not source_doc["taskId"]:
                     raise ValueError(f"{scene_id}: dialogue sidecar has no paid taskId")
