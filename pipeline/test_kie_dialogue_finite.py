@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 
-from pipeline.test_paid_approval import write_approval
+from pipeline.test_paid_approval import grant_retries, write_approval
 
 SPEC = importlib.util.spec_from_file_location('dialogue_finite_target', Path(__file__).with_name('kie_dialogue_finite.py'))
 RUNNER = importlib.util.module_from_spec(SPEC)
@@ -189,7 +189,7 @@ class DialogueFiniteTest(unittest.TestCase):
         self.save()
         return 7 * count
 
-    def run_wave(self, outcomes, seconds, concurrency=1):
+    def run_wave(self, outcomes, seconds, concurrency=1, retry_failed=False, retries=None):
         """Submit with kie_video replaced: 'land', 'fail' (definite) or 'lost' per job id."""
         invoked = []
         def fake_run(command, **kwargs):
@@ -199,19 +199,22 @@ class DialogueFiniteTest(unittest.TestCase):
             invoked.append(job_id)
             stem = self.work / 'motion' / job_id
             stem.parent.mkdir(parents=True, exist_ok=True)
-            if outcomes[job_id] == 'land':
+            outcome = outcomes[job_id].pop(0) if isinstance(outcomes[job_id], list) else outcomes[job_id]
+            if outcome == 'land':
                 stem.with_suffix('.mp4').write_bytes(b'offline')
                 stem.with_suffix('.vid.json').write_text('{}')
                 return mock.Mock(returncode=0)
-            if outcomes[job_id] == 'fail':
+            if outcome == 'fail':
                 stem.with_suffix('.pending.json').write_text(json.dumps({
-                    'status': 'GENERATION_FAILED', 'taskId': f'task-{job_id}', 'failCode': 'demo-code',
-                    'failMsg': 'demo refusal', 'credits': None}))
+                    'status': 'GENERATION_FAILED', 'taskId': f'task-{job_id}-{len(invoked)}',
+                    'failCode': 'demo-code', 'failMsg': 'demo refusal', 'credits': 2}))
             return mock.Mock(returncode=1)
         landed = lambda plan, row: {'id': row['id'], 'durationSeconds': 7.0, 'credits': None,
                                     'creditsSource': None, 'taskId': f'task-{row["id"]}'}
         fake_common = types.SimpleNamespace(kie=lambda route: 10_000)
         approval = self.approval_for(seconds)
+        if retries:
+            grant_retries(approval, **retries)
         with mock.patch.object(RUNNER.platform, 'system', return_value='Linux'), \
              mock.patch.object(RUNNER.subprocess, 'run', side_effect=fake_run), \
              mock.patch.object(RUNNER, 'validate_completed', side_effect=landed), \
@@ -219,7 +222,8 @@ class DialogueFiniteTest(unittest.TestCase):
                                side_effect=lambda plan, row, path, allowed=None: json.loads(path.read_text())), \
              mock.patch.dict(sys.modules, {'_common': fake_common}):
             try:
-                return RUNNER.execute(seconds, True, approval, concurrency), invoked
+                return RUNNER.execute(seconds, True, approval, concurrency,
+                                      retry_failed=retry_failed), invoked
             except RUNNER.PlanError as exc:
                 return exc, invoked
 
@@ -246,7 +250,7 @@ class DialogueFiniteTest(unittest.TestCase):
         self.assertEqual([f['id'] for f in audit['definiteFailures']], ['demo-s1002'])
         [logged] = self.refusals()
         self.assertEqual((logged['jobId'], logged['taskId'], logged['failCode'], logged['operatorResponse']),
-                         ('demo-s1002', 'task-demo-s1002', 'demo-code', None))
+                         ('demo-s1002', 'task-demo-s1002-2', 'demo-code', None))
         result, invoked = self.run_wave(outcomes, seconds)
         self.assertEqual((result['status'], invoked), ('PARTIAL', []))
         self.assertEqual(len(self.refusals()), 1)
@@ -297,6 +301,47 @@ class DialogueFiniteTest(unittest.TestCase):
         self.assertEqual(run.call_count, 1)  # the GPU check only
         [logged] = self.refusals()
         self.assertEqual((logged['failCode'], logged['creditsConsumed']), ('demo-code', 0))
+
+    def test_retry_failed_needs_a_retry_grant(self):
+        seconds = self.add_jobs(2)
+        self.run_wave({'demo-s1001': 'land', 'demo-s1002': 'fail'}, seconds)
+        result, invoked = self.run_wave({'demo-s1002': 'land'}, seconds, retry_failed=True)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('version 3 approval record', str(result))
+        self.assertEqual(invoked, [])
+        self.assertTrue((self.work/'motion/demo-s1002.pending.json').exists())
+
+    def test_retry_failed_reposts_within_the_granted_budget_and_keeps_the_history(self):
+        seconds = self.add_jobs(2)
+        grant = {'jobs': 1, 'credits': 10}
+        self.run_wave({'demo-s1001': 'land', 'demo-s1002': 'fail'}, seconds, retries=grant)
+        # Without --retry-failed the failure stays skipped.
+        result, invoked = self.run_wave({}, seconds, retries=grant)
+        self.assertEqual((result['status'], invoked), ('PARTIAL', []))
+        result, invoked = self.run_wave({'demo-s1002': ['fail']}, seconds, retry_failed=True,
+                                        retries=grant)
+        self.assertEqual((result['status'], invoked), ('PARTIAL', ['demo-s1002']))
+        archived = self.work/'motion/demo-s1002.attempts/attempt-001.pending.json'
+        self.assertEqual(json.loads(archived.read_text())['taskId'], 'task-demo-s1002-2')
+        self.assertEqual(len(self.refusals()), 2)
+        # The budget allowed one retry; a second is refused before anything moves.
+        result, invoked = self.run_wave({'demo-s1002': ['land']}, seconds, retry_failed=True,
+                                        retries=grant)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('retry budget is 1', str(result))
+        self.assertEqual(invoked, [])
+        self.assertTrue((self.work/'motion/demo-s1002.pending.json').exists())
+        variance = json.loads((self.work/'price-variance.json').read_text())
+        self.assertEqual((variance['cumulativeLandedCredits'], variance['retryCredits']), (2.0, 2.0))
+
+    def test_retried_charges_are_held_to_the_retry_budget(self):
+        seconds = self.add_jobs(2)
+        grant = {'jobs': 2, 'credits': 1}
+        self.run_wave({'demo-s1001': 'land', 'demo-s1002': 'fail'}, seconds, retries=grant)
+        result, invoked = self.run_wave({'demo-s1002': ['fail']}, seconds, retry_failed=True,
+                                        retries=grant)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('past the approval', str(result))
 
     def test_changed_source_refused(self):
         self.source.write_bytes(b'changed')

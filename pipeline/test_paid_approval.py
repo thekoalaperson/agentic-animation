@@ -30,7 +30,63 @@ def write_approval(record: Path, *, episode, lane: str, manifest: Path,
     return record
 
 
+def grant_retries(record: Path, *, jobs: int, credits: float) -> Path:
+    """Turn an offline test record into a version-3 retry grant; never a real grant."""
+    document = json.loads(record.read_text(encoding="utf-8"))
+    document.update(schemaVersion=3, automaticRetryAuthorized=True,
+                    retryBudget={"jobs": jobs, "credits": credits})
+    record.write_text(json.dumps(document), encoding="utf-8")
+    return record
+
+
 class PaidApprovalTest(unittest.TestCase):
+    def test_version_three_grants_retries_only_where_the_lane_asks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            manifest.write_text('{"financialApproval": false}')
+            scope = {"jobs": 2, "generatedSeconds": 14, "credits": 70}
+            record = write_approval(root / "approval.json", episode="DEMO", lane="grok-dialogue",
+                                    manifest=manifest, scope=scope)
+            arguments = dict(episode="DEMO", lane="grok-dialogue", manifest_path=manifest,
+                             manifest_sha256=sha256_file(manifest), finite_execution=scope)
+            version_two = validate_paid_approval(record, **arguments)
+            self.assertEqual(set(version_two), {"path", "sha256", "authorizationId", "authorizedAtUtc",
+                                                "budgetPolicy", "lane", "manifestSha256",
+                                                "finiteExecution"})
+            self.assertEqual(validate_paid_approval(record, **arguments, allow_retry_budget=True),
+                             {**version_two})
+            document = json.loads(record.read_text())
+            for change, message in (({"automaticRetryAuthorized": True}, "automaticRetryAuthorized"),
+                                    ({"retryBudget": {"jobs": 1, "credits": 5}}, "root schema")):
+                record.write_text(json.dumps({**document, **change}))
+                with self.subTest(version2=change), self.assertRaisesRegex(PaidApprovalError, message):
+                    validate_paid_approval(record, **arguments, allow_retry_budget=True)
+            record.write_text(json.dumps(document))
+            grant_retries(record, jobs=1, credits=5)
+            with self.assertRaisesRegex(PaidApprovalError, "does not retry"):
+                validate_paid_approval(record, **arguments)
+            granted = validate_paid_approval(record, **arguments, allow_retry_budget=True)
+            self.assertEqual((granted["schemaVersion"], granted["retryBudget"]),
+                             (3, {"jobs": 1, "credits": 5}))
+            self.assertEqual(granted["sha256"], sha256_file(record))
+            three = json.loads(record.read_text())
+            for change, message in (({"automaticRetryAuthorized": False}, "must be true"),
+                                    ({"retryBudget": {"jobs": 0, "credits": 5}}, "retryBudget"),
+                                    ({"retryBudget": {"jobs": 1}}, "retryBudget"),
+                                    ({"retryBudget": {"jobs": True, "credits": 5}}, "retryBudget"),
+                                    ({"topUpAuthorized": True}, "topUpAuthorized"),
+                                    ({"status": "DRAFT"}, "status"),
+                                    ({"extra": 1}, "root schema")):
+                record.write_text(json.dumps({**three, **change}))
+                with self.subTest(version3=change), self.assertRaisesRegex(PaidApprovalError, message):
+                    validate_paid_approval(record, **arguments, allow_retry_budget=True)
+            record.write_text(json.dumps(three))
+            manifest.write_text('{"financialApproval": true}')
+            with self.assertRaisesRegex(PaidApprovalError, "manifest hash is stale"):
+                validate_paid_approval(record, **{**arguments, "manifest_sha256": sha256_file(manifest)},
+                                       allow_retry_budget=True)
+
     def test_admission_requires_exact_current_bytes_and_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

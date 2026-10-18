@@ -647,21 +647,39 @@ def first_frame_difference(video: Path, still: Path) -> dict[str, Any]:
 PRICE_VARIANCE_REPORT_TOLERANCE = 1.25
 
 
+def _credit(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
 def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
-                  failed: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+                  failed: dict[str, dict[str, Any]] | None = None,
+                  history: dict[str, list[dict[str, Any]]] | None = None,
+                  retry_credits: float = 0) -> dict[str, Any]:
     """Compare landed charges with the frozen price; stop past maximumCredits.
 
     The cumulative ceiling is the refusal: every landed credit counts, however
     it was measured. Per-job rates come only from provider receipts, because
     wallet deltas overlap when jobs run concurrently; they are reported, and a
     rate above the declared one is information for the next manifest's price.
+    A job's first attempt counts toward maximumCredits; every retried attempt
+    (``history`` holds the archived ones) counts toward the approval's
+    retryBudget credits instead.
     """
     rate = plan["pricing"]["creditsPerSecond"]
-    rows, cumulative = [], 0.0
+    history = history or {}
+    rows, cumulative, retried = [], 0.0, 0.0
+    for job_id, attempts in history.items():
+        cumulative += _credit(attempts[0].get("creditsConsumed"))
+        retried += sum(_credit(attempt.get("creditsConsumed")) for attempt in attempts[1:])
+        for number, attempt in enumerate(attempts, start=1):
+            rows.append({"id": job_id, "attempt": number, "credits": attempt.get("creditsConsumed"),
+                         "definiteFailure": True, "archived": True})
     for job_id, landed in completed.items():
         credits = landed.get("credits")
-        if isinstance(credits, (int, float)) and not isinstance(credits, bool):
-            cumulative += float(credits)
+        if job_id in history:
+            retried += _credit(credits)
+        else:
+            cumulative += _credit(credits)
         row = {"id": job_id, "credits": credits, "creditsSource": landed.get("creditsSource"),
                "measuredSeconds": landed.get("durationSeconds")}
         if (landed.get("creditsSource") == "receipt" and credits is not None
@@ -674,21 +692,55 @@ def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
     for job_id, facts in (failed or {}).items():
         # A failed task can still be charged; it counts toward the ceiling.
         credits = facts.get("creditsConsumed")
-        if isinstance(credits, (int, float)) and not isinstance(credits, bool):
-            cumulative += float(credits)
+        if job_id in history:
+            retried += _credit(credits)
+        else:
+            cumulative += _credit(credits)
         rows.append({"id": job_id, "credits": credits,
                      "creditsSource": "failure-receipt" if credits is not None else None,
                      "definiteFailure": True})
     over = cumulative > plan["maximumCredits"]
+    over_retry = retried > retry_credits
     report = {"manifestSha256": plan["manifestSha256"], "declaredCreditsPerSecond": rate,
               "maximumCredits": plan["maximumCredits"], "cumulativeLandedCredits": cumulative,
               "reportTolerance": PRICE_VARIANCE_REPORT_TOLERANCE,
-              "status": "REFUSED" if over else "WITHIN_CEILING", "jobs": rows}
+              "status": "REFUSED" if over or over_retry else "WITHIN_CEILING", "jobs": rows,
+              **({"retryCredits": retried, "retryBudgetCredits": retry_credits}
+                 if history else {})}
     atomic_json(HERE / "price-variance.json", report)
     if over:
         raise PlanError(f"landed charges {cumulative} exceed maximumCredits "
                         f"{plan['maximumCredits']}; see price-variance.json")
+    if over_retry:
+        raise PlanError(f"retried attempts charged {retried}, past the approval's retry budget "
+                        f"{retry_credits}; see price-variance.json")
     return report
+
+
+def attempt_history(plan: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Archived definite failures per job, oldest first, from motion/<id>.attempts/."""
+    history = {}
+    for row in plan["jobs"]:
+        folder = row["outputPath"].parent / f"{row['id']}.attempts"
+        attempts = []
+        for path in sorted(folder.glob("attempt-*.pending.json")):
+            record = read_object(path, f"{row['id']} archived attempt")
+            if record.get("status") != DEFINITE_FAILURE or not record.get("taskId"):
+                raise PlanError(f"{path} is not an archived definite failure")
+            attempts.append(failure_facts(row, record))
+        if attempts:
+            history[row["id"]] = attempts
+    return history
+
+
+def archive_failure(row: dict[str, Any], number: int) -> Path:
+    """Move a GENERATION_FAILED record into the job's numbered attempts; never overwrite."""
+    recovery = row["outputPath"].with_suffix(".pending.json")
+    target = row["outputPath"].parent / f"{row['id']}.attempts" / f"attempt-{number:03d}.pending.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.link(recovery, target)
+    recovery.unlink()
+    return target
 
 
 def plan_warnings(plan: dict[str, Any]) -> list[str]:
@@ -956,13 +1008,13 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
 
 def execute(max_generated_seconds: int, submit: bool,
             approval_admission: Path | None = None, concurrency: int = 1,
-            show_requests: bool = False) -> dict[str, Any]:
+            show_requests: bool = False, retry_failed: bool = False) -> dict[str, Any]:
     plan = load_plan(MANIFEST, max_generated_seconds)
     try:
         approval = validate_paid_approval(
             approval_admission, episode=EPISODE_CODE, lane=APPROVAL_LANE,
             manifest_path=plan["manifestPath"], manifest_sha256=plan["manifestSha256"],
-            finite_execution=approval_scope(plan),
+            finite_execution=approval_scope(plan), allow_retry_budget=True,
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
@@ -990,6 +1042,11 @@ def execute(max_generated_seconds: int, submit: bool,
     if not authorized:
         raise PlanError("submission requires a current approval record (--approval-admission); "
                         "the manifest's financialApproval never authorizes spending")
+    retry_budget = approval.get("retryBudget") if approval.get("automaticRetryAuthorized") else None
+    if retry_failed and retry_budget is None:
+        raise PlanError("--retry-failed is a new paid POST: it needs a version 3 approval record "
+                        "with automaticRetryAuthorized and a retryBudget; otherwise freeze the "
+                        "failed jobs as a new manifest with its own approval")
 
     require_media_host()
     if concurrency not in (1, 2, 3):
@@ -1011,11 +1068,21 @@ def execute(max_generated_seconds: int, submit: bool,
                 raise PlanError("execution authorization differs from the existing batch")
         else:
             atomic_json(authorization_path, evidence)
+        history = attempt_history(plan)
+        retry_ids = set(failed) if retry_failed else set()
+        if retry_ids:
+            used = sum(len(attempts) for attempts in history.values())
+            if used + len(retry_ids) > retry_budget["jobs"]:
+                raise PlanError(f"retrying {sorted(retry_ids)} would make {used + len(retry_ids)} "
+                                f"retries; the approval's retry budget is {retry_budget['jobs']}")
+        retry_credits = retry_budget["credits"] if retry_budget else 0
         sys.path.insert(0, str(ROOT / "pipeline"))
         from _common import kie
         wallet_before = float(kie("chat/credit"))
         remaining_seconds = sum(row["durationSeconds"] for row in jobs
                                 if not row["outputPath"].with_suffix(".pending.json").exists())
+        remaining_seconds += sum(row["durationSeconds"] for row in plan["jobs"]
+                                 if row["id"] in retry_ids)
         estimated_credits = remaining_seconds * plan["pricing"]["creditsPerSecond"]
         if wallet_before < estimated_credits:
             raise PlanError("Insufficient existing Kie credits; no top-up or overage")
@@ -1025,7 +1092,18 @@ def execute(max_generated_seconds: int, submit: bool,
             "estimatedNewCredits": estimated_credits, "pricing": plan["pricing"],
             "maximumCredits": plan["maximumCredits"],
             "concurrency": concurrency, "noTopup": True,
+            **({"retrying": sorted(retry_ids), "retryBudget": retry_budget} if retry_ids else {}),
         })
+        if retry_ids:
+            # Each retry is a new paid POST of the identical request; the failed
+            # record moves into the job's numbered attempts and is never deleted.
+            for row in plan["jobs"]:
+                if row["id"] in retry_ids:
+                    archive_failure(row, len(history.get(row["id"], [])) + 1)
+            history = attempt_history(plan)
+            jobs = [row for row in plan["jobs"]
+                    if row["id"] in retry_ids or row["id"] in {job["id"] for job in jobs}]
+            failed = {}
         class DefiniteFailure(Exception):
             def __init__(self, facts):
                 super().__init__(f"provider failed task {facts['taskId']} "
@@ -1046,7 +1124,7 @@ def execute(max_generated_seconds: int, submit: bool,
             result = validate_completed(plan, row)
             result["resumed"] = False
             return result
-        check_charges(plan, completed, failed)
+        check_charges(plan, completed, failed, history, retry_credits)
         consecutive = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             for offset in range(0, len(jobs), concurrency):
@@ -1070,7 +1148,7 @@ def execute(max_generated_seconds: int, submit: bool,
                 log_refusals(failed)
                 if errors:
                     raise PlanError("; ".join(errors))
-                check_charges(plan, completed, failed)
+                check_charges(plan, completed, failed, history, retry_credits)
                 if consecutive >= CONSECUTIVE_FAILURE_BRAKE or (len(group) > 1 and group_failures == len(group)):
                     raise PlanError(
                         f"stopped after definite provider failures {sorted(failed)}; read "
@@ -1080,6 +1158,7 @@ def execute(max_generated_seconds: int, submit: bool,
             "episode": EPISODE_CODE,
             "executionManifestSha256": plan["manifestSha256"],
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
+            **({"retriedAttempts": history} if history else {}),
             "status": ("partial" if failed
                        else "technical-complete-creative-review-required"),
             **({"definiteFailures": list(failed.values()),
@@ -1342,6 +1421,10 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--submit", action="store_true",
                        help="paid run; requires --approval-admission")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="with --submit: re-POST each GENERATION_FAILED job with the identical "
+                             "request, moving its record to motion/<id>.attempts/; needs a version 3 "
+                             "approval record granting a retry budget")
     modes.add_argument("--reconcile-only", action="store_true",
                        help="poll and land already-submitted tasks; never POSTs and needs no approval")
     parser.add_argument("--approval-admission", type=Path,
@@ -1414,9 +1497,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.reconcile_only:
             result = reconcile(args.max_generated_seconds)
         else:
+            if args.retry_failed and not args.submit:
+                raise PlanError("--retry-failed only modifies --submit")
             result = execute(args.max_generated_seconds, args.submit,
                              args.approval_admission, args.concurrency,
-                             show_requests=args.print_requests)
+                             show_requests=args.print_requests, retry_failed=args.retry_failed)
     except PlanError as exc:
         raise SystemExit(f"REFUSED: {exc}") from exc
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))

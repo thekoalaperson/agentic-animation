@@ -25,6 +25,9 @@ ROOT_FIELDS = {
     "topUpAuthorized", "automaticRetryAuthorized", "manifests", "projectRoot",
 }
 MANIFEST_FIELDS = {"lane", "manifestPath", "manifestSha256", "finiteExecution"}
+# Version 3 is version 2 plus a retry grant: automaticRetryAuthorized true and a
+# retryBudget a person set. Everything else is checked by the version 2 rules.
+RETRY_BUDGET_FIELDS = {"jobs", "credits"}
 
 
 class PaidApprovalError(ValueError):
@@ -57,18 +60,51 @@ def validate_paid_approval(
     manifest_path: Path,
     manifest_sha256: str,
     finite_execution: dict[str, Any],
+    allow_retry_budget: bool = False,
 ) -> dict[str, Any] | None:
     """Return normalized authorization evidence, or ``None`` when not supplied.
 
     Version 2 binds a relocatable private project and explicit finite limits.
     Profiles do not authorize spending. Historical grants and their original
     runners remain immutable; this function never upgrades a legacy grant.
+
+    Version 3 adds a person's retry grant and is accepted only by a runner that
+    passes ``allow_retry_budget``; its other fields pass the version 2 checks.
     """
     if admission_path is None:
         return None
     admission_path = admission_path.resolve()
-    manifest_path = manifest_path.resolve()
     doc = _read_object(admission_path)
+    if doc.get("schemaVersion") == 3:
+        if not allow_retry_budget:
+            raise PaidApprovalError(f"the {lane} lane does not retry; use a version 2 record")
+        budget = doc.get("retryBudget")
+        if doc.get("automaticRetryAuthorized") is not True:
+            raise PaidApprovalError("a version 3 record exists to grant retries: "
+                                    "automaticRetryAuthorized must be true")
+        if (not isinstance(budget, dict) or set(budget) != RETRY_BUDGET_FIELDS
+                or isinstance(budget["jobs"], bool) or not isinstance(budget["jobs"], int)
+                or budget["jobs"] <= 0 or isinstance(budget["credits"], bool)
+                or not isinstance(budget["credits"], (int, float))
+                or not math.isfinite(budget["credits"]) or budget["credits"] <= 0):
+            raise PaidApprovalError("retryBudget must be {jobs, credits}, explicit positive limits")
+        view = {key: value for key, value in doc.items() if key != "retryBudget"}
+        view.update(schemaVersion=2, automaticRetryAuthorized=False)
+        evidence = _validate_document(view, admission_path, episode=episode, lane=lane,
+                                      manifest_path=manifest_path, manifest_sha256=manifest_sha256,
+                                      finite_execution=finite_execution)
+        return {**evidence, "schemaVersion": 3, "automaticRetryAuthorized": True,
+                "retryBudget": dict(budget)}
+    return _validate_document(doc, admission_path, episode=episode, lane=lane,
+                              manifest_path=manifest_path, manifest_sha256=manifest_sha256,
+                              finite_execution=finite_execution)
+
+
+def _validate_document(doc: dict[str, Any], admission_path: Path, *, episode: str, lane: str,
+                       manifest_path: Path, manifest_sha256: str,
+                       finite_execution: dict[str, Any]) -> dict[str, Any]:
+    """The version 2 checks, applied to the record as read."""
+    manifest_path = manifest_path.resolve()
     if set(doc) != ROOT_FIELDS:
         raise PaidApprovalError("paid authorization root schema mismatch")
     expected = {
