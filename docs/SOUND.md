@@ -29,9 +29,13 @@ a prompt asks for them.
 
 What this repository can do for continuity today: cut one long take into several
 placements with `sourceStart`/`sourceDuration`, which must cover the placement
-exactly with no retiming; shape the score's level across shots with the authored
-wave that `assemble_longform.py --wave` reads (`shots[].music_energy`); and lower
-or silence a stretch with `musicBreaths`. Musical edits often preserve a cue
+exactly with no retiming; continue an accepted take of an earlier cue in the
+same batch with `extend`, from a point you choose and with the same model (it
+waits until that take has landed, and the provider keeps files 14 days); shape
+the score's level across shots with the authored wave that
+`assemble_longform.py --wave` reads (`shots[].music_energy`, which
+`map_emotion_clock.py` can write from a `musicEnergy` spec), or keep each take's
+own dynamics; and lower or silence a stretch with `musicBreaths`. Musical edits often preserve a cue
 better than stretching it to an unrelated length. Listen to the returned
 composition and use its actual duration. Preserve starts, endings, and exact
 prompts when they are useful for later revisions.
@@ -39,17 +43,22 @@ prompts when they are useful for later revisions.
 Spotting decides where music enters, leaves, meets a picture moment and falls
 silent, and continuous scoring is one answer. The fields that carry it are the
 `scorePlacements` in `timeline-inputs.json` (`movement`, `take`,
-`timelineStart`/`timelineDuration`, an optional `sourceStart`/`sourceDuration`,
-`gainDb`, `fadeInSeconds`/`fadeOutSeconds`) and `musicBreaths` (a range of
-shots, a level and a reason; level 0 is silence). Today the mixer requires
-placements to cover the measured clock from start to end, so silence is made
-with a breath inside a placement rather than with a gap. A film with no audible
-score therefore still needs one admitted take, held at level 0 by a breath.
+`timelineStart`/`timelineDuration` or an `anchor`/`until` on a measured event's
+start, speech start, speech end or end plus an offset, an optional
+`sourceStart`/`sourceDuration`, `gainDb`, `fadeInSeconds`/`fadeOutSeconds`) and
+`musicBreaths` (a range of shots, a level and a reason; level 0 is silence). A
+gap between placements is silence, a placement may name a silence with a
+reason, and a film may declare itself `unscored`. A take shorter than its
+placement is looped at quiet points unless the placement sets
+`allowReprise: false`; the assembly records whether each take was trimmed,
+looped or cut to an authored window.
 
-The score lane today accepts instrumental requests only, with an empty lyrics
-prompt. The music ranker and the effects renderer read eight fixed emotion keys
-(`awe`, `dread`, `devotion`, `grief`, `hope`, `scale`, `kinetic`, `intimacy`).
-Those are the tools' input names, not a vocabulary a film has to think in.
+A cue may be sung. Its words are frozen in the cue's lyrics, and they are text
+in the film that the screenplay may not contain, so note whether they come from
+the source or were added, and whether they are subtitled. The emotion map's
+dimensions are the film's own. The ranker reads any set you declare, given your
+own proxy weights or each cue's own curves, and records the mapping it used.
+The effects renderer keeps the dimensions the wave declares.
 
 In a serial: does a theme belong to a person, a place or an idea? Does it return
 unchanged, or changed by what the story has done? Do some episodes hear none of
@@ -64,11 +73,17 @@ invent the one this film needs. Sound from outside the frame, and sound
 perspective (near or far, inside a head or out in the room), are tools as well.
 
 A dialogue clip arrives with its own room under the line, and today that room
-stays with the line through the edit. Keeping the room, replacing it with an
+stays with the line through the edit; a scene may let it run on before or after
+its kept window (`audioLead`, `audioTail`). Keeping the room, replacing it with an
 authored bed, and playing lines dry are all choices, but the last two need the
 line separated from its room, which no qualified tool here does yet. When the
 room stays, prompt the clip to match the scene and do not ask for the same ambience
 twice, once in the clip and again in an effects bed.
+
+An effects batch names the model that made it, or declares itself recorded or
+library sound (`route: recorded-or-library`) with each source's origin and its
+licence or terms beside the hash; the receipt names which. Licence terms
+change, so note the date they were read.
 
 Short concrete material and action prompts have produced more variety than a
 fixed tail of genre words appended to every request. Try different acoustic
@@ -85,13 +100,21 @@ Self-hosted text-to-audio is an available route, not a compulsory creative choic
 
 What the lanes do today:
 
-- The narration lane (`eleven_batch_finite.py`) takes one voice, one model and
-  language `hi` per manifest, with voice settings fixed at the root for the
-  whole batch. It sends no pronunciation dictionary. The numbers in its
-  docstring show the format; they are not a performance.
+- The narration lane (`eleven_batch_finite.py`) at manifest version 1 takes one
+  voice, one model and language `hi`, with voice settings fixed at the root and
+  no pronunciation dictionary. Version 2 (`--freeze --cast FILE`) casts a voice,
+  model and settings per speaker, may declare a language (sent only to models
+  whose provider page says they take one), per-item settings and seed, and up to
+  three pronunciation dictionaries. Its model list is dated; models no batch has
+  run are marked unexercised, and models whose credit rate the provider does not
+  publish are named in the dry run. The numbers in its docstring are documented
+  ranges, not a performance.
 - The dialogue route invents a voice for each clip from its still and prompt.
   Nothing keeps a character's voice the same from clip to clip, and nothing here
   measures the drift yet, so listen across clips.
+  `prepare_dialogue_review.py --measure-speech-windows` measures where speech
+  sits in each clip on any host, and `measure_dialogue_speech.py` compares a
+  worker transcript with the frozen line; neither judges the voice.
 - A dialogue clip is at most 15 seconds.
 
 Casting is a set of questions. How old does each voice sound, and how near? Which
@@ -115,6 +138,12 @@ Make a mix to hear it. Compare raw sounds and a few labelled scene versions when
 that answers a real question; do not build an approval ceremony around every cue.
 Waveforms and loudness measurements help diagnosis but cannot establish taste.
 Record listening limits honestly and preserve useful observations for reuse.
+
+The balance is authored too, within bounds: a line may keep its own level after
+the shared speech target (`voiceGains`), the mixer's bus balance and loudness
+targets may be set (`mix_absolute_sfx_longform.py --settings`), and a master
+revision records whether loudnorm reached its target with one gain or by riding
+the level, which `refuseDynamicMastering` can turn into a refusal.
 
 Inspect the combined gain of all processing stages and measure the encoded
 result. Preserve complete speech and native sync. A sound-only revision can
