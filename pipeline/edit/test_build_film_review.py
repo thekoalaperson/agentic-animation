@@ -39,6 +39,9 @@ class FilmReviewTest(unittest.TestCase):
         self.assertIn("the level was ridden", page)
         with self.assertRaisesRegex(ValueError, "loudnormSecondPass"):
             review.render(working_cut(mastering={"normalizationType": "guess"}), TEMPLATE)
+        for bad in ({"inputLra": None}, {"outputLra": float("nan")}, {"targetLra": True}):
+            with self.subTest(bad), self.assertRaisesRegex(ValueError, "finite inputLra"):
+                review.render(working_cut(mastering={**mastering, **bad}), TEMPLATE)
 
     def test_refusals_name_what_is_missing(self):
         cases = {

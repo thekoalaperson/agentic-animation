@@ -16,6 +16,7 @@ uploads or publishes.
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 
 REQUIRED = ('episode', 'title', 'reviewKey', 'reviewStatus', 'files', 'events')
@@ -44,6 +45,10 @@ def validate(data):
     if 'mastering' in data and (not isinstance(data['mastering'], dict)
                                 or data['mastering'].get('normalizationType') not in ('linear', 'dynamic')):
         raise ValueError('mastering must be the master audit loudnormSecondPass object')
+    if 'mastering' in data and not all(
+            isinstance(data['mastering'].get(key), (int, float)) and not isinstance(data['mastering'][key], bool)
+            and math.isfinite(data['mastering'][key]) for key in ('inputLra', 'outputLra', 'targetLra')):
+        raise ValueError('mastering needs finite inputLra, outputLra and targetLra')
     if 'reviewSummary' in data and not isinstance(data['reviewSummary'], (list, dict)):
         raise ValueError('reviewSummary must be the readiness object or a list of lines')
 

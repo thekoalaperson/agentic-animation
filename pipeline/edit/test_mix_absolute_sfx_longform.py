@@ -368,6 +368,13 @@ class MixerFixture(unittest.TestCase):
         self.assertEqual(mixer.second_pass_lra(settings, {"input_lra": "0.00"}), 1.0)
         self.assertEqual(mixer.measurement_lra(settings), 11.0)
 
+    def test_v2_settings_may_name_one_sidechain_value_alone(self) -> None:
+        settings = mixer.validate_settings({"settingsVersion": 2, "musicDuck": {"ratio": 3}})
+        self.assertEqual(settings["musicDuck"], {**mixer.default_settings()["musicDuck"], "ratio": 3})
+        self.assertEqual(settings["sfxDuck"], mixer.default_settings()["sfxDuck"])
+        with self.assertRaisesRegex(mixer.MixError, "musicDuck"):
+            mixer.validate_settings({"settingsVersion": 2, "musicDuck": {"knee": 2}})
+
     def test_v2_settings_out_of_bounds_or_unversioned_are_refused(self) -> None:
         cases = {
             "settingsVersion 2": {"musicGainDb": 3.0},
@@ -484,14 +491,16 @@ class MixerFixture(unittest.TestCase):
         self.assertEqual([row["event"] for row in bus["planFollowing"]["events"]],
                          ["scene-1", "scene-2", "scene-3"])
         self.assertIsNone(bus["planFollowing"]["listeningVerdict"])
-        if second["normalizationType"] == "dynamic":
-            master = self.episode / contract["outputs"]["bodyMaster"]
-            master.unlink()
-            refusing = copy.deepcopy(contract)
-            refusing["settings"] = mixer.validate_settings({"settingsVersion": 2, "refuseDynamicMastering": True})
-            with self.assertRaisesRegex(mixer.MixError, "dynamic gain"):
-                mixer.execute_mix(self.episode, contract_path, refusing)
-            self.assertFalse(master.exists())
+        # Steady tones measure no loudness range, so loudnorm cannot keep one gain;
+        # the refusal below must be exercised, not skipped.
+        self.assertEqual(second["normalizationType"], "dynamic")
+        master = self.episode / contract["outputs"]["bodyMaster"]
+        master.unlink()
+        refusing = copy.deepcopy(contract)
+        refusing["settings"] = mixer.validate_settings({"settingsVersion": 2, "refuseDynamicMastering": True})
+        with self.assertRaisesRegex(mixer.MixError, "dynamic gain"):
+            mixer.execute_mix(self.episode, contract_path, refusing)
+        self.assertFalse(master.exists())
 
     def test_render_run_must_preserve_semantic_segments_exactly_once(self) -> None:
         path = self.assembly / "picture-render-runs.json"

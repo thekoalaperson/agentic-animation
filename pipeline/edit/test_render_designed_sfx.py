@@ -425,6 +425,12 @@ class DesignedSfxContractTests(unittest.TestCase):
         self.assertEqual(recorded["origin"], "demo-recordist field take, demo-room")
         self.assertEqual(result["sourceRoutes"], {"a": sfx.DEFAULT_SFX_MODEL, "b": "recorded-or-library"})
 
+    def test_a_cue_naming_origin_itself_takes_the_brief_record(self):
+        self.recorded()
+        self.design["cues"][-1]["origin"] = "demo-note on the cue"
+        recorded = self.render_synthetic()[0]["cues"][1]
+        self.assertEqual(recorded["origin"], "demo-recordist field take, demo-room")
+
     def test_recorded_source_without_origin_or_terms_and_promptless_generation_are_refused(self):
         for changes in ({"origin": ""}, {"licence": None}, {"prompt": "a lamp hum"}):
             with self.subTest(changes):

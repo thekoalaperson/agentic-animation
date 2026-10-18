@@ -528,7 +528,8 @@ def check_bus_settings(settings: dict[str, Any], *, exact: bool = True) -> None:
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """Version 1 is exactly ``default_settings()``; version 2 is authored within bounds.
 
-    A version 2 file names ``settingsVersion: 2`` and only the values it changes.
+    A version 2 file names ``settingsVersion: 2`` and only the values it changes;
+    inside ``musicDuck`` and ``sfxDuck`` too, a single value may be named alone.
     Every other value keeps today's default, and the contract records the whole
     effective set, so its fingerprint binds every chosen value.
     """
@@ -542,6 +543,9 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise MixError(f"unknown mixer settings: {', '.join(sorted(unknown))}")
     result = {**default_settings(), "refuseDynamicMastering": False, **copy.deepcopy(settings)}
+    for key in ("musicDuck", "sfxDuck"):
+        if isinstance(settings.get(key), dict):
+            result[key] = {**default_settings()[key], **result[key]}
     check_bus_settings(result)
     if not -27 <= finite(result["targetIntegratedLufs"], "targetIntegratedLufs") <= -12:
         raise MixError("targetIntegratedLufs must lie within -27..-12")

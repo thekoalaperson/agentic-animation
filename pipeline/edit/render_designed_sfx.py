@@ -219,9 +219,9 @@ def render(ep,root):
         overlapping=[dict(id=p['id'],start=p['timelineStart'],end=p['timelineStart']+p['duration']) for p in picture if p['timelineStart']<c['at']+len(a)/SR and p['timelineStart']+p['duration']>c['at']]
         w=waves[c['shot']]
         origin={k:job[k] for k in ('origin','licence','terms') if k in job}
-        rows.append(dict(**c,source=str(src),sourceSha256=sha(src),sourcePrompt=job['prompt'],**origin,edited=str(out),sha256=sha(out),duration=len(a)/SR,
-                         filters=filters,tempoOutputLengthCorrectionSeconds=-length_error,gainDb=gain,peakSafetyGain=safety,
-                         emotion=emotion_values(w),picture=overlapping))
+        rows.append({**c,'source':str(src),'sourceSha256':sha(src),'sourcePrompt':job['prompt'],**origin,'edited':str(out),'sha256':sha(out),'duration':len(a)/SR,
+                     'filters':filters,'tempoOutputLengthCorrectionSeconds':-length_error,'gainDb':gain,'peakSafetyGain':safety,
+                     'emotion':emotion_values(w),'picture':overlapping})
         print(c['id'],round(len(a)/SR,3),flush=True)
     assert np.max(np.abs(stem))<.95
     if sha(root/'design.json')!=design_digest:
