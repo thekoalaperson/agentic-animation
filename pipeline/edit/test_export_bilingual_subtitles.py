@@ -179,6 +179,44 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         self.assertFalse(audit["deliveryApproval"])
         self.assertFalse(audit["publicationAuthorization"])
 
+    def retime(self, path, **changes) -> None:
+        doc = read_json(path)
+        doc.update(changes)
+        write_json(path, doc)
+
+    def test_default_master_and_widths_are_today_s_hindi_values(self) -> None:
+        audit = self.export()
+        self.assertEqual(audit["masterLanguage"], "hi")
+        self.assertEqual(audit["validation"]["maximumCharactersPerLine"], {"hi": 34, "en": 42})
+        self.assertEqual(list(audit["outputs"]), ["hi", "en"])
+
+    def test_timing_document_may_declare_its_reading_width(self) -> None:
+        self.retime(self.hi_path, maximumCharactersPerLine=12)
+        audit = self.export()
+        self.assertGreater(audit["cueCount"], 144)
+        self.assertEqual(audit["validation"]["maximumCharactersPerLine"], {"hi": 12, "en": 42})
+        text = (self.output / "demo_episode-hi.srt").read_text(encoding="utf-8")
+        self.assertTrue(all(len(line) <= 12 for line in text.splitlines() if line and "-->" not in line))
+
+    def test_master_language_is_read_from_the_timing_document(self) -> None:
+        self.retime(self.hi_path, language="mr", masterLanguage="mr")
+        self.retime(self.en_path, masterLanguage="mr")
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "mr master clock"):
+            self.export()
+        plan = read_json(self.plan_path)
+        plan["language"] = "mr"
+        write_json(self.plan_path, plan)
+        sync = read_json(self.sync_path)
+        sync["planSha256"] = exporter.sha256_file(self.plan_path)
+        write_json(self.sync_path, sync)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "maximumCharactersPerLine"):
+            self.export()
+        self.retime(self.hi_path, maximumCharactersPerLine=34)
+        audit = self.export()
+        self.assertEqual(audit["masterLanguage"], "mr")
+        self.assertTrue((self.output / "demo_episode-mr.srt").is_file())
+        self.assertEqual(audit["validation"]["maximumCharactersPerLine"], {"mr": 34, "en": 42})
+
     def test_refuses_deliverables_or_non_work_output(self) -> None:
         for target in (
             self.episode / "deliverables/subtitles",
