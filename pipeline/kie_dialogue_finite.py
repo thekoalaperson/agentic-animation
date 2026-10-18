@@ -647,7 +647,8 @@ def first_frame_difference(video: Path, still: Path) -> dict[str, Any]:
 PRICE_VARIANCE_REPORT_TOLERANCE = 1.25
 
 
-def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
+                  failed: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Compare landed charges with the frozen price; stop past maximumCredits.
 
     The cumulative ceiling is the refusal: every landed credit counts, however
@@ -670,6 +671,14 @@ def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) ->
                        ratioToDeclared=round(per_second / rate, 4),
                        aboveReportTolerance=per_second > rate * PRICE_VARIANCE_REPORT_TOLERANCE)
         rows.append(row)
+    for job_id, facts in (failed or {}).items():
+        # A failed task can still be charged; it counts toward the ceiling.
+        credits = facts.get("creditsConsumed")
+        if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+            cumulative += float(credits)
+        rows.append({"id": job_id, "credits": credits,
+                     "creditsSource": "failure-receipt" if credits is not None else None,
+                     "definiteFailure": True})
     over = cumulative > plan["maximumCredits"]
     report = {"manifestSha256": plan["manifestSha256"], "declaredCreditsPerSecond": rate,
               "maximumCredits": plan["maximumCredits"], "cumulativeLandedCredits": cumulative,
@@ -734,10 +743,76 @@ def validate_pending(plan: dict[str, Any], row: dict[str, Any], path: Path,
     return record
 
 
-def preflight(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Inspect every destination/recovery record before the first paid subprocess."""
+DEFINITE_FAILURE = "GENERATION_FAILED"
+# A wave stops after this many definite failures in a row, or when every job
+# of a concurrency group of two or more fails, so one bad prompt or a provider
+# outage cannot burn through a batch.
+CONSECUTIVE_FAILURE_BRAKE = 3
+
+
+def failure_facts(row: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """The raw facts of a definite provider failure; nothing is classified."""
+    response = record.get("lastProviderResponse")
+    response = response if isinstance(response, dict) else {}
+    def fact(key: str, response_key: str) -> Any:
+        return record[key] if record.get(key) is not None else response.get(response_key)
+    return {"id": row["id"], "taskId": record["taskId"], "promptSha256": row["promptSha256"],
+            "failCode": fact("failCode", "failCode"), "failMsg": fact("failMsg", "failMsg"),
+            "creditsConsumed": fact("credits", "creditsConsumed")}
+
+
+def log_refusals(failed: dict[str, dict[str, Any]]) -> None:
+    """Append each new definite failure to refusals.jsonl beside the manifest.
+
+    One line per provider task; operatorResponse is left for a person or agent
+    to fill with what they did about it.
+    """
+    path = HERE / "refusals.jsonl"
+    seen = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                seen.add(json.loads(line).get("taskId"))
+            except json.JSONDecodeError as exc:
+                raise PlanError(f"refusals log is unreadable: {path}: {exc}") from exc
+    from datetime import datetime, timezone
+    new = [facts for facts in failed.values() if facts["taskId"] not in seen]
+    if not new:
+        return
+    with path.open("a", encoding="utf-8") as log:
+        for facts in new:
+            log.write(json.dumps({
+                "jobId": facts["id"], "taskId": facts["taskId"],
+                "promptSha256": facts["promptSha256"], "failCode": facts["failCode"],
+                "failMsg": facts["failMsg"], "creditsConsumed": facts["creditsConsumed"],
+                "loggedAtUtc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "operatorResponse": None}, ensure_ascii=False, sort_keys=True) + "\n")
+        log.flush()
+        os.fsync(log.fileno())
+
+
+def definite_failure(plan: dict[str, Any], row: dict[str, Any]) -> dict[str, Any] | None:
+    """Facts of this job's recorded GENERATION_FAILED task, or None for any other state."""
+    recovery = row["outputPath"].with_suffix(".pending.json")
+    if not recovery.exists():
+        return None
+    status = read_object(recovery, f"{row['id']} pending recovery record").get("status")
+    if status != DEFINITE_FAILURE:
+        return None
+    return failure_facts(row, validate_pending(plan, row, recovery, {DEFINITE_FAILURE}))
+
+
+def preflight(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]],
+                                             dict[str, dict[str, Any]]]:
+    """Inspect every destination/recovery record before the first paid subprocess.
+
+    Returns jobs still to run, landed jobs, and definite provider failures. A
+    failure with a recorded task ID is skipped and never re-POSTed; every
+    other recovery state still halts.
+    """
     pending: list[dict[str, Any]] = []
     completed: dict[str, dict[str, Any]] = {}
+    failed: dict[str, dict[str, Any]] = {}
     for row in plan["jobs"]:
         stem = row["outputPath"]
         video = stem.with_suffix(".mp4")
@@ -757,9 +832,12 @@ def preflight(plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dic
                 recovery.unlink()
             continue
         if recovery.exists():
-            validate_pending(plan, row, recovery)
+            record = validate_pending(plan, row, recovery, {"PENDING", DEFINITE_FAILURE})
+            if record["status"] == DEFINITE_FAILURE:
+                failed[row["id"]] = failure_facts(row, record)
+                continue
         pending.append(row)
-    return pending, completed
+    return pending, completed, failed
 
 
 def acquire_lock(path: Path, manifest_sha256: str) -> None:
@@ -812,11 +890,13 @@ def require_media_host() -> None:
     subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], check=True, capture_output=True)
 
 
-def write_progress(plan: dict[str, Any], completed: dict[str, dict[str, Any]]) -> None:
+def write_progress(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
+                   failed: dict[str, dict[str, Any]] | None = None) -> None:
     atomic_json(HERE / "progress.json", {
         "manifestSha256": plan["manifestSha256"],
         "completed": list(completed.values()),
         "jobCount": len(plan["jobs"]),
+        **({"definiteFailures": list(failed.values())} if failed else {}),
     })
 
 
@@ -846,7 +926,7 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
     require_media_host()
     acquire_lock(LOCK, plan["manifestSha256"])
     try:
-        jobs, completed = preflight(plan)
+        jobs, completed, definite = preflight(plan)
         reconciled, unsubmitted, failed = [], [], []
         for row in jobs:
             if not row["outputPath"].with_suffix(".pending.json").exists():
@@ -855,13 +935,19 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
             result = subprocess.run(kie_video_command(plan, row) + ["--resume-only"], cwd=ROOT,
                                     env=upload_env())
             if result.returncode:
-                failed.append(row["id"])
+                facts = definite_failure(plan, row)
+                if facts:
+                    definite[row["id"]] = facts
+                else:
+                    failed.append(row["id"])
                 continue
             completed[row["id"]] = {**validate_completed(plan, row), "resumed": True}
             reconciled.append(row["id"])
-            write_progress(plan, completed)
+            write_progress(plan, completed, definite)
+        log_refusals(definite)
         return {"mode": "RECONCILE_ONLY", "generationPosts": 0,
                 "reconciled": reconciled, "unsubmitted": unsubmitted, "failed": failed,
+                **({"definiteFailures": sorted(definite)} if definite else {}),
                 "completed": len(completed), "jobCount": len(plan["jobs"]),
                 "manifestSha256": plan["manifestSha256"]}
     finally:
@@ -910,7 +996,8 @@ def execute(max_generated_seconds: int, submit: bool,
         raise PlanError("concurrency must be 1, 2 or 3")
     acquire_lock(LOCK, plan["manifestSha256"])
     try:
-        jobs, completed = preflight(plan)
+        jobs, completed, failed = preflight(plan)
+        log_refusals(failed)
         authorization_path = HERE / "execution-authorization.json"
         evidence = {"executionManifestSha256": plan["manifestSha256"], "approval": approval}
         if authorization_path.exists():
@@ -939,10 +1026,19 @@ def execute(max_generated_seconds: int, submit: bool,
             "maximumCredits": plan["maximumCredits"],
             "concurrency": concurrency, "noTopup": True,
         })
+        class DefiniteFailure(Exception):
+            def __init__(self, facts):
+                super().__init__(f"provider failed task {facts['taskId']} "
+                                 f"({facts['failCode']}: {facts['failMsg']})")
+                self.facts = facts
+
         def generate_row(row):
             stem = row["outputPath"]
             result = subprocess.run(kie_video_command(plan, row), cwd=ROOT, env=upload_env())
             if result.returncode:
+                facts = definite_failure(plan, row)
+                if facts:
+                    raise DefiniteFailure(facts)
                 recovery = stem.with_suffix(".pending.json")
                 state = ("durable recovery state exists" if recovery.exists()
                          else "no recovery state was recorded")
@@ -950,28 +1046,45 @@ def execute(max_generated_seconds: int, submit: bool,
             result = validate_completed(plan, row)
             result["resumed"] = False
             return result
-        check_charges(plan, completed)
+        check_charges(plan, completed, failed)
+        consecutive = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             for offset in range(0, len(jobs), concurrency):
                 group = jobs[offset:offset + concurrency]
                 futures = [pool.submit(generate_row, row) for row in group]
-                errors = []
+                errors, group_failures = [], 0
                 for row, future in zip(group, futures):
                     try:
                         completed[row["id"]] = future.result()
-                        write_progress(plan, completed)
+                        consecutive = 0
+                        write_progress(plan, completed, failed)
                         print(f"TECHNICAL COMPLETE {len(completed)}/{len(plan['jobs'])}: {row['id']}", flush=True)
+                    except DefiniteFailure as exc:
+                        failed[row["id"]] = exc.facts
+                        consecutive += 1
+                        group_failures += 1
+                        write_progress(plan, completed, failed)
+                        print(f"DEFINITE FAILURE {row['id']}: {exc}", flush=True)
                     except Exception as exc:
                         errors.append(f"{row['id']}: {exc}")
+                log_refusals(failed)
                 if errors:
                     raise PlanError("; ".join(errors))
-                check_charges(plan, completed)
-        ordered = [completed[row["id"]] for row in plan["jobs"]]
+                check_charges(plan, completed, failed)
+                if consecutive >= CONSECUTIVE_FAILURE_BRAKE or (len(group) > 1 and group_failures == len(group)):
+                    raise PlanError(
+                        f"stopped after definite provider failures {sorted(failed)}; read "
+                        "refusals.jsonl before running the rest (landed and failed jobs are skipped)")
+        ordered = [completed[row["id"]] for row in plan["jobs"] if row["id"] in completed]
         audit = {
             "episode": EPISODE_CODE,
             "executionManifestSha256": plan["manifestSha256"],
             "approvalAdmissionSha256": approval["sha256"] if approval else None,
-            "status": "technical-complete-creative-review-required",
+            "status": ("partial" if failed
+                       else "technical-complete-creative-review-required"),
+            **({"definiteFailures": list(failed.values()),
+                "nextStep": "creative review of landed jobs; a failed job is retried only "
+                            "as a new frozen manifest with its own approval"} if failed else {}),
             "generatedSecondsCap": max_generated_seconds,
             "count": len(ordered),
             "items": ordered,
@@ -983,8 +1096,8 @@ def execute(max_generated_seconds: int, submit: bool,
         audit_path = HERE / "technical-audit.json"
         atomic_json(audit_path, audit)
         return {"mode": "SUBMIT", "networkCalls": len(jobs),
-                "status": "COMPLETED", "audit": str(audit_path),
-                "items": len(ordered)}
+                "status": "PARTIAL" if failed else "COMPLETED", "audit": str(audit_path),
+                "items": len(ordered), **({"failed": sorted(failed)} if failed else {})}
     finally:
         LOCK.unlink(missing_ok=True)
 

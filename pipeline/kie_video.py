@@ -636,8 +636,13 @@ def main(argv=None):
         if state in ('success', 'fail'):
             break
     if state == 'fail':
+        # A definite provider failure: the runner skips it and never re-POSTs.
+        # The refusal facts are lifted beside the raw response; credits keeps
+        # the sidecar's name.
+        facts = rec if isinstance(rec, dict) else {}
         orphan.update(status='GENERATION_FAILED', lastProviderResponse=rec,
-                      providerFinishedAt=time.time())
+                      providerFinishedAt=time.time(), failCode=facts.get('failCode'),
+                      failMsg=facts.get('failMsg'), credits=facts.get('creditsConsumed'))
         atomic_json(pending, orphan, replace=True)
     elif state != 'success':
         orphan.update(status='PENDING', lastProviderResponse=rec,

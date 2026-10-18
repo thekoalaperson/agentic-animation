@@ -420,6 +420,50 @@ class KieVideoFiniteSafetyTest(unittest.TestCase):
             self.assertEqual(DIALOGUE.first_frame_difference(video, root / "missing.png")["method"],
                              "unmeasured")
 
+    def test_provider_failure_is_recorded_as_definite_and_never_reposted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt, frame, stem, argv, source_sha, manifest_sha, execution_sha = self.fixture(root)
+            creates = []
+
+            def kie(route, payload=None):
+                if route == "chat/credit":
+                    return 1000
+                if route == "jobs/createTask":
+                    creates.append(payload)
+                    return {"taskId": "task-offline-failed"}
+                return {"state": "fail", "failCode": "demo-code", "failMsg": "demo refusal",
+                        "creditsConsumed": 0}
+
+            with mock.patch.object(VIDEO, "upload_ref", return_value="https://offline/frame.png"), \
+                 mock.patch.object(VIDEO, "kie", side_effect=kie), \
+                 mock.patch.object(VIDEO, "usd_per_credit", return_value=None), \
+                 mock.patch.object(VIDEO.time, "sleep"):
+                with self.assertRaisesRegex(SystemExit, "ended fail"):
+                    VIDEO.main(argv)
+                with self.assertRaisesRegex(SystemExit, "GENERATION_FAILED.*manual reconciliation"):
+                    VIDEO.main(argv)
+            self.assertEqual(len(creates), 1)
+            pending = stem.with_suffix(".pending.json")
+            record = json.loads(pending.read_text(encoding="utf-8"))
+            self.assertEqual((record["status"], record["failCode"], record["failMsg"], record["credits"]),
+                             ("GENERATION_FAILED", "demo-code", "demo refusal", 0))
+            self.assertEqual(record["provenanceVersion"], 2)
+
+            plan = {"manifestSha256": manifest_sha, "model": "grok-imagine-video-1-5-preview",
+                    "resolution": "720p", "aspectRatio": "16:9"}
+            row = {"id": "demo-s1001", "sourceSha256": source_sha,
+                   "promptSha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                   "durationSeconds": 6, "promptPath": prompt, "outputPath": stem,
+                   "executionRequestSha256": execution_sha, "sourcePath": frame,
+                   "referencePaths": [], "referenceSha256s": []}
+            with self.assertRaisesRegex(DIALOGUE.PlanError, "not auto-retryable"):
+                DIALOGUE.validate_pending(plan, row, pending)
+            facts = DIALOGUE.definite_failure(plan, row)
+            self.assertEqual(facts, {"id": "demo-s1001", "taskId": "task-offline-failed",
+                                     "promptSha256": row["promptSha256"], "failCode": "demo-code",
+                                     "failMsg": "demo refusal", "creditsConsumed": 0})
+
 
 if __name__ == "__main__":
     unittest.main()

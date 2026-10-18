@@ -3,7 +3,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -174,6 +176,127 @@ class DialogueFiniteTest(unittest.TestCase):
         self.assertEqual(RUNNER.minimum_geometry('720p', '16:9'), (1200.0, 675.0))
         self.assertEqual(RUNNER.minimum_geometry('1080p', '9:16'), (1012.5, 1800.0))
         self.assertEqual(RUNNER.minimum_geometry('480p', '1:1'), (450.0, 450.0))
+
+    def add_jobs(self, count):
+        for number in range(2, count + 1):
+            job_id = f'demo-s100{number}'
+            prompt = self.work / f'prompts/{job_id}.txt'
+            prompt.write_text(f'Exact Hindi: नमस्ते {number}।', encoding='utf-8')
+            self.doc['jobs'].append(dict(self.doc['jobs'][0], id=job_id, hindi=f'नमस्ते {number}।',
+                prompt=str(prompt.relative_to(self.ep)), promptSha256=RUNNER.sha256(prompt),
+                outputStem=str((self.work/f'motion/{job_id}').relative_to(self.ep))))
+        self.doc.update(jobCount=count, maximumGeneratedSeconds=7 * count, maximumCredits=35 * count)
+        self.save()
+        return 7 * count
+
+    def run_wave(self, outcomes, seconds, concurrency=1):
+        """Submit with kie_video replaced: 'land', 'fail' (definite) or 'lost' per job id."""
+        invoked = []
+        def fake_run(command, **kwargs):
+            if command[0] == 'nvidia-smi':
+                return mock.Mock(returncode=0)
+            job_id = command[command.index('--job-id') + 1]
+            invoked.append(job_id)
+            stem = self.work / 'motion' / job_id
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            if outcomes[job_id] == 'land':
+                stem.with_suffix('.mp4').write_bytes(b'offline')
+                stem.with_suffix('.vid.json').write_text('{}')
+                return mock.Mock(returncode=0)
+            if outcomes[job_id] == 'fail':
+                stem.with_suffix('.pending.json').write_text(json.dumps({
+                    'status': 'GENERATION_FAILED', 'taskId': f'task-{job_id}', 'failCode': 'demo-code',
+                    'failMsg': 'demo refusal', 'credits': None}))
+            return mock.Mock(returncode=1)
+        landed = lambda plan, row: {'id': row['id'], 'durationSeconds': 7.0, 'credits': None,
+                                    'creditsSource': None, 'taskId': f'task-{row["id"]}'}
+        fake_common = types.SimpleNamespace(kie=lambda route: 10_000)
+        approval = self.approval_for(seconds)
+        with mock.patch.object(RUNNER.platform, 'system', return_value='Linux'), \
+             mock.patch.object(RUNNER.subprocess, 'run', side_effect=fake_run), \
+             mock.patch.object(RUNNER, 'validate_completed', side_effect=landed), \
+             mock.patch.object(RUNNER, 'validate_pending',
+                               side_effect=lambda plan, row, path, allowed=None: json.loads(path.read_text())), \
+             mock.patch.dict(sys.modules, {'_common': fake_common}):
+            try:
+                return RUNNER.execute(seconds, True, approval, concurrency), invoked
+            except RUNNER.PlanError as exc:
+                return exc, invoked
+
+    def approval_for(self, seconds):
+        plan = RUNNER.load_plan(self.manifest, seconds)
+        path = self.ep/'story/approvals/dialogue.json'
+        path.unlink(missing_ok=True)
+        return write_approval(path, episode='DEMO', lane=RUNNER.APPROVAL_LANE, manifest=self.manifest,
+                              scope=RUNNER.approval_scope(plan), project_root=self.ep)
+
+    def refusals(self):
+        log = self.work / 'refusals.jsonl'
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_a_definite_failure_is_skipped_logged_and_never_reposted(self):
+        seconds = self.add_jobs(3)
+        outcomes = {'demo-s1001': 'land', 'demo-s1002': 'fail', 'demo-s1003': 'land'}
+        result, invoked = self.run_wave(outcomes, seconds)
+        self.assertEqual((result['status'], result['failed'], result['items']),
+                         ('PARTIAL', ['demo-s1002'], 2))
+        self.assertEqual(invoked, ['demo-s1001', 'demo-s1002', 'demo-s1003'])
+        audit = json.loads((self.work/'technical-audit.json').read_text())
+        self.assertEqual(audit['status'], 'partial')
+        self.assertEqual([f['id'] for f in audit['definiteFailures']], ['demo-s1002'])
+        [logged] = self.refusals()
+        self.assertEqual((logged['jobId'], logged['taskId'], logged['failCode'], logged['operatorResponse']),
+                         ('demo-s1002', 'task-demo-s1002', 'demo-code', None))
+        result, invoked = self.run_wave(outcomes, seconds)
+        self.assertEqual((result['status'], invoked), ('PARTIAL', []))
+        self.assertEqual(len(self.refusals()), 1)
+
+    def test_consecutive_definite_failures_stop_the_wave(self):
+        seconds = self.add_jobs(4)
+        result, invoked = self.run_wave({f'demo-s100{n}': 'fail' for n in range(1, 5)}, seconds)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('stopped after definite provider failures', str(result))
+        self.assertEqual(invoked, ['demo-s1001', 'demo-s1002', 'demo-s1003'])
+        self.assertEqual(len(self.refusals()), 3)
+        self.assertFalse(RUNNER.LOCK.exists())
+
+    def test_a_whole_failed_concurrency_group_stops_the_wave(self):
+        seconds = self.add_jobs(4)
+        outcomes = {'demo-s1001': 'fail', 'demo-s1002': 'fail', 'demo-s1003': 'land', 'demo-s1004': 'land'}
+        result, invoked = self.run_wave(outcomes, seconds, concurrency=2)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertEqual(sorted(invoked), ['demo-s1001', 'demo-s1002'])
+
+    def test_any_other_failure_still_halts(self):
+        seconds = self.add_jobs(2)
+        result, invoked = self.run_wave({'demo-s1001': 'lost', 'demo-s1002': 'land'}, seconds)
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('no recovery state was recorded', str(result))
+        self.assertEqual(invoked, ['demo-s1001'])
+        self.assertEqual(self.refusals(), [])
+
+    def test_failed_task_charges_count_toward_the_ceiling(self):
+        plan = RUNNER.load_plan(self.manifest, 7)
+        plan['maximumCredits'] = 10
+        with self.assertRaisesRegex(RUNNER.PlanError, 'exceed maximumCredits'):
+            RUNNER.check_charges(plan, {}, {'demo-s1001': {'creditsConsumed': 11}})
+
+    def test_reconcile_only_reports_definite_failures_without_polling_them(self):
+        pending = self.work/'motion/demo-s1001.pending.json'
+        pending.parent.mkdir(parents=True)
+        pending.write_text(json.dumps({'status': 'GENERATION_FAILED', 'taskId': 'task-failed',
+                                       'lastProviderResponse': {'failCode': 'demo-code',
+                                                                'failMsg': 'demo refusal',
+                                                                'creditsConsumed': 0}}))
+        with mock.patch.object(RUNNER.platform,'system',return_value='Linux'), \
+             mock.patch.object(RUNNER.subprocess,'run',return_value=mock.Mock(returncode=0)) as run, \
+             mock.patch.object(RUNNER,'validate_pending',
+                               side_effect=lambda plan, row, path, allowed=None: json.loads(path.read_text())):
+            result = RUNNER.reconcile(7)
+        self.assertEqual(result['definiteFailures'], ['demo-s1001'])
+        self.assertEqual(run.call_count, 1)  # the GPU check only
+        [logged] = self.refusals()
+        self.assertEqual((logged['failCode'], logged['creditsConsumed']), ('demo-code', 0))
 
     def test_changed_source_refused(self):
         self.source.write_bytes(b'changed')
