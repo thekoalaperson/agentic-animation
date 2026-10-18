@@ -67,6 +67,12 @@ class DeckTest(unittest.TestCase):
             self.assertGreaterEqual(len(values), 8, name)
             self.assertEqual(len(values), len(set(values)), name)
 
+    def test_committed_axes_list_their_values_in_alphabetical_order(self):
+        # Alphabetical order is the file's way of carrying no ranking: a value
+        # placed first would otherwise read as the preferred one.
+        for name, values in tool.read_axes().items():
+            self.assertEqual(values, sorted(values, key=str.casefold), name)
+
     def test_axes_draw_one_value_per_axis_and_a_seed_repeats_it(self):
         axes = tool.read_axes()
         first = tool.draw_axes(axes, random.Random(11))
