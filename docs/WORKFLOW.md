@@ -9,6 +9,7 @@ sequences. Choose the amount of process that helps the work.
 | Need | Useful tools |
 |---|---|
 | Register stills and trace dependencies | `register_builtin_imagegen.py`, `asset_registry.py` |
+| Register a take, cue or picture from any hand | `register_supplied_media.py` |
 | Generate hosted motion/dialogue | `kie_video.py`, `kie_dialogue_finite.py` |
 | Generate narration or score | `eleven_batch_finite.py`, `kie_music_finite.py` |
 | Check dialogue clips against their lines | `prepare_dialogue_review.py --measure-speech-windows` (any host), `measure_dialogue_speech.py` (worker) |

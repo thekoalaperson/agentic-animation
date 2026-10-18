@@ -297,14 +297,46 @@ def log_upload(log, raw, host, remote_name):
         os.fsync(target.fileno())
 
 
+# Sidecars beside a file that may declare its rights. A supplied-media
+# sidecar is <name>.supplied.json; a registered still's is <stem>.imagegen.json.
+RIGHTS_SIDECARS = (lambda p: p.with_name(p.name + '.supplied.json'),
+                   lambda p: p.with_suffix('.imagegen.json'))
+
+
+def provider_upload_forbidden(p):
+    """The sidecar that forbids sending this file to a provider, or None.
+
+    A guard against accidental upload of material its maker withheld, not DRM:
+    the declaration lives in the sidecar the operator registered.
+    """
+    p = pathlib.Path(p)
+    for sidecar_of in RIGHTS_SIDECARS:
+        sidecar = sidecar_of(p)
+        if not sidecar.is_file():
+            continue
+        try:
+            record = json.loads(sidecar.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f'cannot read the rights sidecar {sidecar}: {exc}') from exc
+        rights = record.get('rights') if isinstance(record, dict) else None
+        if isinstance(rights, dict) and rights.get('providerUpload') == 'forbidden':
+            return sidecar
+    return None
+
+
 def upload_ref(p, log=None):
     """Upload one file to Kie's file host and return its URL.
 
     Each upload is appended to ``log`` (or ``AGENTIC_UPLOAD_LOG``), a
     project-local record of which bytes left the machine and where. With
-    neither, nothing is uploaded.
+    neither, nothing is uploaded. A file whose sidecar says
+    ``rights.providerUpload: forbidden`` is never uploaded.
     """
     p = pathlib.Path(p)
+    forbidden = provider_upload_forbidden(p)
+    if forbidden is not None:
+        raise ValueError(f'refusing to upload {p.name}: {forbidden.name} says '
+                         'rights.providerUpload is forbidden')
     log = log or os.environ.get('AGENTIC_UPLOAD_LOG')
     if not log:
         raise ValueError(f'refusing to upload {p.name} without an upload log: '

@@ -25,6 +25,8 @@ else:
 SIDECARS = {
     '.imagegen.json': '.png', '.refpack.json': '.png', '.kie.json': '.png',
     '.vid.json': '.mp4', '.ingest.json': '.mp4', '.or.json': '.png',
+    # <name>.supplied.json names its file in full; see register_supplied_media.py.
+    '.supplied.json': '',
 }
 
 
@@ -73,6 +75,10 @@ def references(record: dict) -> list[str]:
         value = record.get(key)
         if isinstance(value, str) and value:
             result.append(value)
+    derived = record.get('derivedFrom')
+    if record.get('kind') == 'supplied_media' and isinstance(derived, dict):
+        if isinstance(derived.get('path'), str) and derived['path']:
+            result.append(derived['path'])
     if record.get('kind') == 'built_in_imagegen_reference_pack':
         result.extend(row['source'] for row in record.get('sources', [])
                       if isinstance(row, dict) and isinstance(row.get('source'), str))
