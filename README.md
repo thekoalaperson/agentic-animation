@@ -5,7 +5,7 @@ story, approved references, provider accounts, and GPU workers. Productions live
 outside this checkout; this repository contains no films, private scripts, voice
 identities, account configuration, or model weights.
 
-The current production path combines reference-grounded stills, MiniMax H3
+One exercised route combines reference-grounded stills, MiniMax H3
 non-dialogue picture, Grok native dialogue, ElevenLabs narration, Suno scoring,
 self-hosted sound effects, and source-bound editing. The Hindi performance with
 Hindi/English subtitles is the qualified preset; other languages require their
