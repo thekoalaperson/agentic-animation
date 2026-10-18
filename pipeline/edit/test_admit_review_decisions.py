@@ -130,6 +130,29 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertIn({"type": "approved-dialogue-verdict", "sceneId": "demo-s003", "actual": "rejected"},
                       ready["missing"])
 
+    def test_rejecting_another_take_keeps_the_admitted_one(self):
+        before = self.read(self.config)["dialogueOutputs"]["demo-s003"]
+        correction_dir = self.ep / "work/grok-dialogue-corrections-v1"
+        correction_dir.mkdir()
+        manifest = correction_dir / "execution-manifest.json"
+        doc = self.read(self.ep / "work/grok-dialogue-v1/execution-manifest.json")
+        doc["jobs"][0]["outputStem"] = "work/grok-dialogue-corrections-v1/demo-s003"
+        self.write_json(manifest, doc)
+        take = correction_dir / "demo-s003.mp4"
+        take.write_bytes(b"a correction take")
+        self.write_json(correction_dir / "demo-s003.vid.json", {
+            "sha256": self.sha(take), "outputSha256": self.sha(take),
+            "executionManifestSha256": self.sha(manifest)})
+        result = self.admit("dialogue", self.decide([{
+            "itemId": "demo-s003", "decision": "rejected", "reviewedAt": AT,
+            "executionManifest": "work/grok-dialogue-corrections-v1/execution-manifest.json"}]))
+        self.assertEqual((result["notAdmitted"], result["currentKept"]), (["demo-s003"], ["demo-s003"]))
+        self.assertEqual(self.read(self.config)["dialogueOutputs"]["demo-s003"], before)
+        export = self.read(self.ep / "work/review/dialogue-review-v1.json")
+        self.assertEqual(export["reviews"][0]["source"]["path"], "work/grok-dialogue-corrections-v1/demo-s003.mp4")
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready["errors"])
+
     def test_check_mode_writes_nothing(self):
         self.unadmit_dialogue()
         before = self.config.read_bytes()
@@ -189,6 +212,23 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(result["unplaced"], ["m1-test take 1"])
         self.assertEqual(self.read(self.config).get("scorePlacements", []), [])
 
+    def test_a_rejected_score_take_adds_no_placement_and_leaves_the_cut(self):
+        self.make_score()
+        placed = {"itemId": "m1-test", "take": 1, "reviewedAt": AT,
+                  "timelineStart": 0.0, "timelineDuration": 10.0}
+        result = self.admit("score", self.decide([dict(placed, decision="rejected")]))
+        self.assertEqual(result["notAdmitted"], ["m1-test take 1"])
+        self.assertEqual(self.read(self.config)["scorePlacements"], [])
+        self.admit("score", self.decide([dict(placed, decision="approved")], name="approve.json"))
+        self.assertEqual([p["id"] for p in self.read(self.config)["scorePlacements"]], ["m1-test-take-1"])
+        result = self.admit("score", self.decide([dict(placed, decision="rejected")], name="reject.json"))
+        self.assertEqual(result["removedPlacements"], ["m1-test-take-1"])
+        self.assertEqual(self.read(self.config)["scorePlacements"], [])
+        archived = self.read(self.ep / "work/assembly-v1/timeline-inputs-v3.json")
+        self.assertEqual(len(archived["scorePlacements"]), 1)
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready["errors"])
+
     def make_h3_audit(self, scenes, receipt=True):
         """A local audit as review_finite.py leaves it after a grouped ingest."""
         root = self.ep / "work/h3-run"
@@ -234,6 +274,22 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(ready["reviewSummary"]["h3"]["admitted"], 3)
         self.assertEqual(ready["reviewSummary"]["h3"]["methods"], {"frame sheet": 3})
 
+    def test_h3_re_review_of_the_same_bytes_keeps_the_authored_trim(self):
+        (self.ep / "work/h3-review-ledger-v1.json").unlink()
+        audit = self.make_h3_audit(("demo-s001", "demo-s002", "demo-s004"))
+        rows = [{"itemId": f"{scene}-job", "sceneId": scene, "decision": "approved", "reviewedAt": AT}
+                for scene in ("demo-s001", "demo-s002", "demo-s004")]
+        rows[1].update({"in": 0.5, "out": 2.5, "speed": 1.0, "role": "demo-role"})
+        self.admit("h3", self.decide(rows), audit_path=audit)
+        self.admit("h3", self.decide([dict(rows[1], method="full playback", **{
+            k: None for k in ("in", "out", "speed", "role")})], name="again.json"), audit_path=audit)
+        segments = self.read(self.ep / "work/review/h3-review-ledger-v2.json")["entries"]["demo-s002"]["segments"]
+        self.assertEqual(len(segments), 1)
+        self.assertEqual({k: segments[0][k] for k in ("in", "out", "speed", "role", "method")},
+                         {"in": 0.5, "out": 2.5, "speed": 1.0, "role": "demo-role", "method": "full playback"})
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.probe_with_silent)
+        self.assertTrue(ready["ready"], ready["errors"])
+
     def test_h3_refuses_to_guess_the_row_or_drop_an_origin(self):
         (self.ep / "work/h3-review-ledger-v1.json").unlink()
         audit = self.make_h3_audit(("demo-s002",), receipt=False)
@@ -262,8 +318,9 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
         self.assertEqual(stop.exception.code, 0)
 
 
-class ScoreBenchExportTest(unittest.TestCase):
-    def test_bench_exports_the_decisions_shape(self):
+class ScoreBenchTemplateTest(unittest.TestCase):
+    def test_bench_template_names_the_decisions_fields(self):
+        # The shape itself is proved by the score admission tests above.
         page = (Path(__file__).resolve().parents[1] / "score_candidate_review_template.html").read_text()
         for field in ("lane:'score'", "reviewedBy", "itemId", "take:", "decision", "reviewedAt"):
             self.assertIn(field, page)

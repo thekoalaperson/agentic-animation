@@ -38,12 +38,22 @@ Per lane, a row also carries:
   ``sceneId`` (default ``itemId``), ``reuseReason`` and ``speechWindow``.
 * ``score`` -- ``itemId`` is the cue ID and ``take`` its candidate index. A
   placement already authored for that take is pointed at the new record;
-  ``timelineStart`` and ``timelineDuration`` on the row add one.
+  ``timelineStart`` and ``timelineDuration`` on the row add one, named by
+  ``placementId`` or ``<cue>-take-<n>``. A decision that is not an acceptance
+  adds no placement and removes the take's placements from the inputs (the
+  archived inputs keep them); the report names them.
 * ``h3`` -- ``itemId`` is the job ID in ``--audit`` (``review_finite.py``'s
   ``local-audit.json``) and ``sceneId`` the storyboard row it covers, which may
   be left out only when it equals ``itemId``. Optional ``in``, ``out``,
   ``speed``, ``role`` and ``origin``; the origin defaults to the job's grouped
-  ingest receipt when the audit names one.
+  ingest receipt when the audit names one. A take already in the row's
+  segments is re-decided in place: each of its windows keeps its ``in``,
+  ``out``, ``speed`` and ``role`` unless the row restates them. A second
+  window cut from one take is authored in the ledger; this tool then keeps it.
+
+A dialogue decision that is not an acceptance, for a take other than the one
+the scene already holds, is recorded in the export and leaves the scene's
+current take in place; the report lists it under ``currentKept``.
 
 The tool refuses when any source or sidecar hash has changed since it was
 recorded, and refuses the whole file if any row is unusable.
@@ -194,6 +204,7 @@ class Admission:
         self.documents = {label: self.path(raw) for label, raw in
                           lane_documents(self.episode, self.episode, self.config_path, self.config).items()}
         self.report: dict[str, list[str]] = {"admitted": [], "notAdmitted": [], "unplaced": []}
+        self.rewritten: set[str] = set()
 
     def path(self, raw: Any, owner: Path | None = None) -> Path:
         return _resolve_path(self.episode, self.episode, owner or self.config_path, str(raw))
@@ -266,6 +277,12 @@ class Admission:
                         binding_paths.append(path)
                 scene = str(row.get("sceneId") or item)
                 previous = outputs.get(scene) if isinstance(outputs.get(scene), dict) else {}
+                self.tally(scene, record["decision"])
+                if (_normal_verdict(record["decision"]) not in ACCEPTED and previous
+                        and previous.get("sha256") != source_sha):
+                    # Rejecting another take leaves the scene's current take in place.
+                    self.report.setdefault("currentKept", []).append(scene)
+                    continue
                 # Editorial choices made on this exact take survive a re-review.
                 entry = dict(previous) if previous.get("sha256") == source_sha else {}
                 entry.update(path=self.rel(source), verdict=record["decision"], sha256=source_sha,
@@ -282,7 +299,7 @@ class Admission:
                     if row.get("reuseReason"):
                         entry["reuseReason"] = row["reuseReason"]
                 outputs[scene] = entry
-                self.tally(scene, record["decision"])
+                self.rewritten.add(scene)
             except (AdmissionError, KeyError, TypeError) as exc:
                 errors.append(str(exc))
         if errors:
@@ -337,21 +354,27 @@ class Admission:
                 bound = dict(track=self.rel(track), trackSha256=track_sha,
                              sidecar=self.rel(sidecar), sidecarSha256=sidecar_sha)
                 matched = [p for p in placements if p.get("movement") == item and p.get("take") == take]
+                self.tally(label, record["decision"])
+                if _normal_verdict(record["decision"]) not in ACCEPTED:
+                    # A rejected take leaves the cut; the archived inputs keep its placement.
+                    for placement in matched:
+                        placements.remove(placement)
+                        self.report.setdefault("removedPlacements", []).append(
+                            str(placement.get("id", item)))
+                    continue
                 for placement in matched:
                     placement.update(bound)
                 if not matched and row.get("timelineStart") is not None and row.get("timelineDuration") is not None:
                     placement = {"movement": item, "take": take, **bound,
+                                 "id": str(row.get("placementId") or f"{item}-take-{take}"),
                                  "timelineStart": _number(row["timelineStart"], f"{label}: timelineStart"),
                                  "timelineDuration": _number(row["timelineDuration"], f"{label}: timelineDuration")}
-                    if row.get("placementId"):
-                        placement["id"] = row["placementId"]
                     placements.append(placement)
                     matched = [placement]
                 if not matched:
                     self.report["unplaced"].append(label)
                 for placement in matched:
                     placement["_new"] = True
-                self.tally(label, record["decision"])
             except (AdmissionError, KeyError, TypeError) as exc:
                 errors.append(str(exc))
         if errors:
@@ -454,8 +477,16 @@ class Admission:
                 entry = entries.setdefault(scene, {"pictureRoute": "h3", "segments": []})
                 if str(entry.get("pictureRoute", "")).lower() not in PICTURE_ROUTES:
                     raise AdmissionError(f"{item}: {scene} is routed {entry.get('pictureRoute')!r}, not H3 picture")
-                kept = [s for s in entry["segments"] if s.get("sourceSha256") != source_sha]
-                entry["segments"] = kept + [segment]
+                # A re-review of the same bytes keeps each window's authored trim
+                # and role, in place, unless the row restates them.
+                carried = ("in", "out", "speed", "role")
+                same = [i for i, s in enumerate(entry["segments"]) if s.get("sourceSha256") == source_sha]
+                for i in same:
+                    old_segment = entry["segments"][i]
+                    entry["segments"][i] = dict(segment, **{k: old_segment[k] for k in carried
+                                                            if k in old_segment and k not in segment})
+                if not same:
+                    entry["segments"].append(segment)
                 self.tally(f"{scene} {item}", segment["verdict"])
             except (AdmissionError, KeyError, TypeError) as exc:
                 errors.append(str(exc))
@@ -502,8 +533,8 @@ class Admission:
         evidence = {"reviewExport": self.rel(target), "reviewExportSha256": sha,
                     "reviewFingerprint": document.get("reviewFingerprint")}
         if self.lane == "dialogue":
-            for row in self.rows:
-                config["dialogueOutputs"][str(row.get("sceneId") or row["itemId"])].update(evidence)
+            for scene in self.rewritten:
+                config["dialogueOutputs"][scene].update(evidence)
         elif self.lane == "score":
             for placement in config["scorePlacements"]:
                 if placement.pop("_new", False):
