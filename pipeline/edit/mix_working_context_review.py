@@ -86,6 +86,11 @@ def source_paths(episode: Path, inventory: dict) -> dict[str, Path]:
     return paths
 
 
+def take_sequence(conform: list[dict]) -> list:
+    """The score takes in play order; an authored silence placement reads as "silence"."""
+    return ["silence" if row.get("silence") is True else row["take"] for row in conform]
+
+
 def preview_output(episode: Path, directory: str) -> Path:
     path = mix.work_output(episode, directory, "working review directory")
     relative = path.relative_to(episode.resolve())
@@ -216,7 +221,7 @@ def main() -> int:
     result.update(kind="non-promotable-working-review", status="working-watch-ready-not-final",
                   finalApproved=False, promotable=False, hardVacuumVerification=vacuums,
                   pendingSfxAnchorCount=len(inventory["provisionalCueIds"]),
-                  scoreTakeSequence=[row["take"] for row in conform],
+                  scoreTakeSequence=take_sequence(conform),
                   contextInventory={"path": mix.portable(inventory_path, episode), "sha256": inventory_sha})
     mix.atomic_json(episode / contract["outputs"]["masterAudit"], result)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
