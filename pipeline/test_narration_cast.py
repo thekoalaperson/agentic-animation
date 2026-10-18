@@ -148,6 +148,27 @@ class CastManifestTest(unittest.TestCase):
         self.assertEqual(finite.request_body(plan, plan["items"][1])["language_code"], "sa")
         self.assertNotIn("language_code", finite.request_body(plan, plan["items"][0]))
 
+    def test_dry_run_names_models_priced_or_run_only_by_assumption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = cast_manifest(Path(tmp))
+            report = finite.execute(manifest, cap(manifest), False)
+        # The approval binds characters; eleven_v4 publishes no credit rate.
+        self.assertEqual(report["unpublishedPricingModels"], ["eleven_v4"])
+        self.assertEqual(report["unexercisedModels"], ["eleven_v4"])
+        teller = report["items"][1]
+        self.assertEqual((teller["modelId"], teller["creditsPerCharacter"], teller["exercised"]),
+                         ("eleven_v4", None, False))
+        self.assertEqual(report["items"][0]["creditsPerCharacter"], 1)
+        for model, entry in finite.MODELS.items():
+            self.assertIn("creditsPerCharacter", entry, model)
+
+    def test_version_one_dry_run_keeps_its_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = VersionOneUnchangedTest().manifest(Path(tmp))
+            report = finite.execute(manifest, len("एक पंक्ति।"), False)
+        self.assertNotIn("unpublishedPricingModels", report)
+        self.assertEqual(set(report["items"][0]), {"id", "characters", "output"})
+
     def test_mocked_cast_batch_posts_once_per_item_and_resumes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

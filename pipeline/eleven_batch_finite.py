@@ -92,21 +92,49 @@ SEED_RANGE = (0, 4294967295)
 MAX_DICTIONARY_LOCATORS = 3
 MODEL_EVIDENCE = ("https://elevenlabs.io/docs/overview/models and "
                   "https://elevenlabs.io/docs/api-reference/text-to-speech/convert, read 2026-10-18")
+PRICING_EVIDENCE = ("https://elevenlabs.io/pricing, read 2026-10-18: one credit per character "
+                    "for multilingual v2; 0.5 to 1 credit per character for Flash through the "
+                    "API; no credit rate stated for v3 or v4. https://elevenlabs.io/pricing/api "
+                    "gives dollar prices only and no credit rate.")
 # The models a version 2 manifest may freeze. There is no fallback: a model
 # not listed here is refused. languageCode says whether the provider documents
 # language_code for the model (it states multilingual_v2 does not take it).
+# creditsPerCharacter is the highest credit rate the provider publishes for the
+# model, or None where it publishes none; the approval and the preflight count
+# characters, so they bound credits only where this is at most 1.
 # exercised says whether this repository has a recorded paid run on it; a new
 # entry needs its own page reading on the day it is added.
 MODELS = {
     ALLOWED_MODEL: {"verifiedAt": "2026-10-18", "languageCode": False,
-                    "maxCharactersPerRequest": 10000, "exercised": True},
+                    "maxCharactersPerRequest": 10000, "creditsPerCharacter": 1,
+                    "exercised": True},
     "eleven_v4": {"verifiedAt": "2026-10-18", "languageCode": True,
-                  "maxCharactersPerRequest": 10000, "exercised": False},
+                  "maxCharactersPerRequest": 10000, "creditsPerCharacter": None,
+                  "exercised": False},
     "eleven_v3": {"verifiedAt": "2026-10-18", "languageCode": True,
-                  "maxCharactersPerRequest": 5000, "exercised": False},
+                  "maxCharactersPerRequest": 5000, "creditsPerCharacter": None,
+                  "exercised": False},
+    # The pricing page gives 0.5 to 1 credit per character through the API.
     "eleven_flash_v2_5": {"verifiedAt": "2026-10-18", "languageCode": True,
-                          "maxCharactersPerRequest": 40000, "exercised": False},
+                          "maxCharactersPerRequest": 40000, "creditsPerCharacter": 1,
+                          "exercised": False},
 }
+
+
+def model_cautions(plan: dict[str, Any]) -> dict[str, list[str]]:
+    """The models a plan uses that have no published credit rate, or no recorded run.
+
+    The approval binds characters. For a model whose credit rate is unpublished
+    or above one per character, that ceiling bounds spend only by assumption,
+    so the dry run names it for the person who signs the approval record.
+    """
+    used = sorted({voice["modelId"] for voice in plan["voices"]})
+    return {
+        "unpublishedPricingModels": [
+            m for m in used if MODELS[m]["creditsPerCharacter"] is None
+            or MODELS[m]["creditsPerCharacter"] > 1],
+        "unexercisedModels": [m for m in used if not MODELS[m]["exercised"]],
+    }
 
 
 def schema() -> dict[str, Any]:
@@ -118,6 +146,7 @@ def schema() -> dict[str, Any]:
         "optionalRootFields": ["episode", "episodeRoot", "provenancePathBase", "projectRoot",
                                "sourcePlan", "sourcePlanSha256", "productionOverrides",
                                "productionOverridesSha256", "authority", "authoritySha256"],
+        "describes": "version 1; version 2 differs where the version2 block says",
         "fixedValues": {"version": 1, "language": "hi", "modelId": ALLOWED_MODEL,
                         "outputFormat": ALLOWED_FORMAT},
         "voiceSettingRanges": VOICE_SETTING_RANGES,
@@ -145,6 +174,10 @@ def schema() -> dict[str, Any]:
                 "{pronunciationDictionaryId, versionId}; sent with every item"),
             "models": MODELS,
             "modelEvidence": MODEL_EVIDENCE,
+            "pricingEvidence": PRICING_EVIDENCE,
+            "pricingNote": ("the approval and the credit preflight count characters; for a "
+                            "model whose creditsPerCharacter is null or above 1 that bounds "
+                            "credits only by assumption, and the dry run names such models"),
             "deferred": ("previous_text/next_text: the provider page does not say whether "
                          "context text is billed, so the character ceiling could not bind it"),
         },
@@ -670,21 +703,27 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
             f"custom state paths are forbidden for paid batches; use canonical {default_state}"
         )
     if not submit:
-        return {"mode": "DRY_RUN", "networkCalls": 0,
-                "financialApproval": plan["financialApproval"],
-                "financialAuthorized": plan["financialAuthorized"],
-                "approvalAdmissionSha256": (
-                    approval["sha256"] if approval else None
-                ),
-                "manifest": plan["manifest"],
-                "aggregateCharacters": plan["aggregateCharacters"],
-                "maxCharacters": plan["maxCharacters"],
-                "items": [{"id": x["id"], "characters": x["characters"],
-                           "output": x["output"],
-                           **({"speaker": x["speaker"], "voiceId": x["voice"]["voiceId"],
-                               "modelId": x["voice"]["modelId"]}
-                              if plan["version"] == 2 else {})}
-                          for x in plan["items"]]}
+        report = {"mode": "DRY_RUN", "networkCalls": 0,
+                  "financialApproval": plan["financialApproval"],
+                  "financialAuthorized": plan["financialAuthorized"],
+                  "approvalAdmissionSha256": (
+                      approval["sha256"] if approval else None
+                  ),
+                  "manifest": plan["manifest"],
+                  "aggregateCharacters": plan["aggregateCharacters"],
+                  "maxCharacters": plan["maxCharacters"],
+                  "items": [{"id": x["id"], "characters": x["characters"],
+                             "output": x["output"],
+                             **({"speaker": x["speaker"], "voiceId": x["voice"]["voiceId"],
+                                 "modelId": x["voice"]["modelId"],
+                                 "creditsPerCharacter":
+                                     MODELS[x["voice"]["modelId"]]["creditsPerCharacter"],
+                                 "exercised": MODELS[x["voice"]["modelId"]]["exercised"]}
+                                if plan["version"] == 2 else {})}
+                            for x in plan["items"]]}
+        if plan["version"] == 2:
+            report.update(model_cautions(plan))
+        return report
 
     if not plan["financialAuthorized"]:
         raise PlanError(

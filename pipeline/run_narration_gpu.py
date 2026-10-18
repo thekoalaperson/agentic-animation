@@ -19,7 +19,7 @@ import subprocess
 import sys
 import urllib.request
 
-from eleven_batch_finite import execute, load_plan, _atomic_json, _sha256_file
+from eleven_batch_finite import execute, load_plan, model_cautions, _atomic_json, _sha256_file
 from _common import adopt_legacy_record, attempt_records, write_attempt_json
 
 
@@ -64,7 +64,6 @@ def main():
         found = get('voices/' + row['voiceId'])
         voices.append(dict(speaker=row['speaker'], voiceId=found['voice_id'],
                            voiceName=found['name'], modelId=row['modelId']))
-    voice = voices[0]
     available = sub['character_limit'] - sub['character_count']
     pending = pending_characters(plan, state_path)
     if available < pending:
@@ -75,11 +74,15 @@ def main():
                    characterLimit=sub['character_limit'], availableBefore=available,
                    plannedCharacters=plan['aggregateCharacters'],
                    pendingCharacters=pending,
-                   voiceId=voice['voiceId'], voiceName=voice['voiceName'],
                    manifestSha256=plan['manifestSha256'], computeHost=platform.node(),
                    noOverage=True, noAutomaticRetry=True)
     if plan['version'] == 2:
+        # A cast has no single voice, so a version 2 receipt lists every voice
+        # and names the models whose characters bound credits only by assumption.
         receipt['voices'] = voices
+        receipt.update(model_cautions(plan))
+    else:
+        receipt.update(voiceId=voices[0]['voiceId'], voiceName=voices[0]['voiceName'])
     write_attempt_json(folder, 'credit-preflight', receipt)
     print(json.dumps(receipt), flush=True)
     error = None
