@@ -1065,6 +1065,11 @@ def execute(max_generated_seconds: int, submit: bool,
                         "this batch was started on the manifest's financialApproval with no "
                         "approval record; land its posted tasks with --reconcile-only, and "
                         "submit the remainder only with the runner that started it")
+                if retry_failed:
+                    raise PlanError(
+                        "this batch started under a different approval record; a retry grant "
+                        "must be in place before a batch's first submission, so freeze the failed "
+                        "jobs as a new manifest with its own approval instead")
                 raise PlanError("execution authorization differs from the existing batch")
         else:
             atomic_json(authorization_path, evidence)

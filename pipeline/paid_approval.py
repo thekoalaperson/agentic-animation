@@ -329,7 +329,8 @@ def check_record(record: Path, manifest: Path, lane: str, project: Path | None =
     try:
         return validate_paid_approval(record, episode=episode, lane=lane,
                                       manifest_path=manifest, manifest_sha256=sha256_file(manifest),
-                                      finite_execution=scope)
+                                      finite_execution=scope,
+                                      allow_retry_budget=lane == "grok-dialogue")
     except PaidApprovalError as exc:
         detail = [str(exc)]
         try:

@@ -334,6 +334,21 @@ class DialogueFiniteTest(unittest.TestCase):
         variance = json.loads((self.work/'price-variance.json').read_text())
         self.assertEqual((variance['cumulativeLandedCredits'], variance['retryCredits']), (2.0, 2.0))
 
+    def test_a_retry_grant_added_after_the_first_submission_names_the_route(self):
+        seconds = self.add_jobs(2)
+        self.run_wave({'demo-s1001': 'land', 'demo-s1002': 'fail'}, seconds)
+        result, invoked = self.run_wave({'demo-s1002': ['land']}, seconds, retry_failed=True,
+                                        retries={'jobs': 1, 'credits': 10})
+        self.assertIsInstance(result, RUNNER.PlanError)
+        self.assertIn('before a batch\'s first submission', str(result))
+        self.assertEqual(invoked, [])
+
+    def test_paid_approval_check_accepts_a_dialogue_retry_grant(self):
+        from pipeline import paid_approval
+        record = grant_retries(self.approval(), jobs=1, credits=5)
+        checked = paid_approval.check_record(record, self.manifest, RUNNER.APPROVAL_LANE, self.ep)
+        self.assertEqual((checked['schemaVersion'], checked['retryBudget']), (3, {'jobs': 1, 'credits': 5}))
+
     def test_retried_charges_are_held_to_the_retry_budget(self):
         seconds = self.add_jobs(2)
         grant = {'jobs': 2, 'credits': 1}
