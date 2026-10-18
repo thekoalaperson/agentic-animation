@@ -299,8 +299,12 @@ def log_upload(log, raw, host, remote_name):
 
 # Sidecars beside a file that may declare its rights. A supplied-media
 # sidecar is <name>.supplied.json; a registered still's is <stem>.imagegen.json.
+# Supplied media, then the still registrar's and deriver's sidecars, which
+# carry the same rights block (a derived still inherits its parent's).
 RIGHTS_SIDECARS = (lambda p: p.with_name(p.name + '.supplied.json'),
-                   lambda p: p.with_suffix('.imagegen.json'))
+                   lambda p: p.with_suffix('.imagegen.json'),
+                   lambda p: p.with_suffix('.still.json'),
+                   lambda p: p.with_suffix('.derive.json'))
 
 
 def provider_upload_forbidden(p):

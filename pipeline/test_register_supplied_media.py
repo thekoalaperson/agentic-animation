@@ -124,6 +124,22 @@ class UploadRefusalTest(unittest.TestCase):
             self.assertEqual(_common.provider_upload_forbidden(still),
                              still.with_suffix(".imagegen.json"))
 
+    def test_supplied_and_derived_still_sidecars_that_forbid_upload_are_honoured(self):
+        # register_builtin_imagegen.py writes a supplied still's rights to .still.json,
+        # and derive_still.py copies them into the derivative's .derive.json.
+        for suffix in (".still.json", ".derive.json"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                still = Path(tmp) / "demo-s001.png"
+                still.write_bytes(b"demo still")
+                still.with_suffix(suffix).write_text(json.dumps(
+                    {"rights": {"basis": "own painting", "providerUpload": "forbidden"}}))
+                self.assertEqual(_common.provider_upload_forbidden(still), still.with_suffix(suffix))
+                with mock.patch.object(_common, "http_json") as post, \
+                     mock.patch.object(_common, "env_key", return_value="offline"):
+                    with self.assertRaisesRegex(ValueError, "providerUpload is forbidden"):
+                        _common.upload_ref(still, Path(tmp) / "work/upload-log.jsonl")
+                post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
