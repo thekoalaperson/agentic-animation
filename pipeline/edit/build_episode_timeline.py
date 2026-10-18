@@ -2718,7 +2718,9 @@ the colon; nothing here is required):
                                    speech; the line's audio stays the clock: none
   dialogueOutputs[scene].audioLead, audioTail
                                    {seconds, reason} of the clip's own sound
-                                   heard before or after its kept window: none
+                                   heard before or after its kept window; a
+                                   Short cut from the scene hears the line
+                                   without it: none
   minimumPictureSegmentSeconds     shorter windows warn, or need a role word: 1.3
   microCutRoleWords                role words that mark a deliberate short cut:
                                    """ + ", ".join(sorted(MICRO_CUT_ROLE_WORDS)) + """
@@ -2739,7 +2741,11 @@ the colon; nothing here is required):
                                    dip-to-black or dip-to-white: every boundary
                                    is a cut
   frameAspect, cadence             a matte inside the 16:9 container, and each
-                                   picture frame held 2 or 3 delivery frames:
+                                   picture frame held 2 or 3 delivery frames;
+                                   subtitles are still placed against the whole
+                                   container, so they may sit on the matte; a
+                                   stepped part is stepped before its dissolve
+                                   and its phase restarts at each render run:
                                    none, 1
 """
 

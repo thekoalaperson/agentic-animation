@@ -1815,6 +1815,44 @@ class TimelineBuilderTest(unittest.TestCase):
         window = next(e for e in plan["events"] if e["id"] == "demo-s003")["pictureWindows"][0]
         self.assertEqual((window["sourceKind"], window["sourceSceneId"]), ("segment", "demo-s003"))
 
+    def test_picture_window_refuses_a_rejected_segment(self):
+        reaction = self.ep / "work/h3/demo-s003-reaction.mp4"
+        reaction.write_bytes(b"silent-reaction")
+        path, ledger = self.ledger()
+        ledger["entries"]["demo-s003"]["segments"] = [{
+            "source": str(reaction.relative_to(self.ep)), "sourceSha256": self.sha(reaction),
+            "in": 0, "out": 3, "role": "reaction", "verdict": "rejected"}]
+        self.write_json(path, ledger)
+        self.set_output(pictureWindows=[self.window(1.0, 2.5, str(reaction.relative_to(self.ep)), 0.5)])
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "picture-window" for e in self.readiness()["errors"]),
+                        self.readiness()["errors"])
+
+    def test_removing_each_editing_field_restores_the_plan_bytes(self):
+        timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        plan_path = self.ep / "work/assembly-v1/edit-plan.json"
+        readiness_path = self.ep / "work/assembly-v1/timeline-readiness.json"
+        original = (plan_path.read_bytes(), readiness_path.read_bytes())
+        pristine = self.config.read_text()
+        scene = {"pictureWindows": [self.window(1.0, 2.5, "work/h3/demo-s004.mp4", 1.0)],
+                 "audioLead": {"seconds": 0.25, "reason": "Let the room arrive first."},
+                 "audioTail": {"seconds": 0.5, "reason": "Let the breath ring under the next shot."}}
+        film = {"transitions": [{"after": "demo-s003", "kind": "dip-to-black", "frames": 12,
+                                 "reason": "A breath of dark before the last image."}],
+                "frameAspect": "2.39:1", "cadence": 2}
+        for key, value in list(scene.items()) + list(film.items()):
+            with self.subTest(key):
+                config = json.loads(pristine)
+                (config["dialogueOutputs"]["demo-s003"] if key in scene else config)[key] = value
+                self.write_json(self.config, config)
+                ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                self.assertTrue(ready["ready"], ready)
+                self.assertNotEqual(original[0], plan_path.read_bytes())
+                self.config.write_text(pristine)
+                timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                self.assertEqual(original, (plan_path.read_bytes(), readiness_path.read_bytes()))
+
     def test_picture_windows_are_refused_outside_accepted_frames_or_rules(self):
         h3 = "work/h3/demo-s004.mp4"
         cases = {
@@ -2208,6 +2246,8 @@ class TimelineBuilderTest(unittest.TestCase):
                         "narrationBreathing", "narrationBreathOverrides", "holdSeconds", "allowCausalBorrowing",
                         "musicBreaths", "transitions", "frameAspect", "cadence"):
             self.assertIn(control, out.getvalue())
+        # The matte's cost to subtitle placement is stated, not hidden.
+        self.assertIn("subtitles are still placed against the whole", out.getvalue())
 
 
 if __name__ == "__main__":
