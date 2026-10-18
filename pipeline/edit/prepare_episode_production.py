@@ -173,9 +173,14 @@ def main():
         if speaker:
             dialogues.append(r)
         else:
-            narration.append(dict(id=key+'-hi',shotId=key,language='hi',
+            item=dict(id=key+'-hi',shotId=key,language='hi',
                 displayText=text,text=text,role='narration',
-                output=f'audio/narration-v1/{key}-hi.mp3'))
+                output=f'audio/narration-v1/{key}-hi.mp3')
+            # A character heard over picture keeps its name in the row's voice
+            # field; the narration freeze casts it from --cast by that name.
+            if row.get('voice'):
+                item['speaker']=row['voice']
+            narration.append(item)
     sources=args.h3_sources.resolve() if args.h3_sources else None
     if sources is not None and not sources.is_dir():
         raise ValueError('H3 source directory does not exist: ' + str(sources))

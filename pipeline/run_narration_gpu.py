@@ -58,7 +58,13 @@ def main():
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
     sub = get('user/subscription')
-    voice = get('voices/' + plan['config']['voiceId'])
+    # Every voice the batch will use is fetched and recorded before any POST.
+    voices = []
+    for row in plan['voices']:
+        found = get('voices/' + row['voiceId'])
+        voices.append(dict(speaker=row['speaker'], voiceId=found['voice_id'],
+                           voiceName=found['name'], modelId=row['modelId']))
+    voice = voices[0]
     available = sub['character_limit'] - sub['character_count']
     pending = pending_characters(plan, state_path)
     if available < pending:
@@ -69,9 +75,11 @@ def main():
                    characterLimit=sub['character_limit'], availableBefore=available,
                    plannedCharacters=plan['aggregateCharacters'],
                    pendingCharacters=pending,
-                   voiceId=voice['voice_id'], voiceName=voice['name'],
+                   voiceId=voice['voiceId'], voiceName=voice['voiceName'],
                    manifestSha256=plan['manifestSha256'], computeHost=platform.node(),
                    noOverage=True, noAutomaticRetry=True)
+    if plan['version'] == 2:
+        receipt['voices'] = voices
     write_attempt_json(folder, 'credit-preflight', receipt)
     print(json.dumps(receipt), flush=True)
     error = None
