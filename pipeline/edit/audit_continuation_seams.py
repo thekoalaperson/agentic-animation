@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _common import MediaWorkerRequired, require_media_worker
+from _common import require_media_worker
 
 if not __debug__:
     raise SystemExit("Optimized Python disables production safety gates")

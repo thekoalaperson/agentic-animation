@@ -336,6 +336,9 @@ class Admission:
         if len(rows) != 1:
             raise AdmissionError(f"{item}: {self.rel(attempt)} holds no single item {measured_id!r}")
         measured = rows[0]
+        if not measured.get("sourceSha256") or not measured.get("sidecarSha256"):
+            raise AdmissionError(f"{item}: {self.rel(attempt)} item {measured_id!r} records no take and "
+                                 "sidecar hash; measure the take again")
         if measured.get("sourceSha256") != source_sha or measured.get("sidecarSha256") != sidecar_sha:
             raise AdmissionError(f"{item}: {self.rel(attempt)} item {measured_id!r} measured other bytes "
                                  "than the take being admitted")

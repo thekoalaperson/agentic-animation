@@ -14,6 +14,8 @@ from unittest import mock
 
 import numpy as np
 
+from _common import MediaWorkerRequired
+
 
 class SyntheticSheet:
     def paste(self, *_args):
@@ -85,7 +87,7 @@ class ContinuationSeamContractTests(unittest.TestCase):
     def worker(system):
         def check(reason):
             if system != "Linux":
-                raise seams.MediaWorkerRequired(reason + " must run on the qualified GPU worker")
+                raise MediaWorkerRequired(reason + " must run on the qualified GPU worker")
             return "GPU 0: synthetic"
         return check
 

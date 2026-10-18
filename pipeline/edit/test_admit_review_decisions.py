@@ -114,6 +114,7 @@ class AdmitReviewDecisionsTest(unittest.TestCase):
             "measured other bytes": ({"sourceSha256": "0" * 64}, {}),
             "no single item": ({}, {"itemId": "demo-s099"}),
             "not both": ({}, {"both": True}),
+            "records no take and sidecar hash": ({"sidecarSha256": None}, {}),
         }
         config_bytes = self.config.read_bytes()
         for message, (item, ref) in cases.items():
