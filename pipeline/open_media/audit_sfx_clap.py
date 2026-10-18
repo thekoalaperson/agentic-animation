@@ -16,12 +16,28 @@ import numpy as np
 MODEL = "laion/clap-htsat-unfused"
 
 
-def semantic_text(prompt: str) -> str:
+# The wrapper text the earlier briefs put around each family's phrase. A brief
+# that wraps its prompts differently names its own in ``clapPromptTemplate``.
+DEFAULT_TEMPLATE = {
+    "cutAt": [" Dry, clean,"],
+    "remove": ["Isolated cinematic sound effect. ", "TrackType: SFX. "],
+    "negativeWord": "No",
+}
+
+
+def semantic_text(prompt: str, template: dict | None = None) -> str:
     # Negative clauses describe what must be absent and would pollute a positive
     # CLAP target. Keep the authored source/action/material/perspective phrase.
-    text = prompt.split(" Dry, clean,")[0].replace("Isolated cinematic sound effect. ", "")
-    text = text.replace("TrackType: SFX. ", "")
-    return re.split(r"\s+No\s+", text, maxsplit=1)[0].strip()
+    template = DEFAULT_TEMPLATE if template is None else template
+    text = prompt
+    for marker in template.get("cutAt", []):
+        text = text.split(marker)[0]
+    for phrase in template.get("remove", []):
+        text = text.replace(phrase, "")
+    negative = template.get("negativeWord")
+    if negative:
+        text = re.split(r"\s+" + re.escape(negative) + r"\s+", text, maxsplit=1)[0]
+    return text.strip()
 
 
 def main() -> None:
@@ -38,7 +54,7 @@ def main() -> None:
     manifest = json.loads(args.manifest.read_text())
     families = manifest["families"]
     family_index = {x["id"]: i for i, x in enumerate(families)}
-    prompts = [semantic_text(x["prompt"]) for x in families]
+    prompts = [semantic_text(x["prompt"], manifest.get("clapPromptTemplate")) for x in families]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if sys.platform != "linux" or device != "cuda":
         raise RuntimeError("Audio QA must run on the qualified GPU worker")
