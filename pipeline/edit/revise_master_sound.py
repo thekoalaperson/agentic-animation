@@ -1,4 +1,12 @@
-"""Versioned audio-only master revision; preserve picture payloads and A/V clocks."""
+"""Versioned audio-only master revision; preserve picture payloads and A/V clocks.
+
+``work/assembly-v1/mix-settings.json`` may also carry the long-form mixer's
+loudness choices (``targetIntegratedLufs`` -27..-12, ``targetTruePeakDbtp``
+-3..-1, ``targetLra`` 1..50 or ``"measured"``, ``refuseDynamicMastering``),
+with today's -14 / -1.5 / 11 as defaults, and ``musicReflections: false`` to
+mix the score dry instead of through the short echo. The revision records
+whether loudnorm's second pass was linear or dynamic, and warns when dynamic.
+"""
 import argparse
 from fractions import Fraction
 import json
@@ -10,6 +18,7 @@ import numpy as np
 from render_designed_sfx import sha, read, run
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'open_media'))
 from hd_audio_remux import remux_approved_audio, packet_hash, streams, start
+import mix_absolute_sfx_longform as longform
 
 def probe(path: Path) -> dict:
     return json.loads(subprocess.check_output([
@@ -18,13 +27,36 @@ def probe(path: Path) -> dict:
     ], text=True))
 
 
-def loudness(path: Path, target_peak: float = -1.0) -> dict:
+def loudness(path: Path, target_peak: float = -1.0, target_i: float = -14, lra: float = 11) -> dict:
     stderr = run([
         "ffmpeg", "-hide_banner", "-i", path, "-vn", "-af",
-        f"loudnorm=I=-14:TP={target_peak}:LRA=11:print_format=json",
+        f"loudnorm=I={target_i}:TP={target_peak}:LRA={lra}:print_format=json",
         "-f", "null", "-",
     ], capture_output=True, text=True).stderr
     return json.loads(stderr[stderr.rfind("{"):stderr.rfind("}") + 1])
+
+
+def mastering_settings(settings: dict) -> dict:
+    """The loudness choices, bounded exactly as the long-form mixer's version 2."""
+    chosen = {key: settings[key] for key in ("targetIntegratedLufs", "targetTruePeakDbtp", "targetLra",
+                                              "refuseDynamicMastering") if key in settings}
+    if not chosen:
+        return {**{k: v for k, v in longform.default_settings().items() if k.startswith("target")},
+                "refuseDynamicMastering": False}
+    full = longform.validate_settings({"settingsVersion": 2, **chosen})
+    return {key: full[key] for key in ("targetIntegratedLufs", "targetTruePeakDbtp", "targetLra",
+                                       "refuseDynamicMastering")}
+
+
+def music_space(settings: dict) -> str:
+    """Today's short echo on the score, unless the settings ask for it dry."""
+    reflections = settings.get("musicReflections", True)
+    if type(reflections) is not bool:
+        raise RuntimeError("musicReflections must be a boolean")
+    if not reflections:
+        return "anull[space];"
+    return ("asplit=2[md][ms];[ms]aecho=0.8:0.45:80|160|320:0.10|0.06|0.025,volume=0.22[mr];"
+            "[md][mr]amix=inputs=2:normalize=0[space];")
 
 
 def mix(ep,root):
@@ -44,9 +76,9 @@ def mix(ep,root):
         assert b>a and g<=0 and fi>0 and fo>0
         env.append(f'if(between(t,{a},{b}),pow(10,({g}*min(1,min((t-{a})/{fi},({b}-t)/{fo})))/20),1)')
     envelope=("volume='"+'*'.join(env)+"':eval=frame,") if env else ''
-    graph=(f"[1:a]volume={settings['musicGainDb']}dB,{envelope}asplit=2[md][ms];"
-           "[ms]aecho=0.8:0.45:80|160|320:0.10|0.06|0.025,volume=0.22[mr];"
-           "[md][mr]amix=inputs=2:normalize=0[space];"
+    targets=mastering_settings(settings)
+    graph=(f"[1:a]volume={settings['musicGainDb']}dB,{envelope}"
+           +music_space(settings)+
            f"[space][0:a]sidechaincompress=threshold={settings['musicDuckThreshold']}:ratio={settings['musicDuckRatio']}:attack={settings['musicDuckAttackMs']}:release={settings['musicDuckReleaseMs']}[music];"
            "[2:a][0:a]sidechaincompress=threshold=0.035:ratio=4:attack=8:release=360[sfx];"
            "[0:a][music][sfx]amix=inputs=3:normalize=0:dropout_transition=0[out]")
@@ -57,19 +89,31 @@ def mix(ep,root):
     run(['ffmpeg','-y','-v','error','-i',voice,'-i',music,'-i',sfx,'-filter_complex',graph,
          '-map','[out]',
          '-ar',48000,'-c:a','pcm_f32le',premaster])
-    measured=loudness(premaster,-1.5)
-    norm=(f"loudnorm=I=-14:TP=-1.5:LRA=11:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+    measured=loudness(premaster,targets['targetTruePeakDbtp'],targets['targetIntegratedLufs'],
+                      longform.measurement_lra(targets))
+    target_lra=longform.second_pass_lra(targets,measured)
+    norm=(f"loudnorm=I={targets['targetIntegratedLufs']}:TP={targets['targetTruePeakDbtp']}:LRA={target_lra}:"
+          f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
           f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:offset={measured['target_offset']}:linear=true")
     new720=root/old720.name;v=next(x for x in streams(old720) if x['codec_type']=='video')
     scale=math.lcm(Fraction(v['time_base']).denominator,48000)
-    run(['ffmpeg','-y','-v','error','-copyts','-i',old720,'-i',premaster,'-map','0:v:0','-map','1:a:0',
-         '-c:v','copy','-af',norm,'-ar',48000,'-c:a','aac','-b:a','256k','-avoid_negative_ts','disabled',
-         '-movie_timescale',scale,'-video_track_timescale',Fraction(v['time_base']).denominator,'-movflags','+faststart',new720])
+    muxed=run(['ffmpeg','-y','-nostats','-v','info','-copyts','-i',old720,'-i',premaster,'-map','0:v:0','-map','1:a:0',
+         '-c:v','copy','-af',norm+':print_format=json','-ar',48000,'-c:a','aac','-b:a','256k','-avoid_negative_ts','disabled',
+         '-movie_timescale',scale,'-video_track_timescale',Fraction(v['time_base']).denominator,'-movflags','+faststart',new720],
+         capture_output=True,text=True)
+    second_pass=longform.second_pass_record(longform.parse_loudnorm(muxed.stderr.encode()),target_lra)
+    if second_pass['normalizationType']=='dynamic':
+        if targets['refuseDynamicMastering']:
+            new720.unlink(missing_ok=True)
+            raise RuntimeError(longform.dynamic_mastering_message(second_pass))
+        print('warning: '+longform.dynamic_mastering_message(second_pass),file=sys.stderr,flush=True)
     assert packet_hash(old720,'0:v:0')==packet_hash(new720,'0:v:0')
     ov=next(s for s in streams(old720) if s['codec_type']=='video');nv=next(s for s in streams(new720) if s['codec_type']=='video')
     assert start(ov)==start(nv)
     result=loudness(new720)
-    assert abs(float(result['input_i'])+14)<.7 and float(result['input_tp'])<=-1
+    if (abs(float(result['input_i'])-targets['targetIntegratedLufs'])>=.7
+            or float(result['input_tp'])>targets['targetTruePeakDbtp']+.5):
+        raise RuntimeError(f'Revised master missed its loudness targets: {result}')
     new1080=root/old1080.name
     hd=remux_approved_audio(old1080,new720,new1080)
     assert packet_hash(old1080,'0:v:0')==packet_hash(new1080,'0:v:0')
@@ -86,12 +130,15 @@ def mix(ep,root):
                     fps=float(Fraction(video['r_frame_rate'])),frames=int(video['nb_frames']),duration=float(video['duration']),containerDuration=float(data['format']['duration']),
                     videoStartSeconds=float(video['start_time']),picturePacketsUnchanged=True,
                     soundRevision=str(root),sfxMixAudit=str(root/'mix-audit.json'),sfxPlacements=audit['placements'],
-                    sourceHashes=source_hashes,loudness=result,sourcePicturePacketSha256=packet_hash(old,'0:v:0'),
+                    sourceHashes=source_hashes,loudness=result,loudnormSecondPass=second_pass,
+                    sourcePicturePacketSha256=packet_hash(old,'0:v:0'),
                     decode='pending',finalHumanReview='pending',generatedVideo=False,deterministic=True)
         if video['height']==1080:record['audioRemux']=hd
         new.with_suffix('.json').write_text(json.dumps(record,indent=2)+'\n');products.append(record)
     report=dict(products=products,sourceHashes=source_hashes,filterGraph=graph,normalizationFilter=norm,
                 preNormalizationLoudness=measured,deliveredLoudness=result,
+                loudnormSecondPass=second_pass,masteringTargets=targets,
+                musicReflections=settings.get('musicReflections',True),
                 sfxDuck=dict(threshold=.035,ratio=4,attackMs=8,releaseMs=360),
                 musicDips=dips,sourceSettings=settings,codeSha256=code_hash,designSha256=design_hash,
                 title='Original duration preserved; added effects end before silent end title.',
