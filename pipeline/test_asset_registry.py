@@ -41,6 +41,14 @@ class AssetRegistryTest(unittest.TestCase):
                 report = registry.integrity_report(registry.load_registry(root), root)
             self.assertEqual(report, {"caseVariants": [], "unresolvedReferences": []})
 
+    def test_series_canon_references_are_neither_unresolved_nor_case_variants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.project(Path(tmp).resolve(), ["canon:sheets/demo-sheet.png",
+                                                      "canon:sheets/Demo-Sheet.png"])
+            with mock.patch.object(registry, "case_insensitive", return_value=True):
+                report = registry.integrity_report(registry.load_registry(root), root)
+            self.assertEqual(report, {"caseVariants": [], "unresolvedReferences": []})
+
     def test_relocation_map_resolves_paths_recorded_before_a_move(self):
         with tempfile.TemporaryDirectory() as tmp:
             old = "/old/studio/demo-project/art/canon/demo-sheet.png"

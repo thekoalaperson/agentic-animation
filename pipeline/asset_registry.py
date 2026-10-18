@@ -144,14 +144,14 @@ def integrity_report(assets: dict[str, dict], root: Path) -> dict[str, list]:
     spellings: dict[str, set[str]] = {}
     for key, row in assets.items():
         for name in [key, *row['refs']]:
-            if not name.startswith(('https://', 'gs://')):
+            if not name.startswith(('https://', 'gs://', 'canon:')):
                 spellings.setdefault(fold(name, folded), set()).add(name)
     variants = sorted(sorted(names) for names in spellings.values() if len(names) > 1) if folded else []
     known = {fold(key, folded) for key in assets}
     unresolved = []
     for key, row in sorted(assets.items()):
         for ref in row['refs']:
-            if ref.startswith(('https://', 'gs://')) or fold(ref, folded) in known:
+            if ref.startswith(('https://', 'gs://', 'canon:')) or fold(ref, folded) in known:
                 continue
             path = Path(ref) if Path(ref).is_absolute() else root / ref
             if not path.exists():
