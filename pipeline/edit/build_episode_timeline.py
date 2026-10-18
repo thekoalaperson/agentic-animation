@@ -2928,7 +2928,13 @@ the colon; nothing here is required):
   scorePlacements gaps, {movement, silence: true, timelineStart,
   timelineDuration, reason}        stretches with no score; a gap between
                                    placements is silence: none
-  unscored                         the film has no score, so an empty
+  scorePlacements[].anchor, until  {event, at: start|speechStart|speechEnd|end,
+                                   offsetSeconds} in place of timelineStart or
+                                   timelineDuration, resolved on the measured
+                                   clock: absolute times
+  scorePlacements[].allowReprise   false refuses to loop a take shorter than its
+                                   placement; the assembly records each fit: true
+  unscored                       the film has no score, so an empty
                                    scorePlacements list is intended: false
   transitions                      [{after, kind, frames, reason}], kind dissolve,
                                    dip-to-black or dip-to-white: every boundary

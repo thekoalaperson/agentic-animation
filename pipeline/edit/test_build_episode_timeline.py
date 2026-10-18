@@ -2385,7 +2385,8 @@ class TimelineBuilderTest(unittest.TestCase):
                         "audioLead", "audioTail", "minimumPictureSegmentSeconds", "microCutRoleWords",
                         "narrationBreathing", "narrationBreathOverrides", "holdSeconds", "allowCausalBorrowing",
                         "musicBreaths", "musicShaping", "voiceGains", "unscored",
-                        "transitions", "frameAspect", "cadence"):
+                        "transitions", "frameAspect", "cadence", "scorePlacements[].anchor",
+                        "allowReprise"):
             self.assertIn(control, out.getvalue())
         # The matte's cost to subtitle placement is stated, not hidden.
         self.assertIn("subtitles are still placed against the whole", out.getvalue())
