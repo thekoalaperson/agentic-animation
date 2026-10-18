@@ -18,11 +18,15 @@ def sha(path):
     return h.hexdigest()
 
 
-# Per-model limits. A job may run to the qualified length; a longer job names a
-# retained qualification run at that length (``lengthQualification`` in the
-# brief: a prior batch-audit.json copied into this job root, with its SHA-256).
-# Steps and CFG scale are part of each job's identity; the defaults here are
-# the qualified ones, and any other value is recorded as unqualified.
+# Per-model limits. A job may run to the qualified length. To go longer, first
+# run a length-qualification batch: a brief with ``lengthQualificationRun: true``
+# admits at most two jobs at any length, marks every output
+# ``lengthQualified: false`` and writes a batch-audit.json that says it was such
+# a run. A later brief names that retained audit (``lengthQualification``: its
+# path inside the new job root and its SHA-256), and may then run to the longest
+# length the audit measured. Steps and CFG scale are part of each job's
+# identity; the defaults here are the qualified ones, and any other value is
+# recorded as unqualified.
 MODELS = {
     'stabilityai/stable-audio-3-small-sfx': {
         'configKey': 'small-sfx', 'qualifiedSeconds': 10, 'steps': 8, 'cfgScale': 1.0,
@@ -40,10 +44,13 @@ def qualified_seconds(plan, root, model):
     if not path.is_relative_to(root) or not path.is_file() or sha(path) != evidence['sha256']:
         raise RuntimeError('lengthQualification must be a retained batch audit inside this job root, hash bound')
     audit = json.loads(path.read_text())
-    lengths = [row['seconds'] for row in audit.get('outputs', [])
+    runtime = audit.get('runtime', {})
+    # Each row's seconds is measured from the written samples, and the runner
+    # asserts it matches the job within one sample.
+    lengths = [min(row['seconds'], row['job']['seconds']) for row in audit.get('outputs', [])
                if row.get('status') == 'complete' and row.get('job', {}).get('prompt')]
-    if audit.get('runtime', {}).get('model') != model or not lengths:
-        raise RuntimeError('lengthQualification is not a completed run of this model')
+    if runtime.get('model') != model or runtime.get('lengthQualificationRun') is not True or not lengths:
+        raise RuntimeError('lengthQualification is not a completed length-qualification run of this model')
     return max(limit, max(lengths))
 
 
@@ -70,15 +77,58 @@ def validate_plan(plan, root, max_jobs):
     ids = [j['id'] for j in plan['jobs']]
     assert len(ids) == len(set(ids))
     assert len({j['output'] for j in plan['jobs']}) == len(ids)
+    qualifying = plan.get('lengthQualificationRun', False)
+    if not isinstance(qualifying, bool):
+        raise RuntimeError('lengthQualificationRun must be true or false')
+    if qualifying and 'lengthQualification' in plan:
+        raise RuntimeError('A length-qualification run cannot also cite a lengthQualification')
+    if qualifying and len(plan['jobs']) > 2:
+        raise RuntimeError('A length-qualification run admits at most two jobs')
     limit = qualified_seconds(plan, root, model)
     for job in plan['jobs']:
         assert job['prompt'].strip()
-        if not 0 < job['seconds'] <= limit:
+        if qualifying:
+            if isinstance(job['seconds'], bool) or not isinstance(job['seconds'], (int, float)) \
+                    or not 0 < job['seconds'] < float('inf'):
+                raise RuntimeError(f"{job['id']}: seconds must be a positive finite number")
+        elif not 0 < job['seconds'] <= limit:
             raise RuntimeError(f"{job['id']}: {job['seconds']} s is beyond the {limit} s this model "
-                               'is qualified for here; retain a qualification run at that length first')
+                               'is qualified for here; retain a qualification run at that length first '
+                               '(a brief with lengthQualificationRun: true)')
         job_settings(job, model)
         assert (root / job['output']).resolve().is_relative_to(root / 'outputs')
     return model
+
+
+def maximum_job_seconds(plan, root, model):
+    """What the runtime record states as the batch's length bound."""
+    if plan.get('lengthQualificationRun') is True:
+        return max(job['seconds'] for job in plan['jobs'])
+    return qualified_seconds(plan, root, model)
+
+
+def output_row(plan, job, model, identity, target_sha256, target, samples, sr, steps, cfg_scale,
+               inference_seconds, peak_gpu_bytes):
+    """The sidecar and audit row for one completed output."""
+    a = samples
+    row = dict(id=job['id'], status='complete', identity=identity, sha256=target_sha256,
+               path=str(target), job=job, seconds=len(a)/sr, sampleRate=sr, channels=a.shape[1],
+               peak=float(np.max(np.abs(a))), rms=float(np.sqrt(np.mean(a*a))),
+               overFullScaleSamples=int(np.count_nonzero(np.abs(a)>1)),
+               steps=steps, cfgScale=cfg_scale,
+               qualifiedSettings=(steps, cfg_scale) == (MODELS[model]['steps'], MODELS[model]['cfgScale']),
+               inferenceAndSaveSeconds=inference_seconds,
+               peakGpuMemoryBytes=peak_gpu_bytes,
+               normalization='none; original float samples preserved', creativeVerdict='unreviewed')
+    if plan.get('lengthQualificationRun') is True:
+        row['lengthQualified'] = False
+    return row
+
+
+def write_batch_audit(root, runtime, rows, total_seconds):
+    """The batch audit; a length-qualification run's audit is later evidence for longer jobs."""
+    (root / 'batch-audit.json').write_text(json.dumps(dict(runtime=runtime, outputs=rows,
+         completed=len(rows), totalSeconds=total_seconds, creativeVerdict='unreviewed'), indent=2))
 
 
 def main():
@@ -108,8 +158,10 @@ def main():
                        torch=torch.__version__, gpu=torch.cuda.get_device_name(0),
                        codeSha256=sha(__file__), briefSha256=sha(brief),
                        steps=MODELS[model_name]['steps'], cfgScale=MODELS[model_name]['cfgScale'],
-                       maximumJobSeconds=qualified_seconds(plan, root, model_name), precision='float16',
+                       maximumJobSeconds=maximum_job_seconds(plan, root, model_name), precision='float16',
                        normalization='none', sourceFormat='32-bit float WAV, native sample rate/channels')
+        if plan.get('lengthQualificationRun') is True:
+            runtime['lengthQualificationRun'] = True
         (root / 'runtime.json').write_text(json.dumps(runtime, indent=2))
         print('Loading one resident model', flush=True)
         model = StableAudioModel.from_pretrained(MODELS[model_name]['configKey'], device='cuda', model_half=True)
@@ -149,23 +201,15 @@ def main():
             sf.write(target, a, sr, subtype='FLOAT')
             decoded = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(target), '-f', 'null', '-'], capture_output=True, check=True)
             assert not decoded.stderr
-            row = dict(id=job['id'], status='complete', identity=identity, sha256=sha(target),
-                       path=str(target), job=job, seconds=len(a)/sr, sampleRate=sr, channels=a.shape[1],
-                       peak=float(np.max(np.abs(a))), rms=float(np.sqrt(np.mean(a*a))),
-                       overFullScaleSamples=int(np.count_nonzero(np.abs(a)>1)),
-                       steps=steps, cfgScale=cfg_scale,
-                       qualifiedSettings=(steps, cfg_scale) == (MODELS[model_name]['steps'], MODELS[model_name]['cfgScale']),
-                       inferenceAndSaveSeconds=time.monotonic()-t0,
-                       peakGpuMemoryBytes=torch.cuda.max_memory_allocated(),
-                       normalization='none; original float samples preserved', creativeVerdict='unreviewed')
+            row = output_row(plan, job, model_name, identity, sha(target), target, a, sr, steps, cfg_scale,
+                             time.monotonic()-t0, torch.cuda.max_memory_allocated())
             sidecar.write_text(json.dumps(row, indent=2))
             with state_path.open('a') as stream:
                 stream.write(json.dumps(row) + '\n')
             rows.append(row)
             print(json.dumps(row), flush=True)
         assert sha(brief) == runtime['briefSha256']
-        (root / 'batch-audit.json').write_text(json.dumps(dict(runtime=runtime, outputs=rows,
-             completed=len(rows), totalSeconds=time.monotonic()-started, creativeVerdict='unreviewed'), indent=2))
+        write_batch_audit(root, runtime, rows, time.monotonic()-started)
         print(f'{len(rows)}-source review batch complete; no film mutation or automatic acceptance', flush=True)
 
 
