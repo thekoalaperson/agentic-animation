@@ -27,6 +27,10 @@ class FilmReviewTest(unittest.TestCase):
         payload = json.loads(page.split("const DATA=", 1)[1].split(";\n", 1)[0])
         self.assertEqual(payload["notChecked"], ["lip sync at full speed"])
 
+    def test_other_files_in_the_data_are_ignored(self):
+        data = working_cut(files={"720": {"path": "a.mp4", "sha256": "a" * 64}, "4k": {"note": "elsewhere"}})
+        self.assertIn("a.mp4", review.render(data, TEMPLATE))
+
     def test_refusals_name_what_is_missing(self):
         cases = {
             "working cut": working_cut(files={"short": {"path": "s.mp4", "sha256": "b" * 64}}),
@@ -34,8 +38,6 @@ class FilmReviewTest(unittest.TestCase):
                                               "short": {"path": "s.mp4", "sha256": "b" * 64}}),
             "sha256": working_cut(files={"1080": {"path": "a.mp4", "sha256": "short"}}),
             "needs title": {k: v for k, v in working_cut().items() if k != "title"},
-            "unknown review files": working_cut(files={"720": {"path": "a.mp4", "sha256": "a" * 64},
-                                                       "4k": {"path": "b.mp4", "sha256": "b" * 64}}),
         }
         for message, data in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):

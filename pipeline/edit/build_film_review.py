@@ -4,7 +4,8 @@ A working cut alone is enough: ``files`` needs a ``720`` or ``1080`` entry,
 each with a ``path`` and its ``sha256``. Short and Reels files (which then
 need ``shortEvents`` and ``shortSubtitles``), ``subtitles``, ``chapters``,
 thumbnails and the upload kit are optional panels. Optional
-``reviewSummary`` (the timeline readiness report's object, or lines),
+``reviewSummary`` (copied from the ``reviewSummary`` object in the
+timeline's ``timeline-readiness.json``, or given as lines),
 ``checked`` (what was checked and by which method) and ``notChecked`` (what
 could not be) are shown beside the film, so a person sees what the review
 covered. The page is self-contained apart from relative media; nothing here
@@ -26,10 +27,9 @@ def validate(data):
     files = data['files']
     if not isinstance(files, dict) or not ({'720', '1080'} & set(files)):
         raise ValueError('film review needs a working cut: a 720 or 1080 file')
-    unknown = sorted(set(files) - set(ASSETS))
-    if unknown:
-        raise ValueError(f'unknown review files {unknown}; use {", ".join(ASSETS)}')
     for key, row in files.items():
+        if key not in ASSETS:
+            continue  # other files may travel in the data; the page shows only its own
         if not isinstance(row, dict) or not row.get('path') or len(str(row.get('sha256', ''))) != 64:
             raise ValueError(f'review file {key} needs a path and its sha256')
     if {'short', 'reels'} & set(files):

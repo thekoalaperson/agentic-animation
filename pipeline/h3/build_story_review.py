@@ -49,7 +49,9 @@ def add_evidence(data, project, h3_audits=(), dialogue_indexes=()):
         audit_path = audit_path.resolve()
         audit = json.loads(audit_path.read_text())
         for row in audit.get('outputs', []):
-            silent = row.get('silent') if isinstance(row, dict) else None
+            if not isinstance(row, dict):
+                continue
+            silent = row.get('silent')
             if row.get('status') != 'technical-pass' or not isinstance(silent, dict):
                 continue
             recorded = Path(str(silent.get('file') or ''))

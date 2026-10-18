@@ -29,6 +29,7 @@ class StoryReviewEvidenceTest(unittest.TestCase):
                 {"id": "demo-s099-a", "status": "technical-pass",
                  "silent": {"file": "/worker/silent/demo-s099-a.mp4", "sha256": "0" * 64}},
                 {"id": "demo-s002-a", "status": "not-complete"},
+                "a malformed row is skipped",
             ]})
         dialogue = self.project / "work/grok-dialogue-v1"
         (dialogue / "motion").mkdir(parents=True)
