@@ -651,6 +651,18 @@ def _credit(value: Any) -> float:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
+def retry_charged(completed: dict[str, dict[str, Any]], failed: dict[str, dict[str, Any]],
+                  history: dict[str, list[dict[str, Any]]]) -> float:
+    """Credits charged by retries: each archived attempt after a job's first,
+    plus whatever a job with an attempts history has charged since."""
+    return (sum(_credit(attempt.get("creditsConsumed"))
+                for attempts in history.values() for attempt in attempts[1:])
+            + sum(_credit(landed.get("credits"))
+                  for job_id, landed in completed.items() if job_id in history)
+            + sum(_credit(facts.get("creditsConsumed"))
+                  for job_id, facts in failed.items() if job_id in history))
+
+
 def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
                   failed: dict[str, dict[str, Any]] | None = None,
                   history: dict[str, list[dict[str, Any]]] | None = None,
@@ -666,19 +678,17 @@ def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
     retryBudget credits instead.
     """
     rate = plan["pricing"]["creditsPerSecond"]
-    history = history or {}
-    rows, cumulative, retried = [], 0.0, 0.0
+    history, failed = history or {}, failed or {}
+    retried = retry_charged(completed, failed, history)
+    rows, cumulative = [], 0.0
     for job_id, attempts in history.items():
         cumulative += _credit(attempts[0].get("creditsConsumed"))
-        retried += sum(_credit(attempt.get("creditsConsumed")) for attempt in attempts[1:])
         for number, attempt in enumerate(attempts, start=1):
             rows.append({"id": job_id, "attempt": number, "credits": attempt.get("creditsConsumed"),
                          "definiteFailure": True, "archived": True})
     for job_id, landed in completed.items():
         credits = landed.get("credits")
-        if job_id in history:
-            retried += _credit(credits)
-        else:
+        if job_id not in history:
             cumulative += _credit(credits)
         row = {"id": job_id, "credits": credits, "creditsSource": landed.get("creditsSource"),
                "measuredSeconds": landed.get("durationSeconds")}
@@ -689,12 +699,10 @@ def check_charges(plan: dict[str, Any], completed: dict[str, dict[str, Any]],
                        ratioToDeclared=round(per_second / rate, 4),
                        aboveReportTolerance=per_second > rate * PRICE_VARIANCE_REPORT_TOLERANCE)
         rows.append(row)
-    for job_id, facts in (failed or {}).items():
+    for job_id, facts in failed.items():
         # A failed task can still be charged; it counts toward the ceiling.
         credits = facts.get("creditsConsumed")
-        if job_id in history:
-            retried += _credit(credits)
-        else:
+        if job_id not in history:
             cumulative += _credit(credits)
         rows.append({"id": job_id, "credits": credits,
                      "creditsSource": "failure-receipt" if credits is not None else None,
@@ -738,6 +746,8 @@ def archive_failure(row: dict[str, Any], number: int) -> Path:
     recovery = row["outputPath"].with_suffix(".pending.json")
     target = row["outputPath"].parent / f"{row['id']}.attempts" / f"attempt-{number:03d}.pending.json"
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise PlanError(f"{target} already exists; reconcile the attempts history by hand")
     os.link(recovery, target)
     recovery.unlink()
     return target
@@ -979,10 +989,11 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
     acquire_lock(LOCK, plan["manifestSha256"])
     try:
         jobs, completed, definite = preflight(plan)
-        reconciled, unsubmitted, failed = [], [], []
+        history = attempt_history(plan)
+        reconciled, unsubmitted, failed, unposted = [], [], [], []
         for row in jobs:
             if not row["outputPath"].with_suffix(".pending.json").exists():
-                unsubmitted.append(row["id"])
+                (unposted if row["id"] in history else unsubmitted).append(row["id"])
                 continue
             result = subprocess.run(kie_video_command(plan, row) + ["--resume-only"], cwd=ROOT,
                                     env=upload_env())
@@ -1000,6 +1011,7 @@ def reconcile(max_generated_seconds: int) -> dict[str, Any]:
         return {"mode": "RECONCILE_ONLY", "generationPosts": 0,
                 "reconciled": reconciled, "unsubmitted": unsubmitted, "failed": failed,
                 **({"definiteFailures": sorted(definite)} if definite else {}),
+                **({"unpostedRetries": unposted} if unposted else {}),
                 "completed": len(completed), "jobCount": len(plan["jobs"]),
                 "manifestSha256": plan["manifestSha256"]}
     finally:
@@ -1046,7 +1058,8 @@ def execute(max_generated_seconds: int, submit: bool,
     if retry_failed and retry_budget is None:
         raise PlanError("--retry-failed is a new paid POST: it needs a version 3 approval record "
                         "with automaticRetryAuthorized and a retryBudget; otherwise freeze the "
-                        "failed jobs as a new manifest with its own approval")
+                        "failed jobs as a new manifest (--freeze --only <ids> --selection-reason) "
+                        "with its own approval")
 
     require_media_host()
     if concurrency not in (1, 2, 3):
@@ -1069,17 +1082,36 @@ def execute(max_generated_seconds: int, submit: bool,
                     raise PlanError(
                         "this batch started under a different approval record; a retry grant "
                         "must be in place before a batch's first submission, so freeze the failed "
-                        "jobs as a new manifest with its own approval instead")
+                        "jobs as a new manifest (--freeze --only <ids> --selection-reason) with "
+                        "its own approval instead")
                 raise PlanError("execution authorization differs from the existing batch")
         else:
             atomic_json(authorization_path, evidence)
         history = attempt_history(plan)
+        # A job whose failed record was moved into its attempts history but
+        # whose retry was never posted (the run stopped in between) is a paid
+        # retry still owed; only --retry-failed may post it.
+        unposted = {row["id"] for row in jobs if row["id"] in history
+                    and not row["outputPath"].with_suffix(".pending.json").exists()}
+        if unposted and not retry_failed:
+            raise PlanError(f"{sorted(unposted)} were moved into their attempts history for a retry "
+                            "that was never posted; posting them is a retry, so run --submit "
+                            "--retry-failed (they already count toward the retry budget)")
         retry_ids = set(failed) if retry_failed else set()
-        if retry_ids:
+        if retry_ids or unposted:
             used = sum(len(attempts) for attempts in history.values())
             if used + len(retry_ids) > retry_budget["jobs"]:
                 raise PlanError(f"retrying {sorted(retry_ids)} would make {used + len(retry_ids)} "
                                 f"retries; the approval's retry budget is {retry_budget['jobs']}")
+            # The retry credits budget is read before any money moves, not only
+            # after a charge lands; check_charges still holds it post hoc.
+            so_far = retry_charged(completed, failed, history)
+            estimate = sum(row["durationSeconds"] for row in plan["jobs"]
+                           if row["id"] in retry_ids | unposted) * plan["pricing"]["creditsPerSecond"]
+            if so_far + estimate > retry_budget["credits"]:
+                raise PlanError(f"retries already charged {so_far} and posting {sorted(retry_ids | unposted)} "
+                                f"is priced at {estimate}; the approval's retry credits budget is "
+                                f"{retry_budget['credits']}")
         retry_credits = retry_budget["credits"] if retry_budget else 0
         sys.path.insert(0, str(ROOT / "pipeline"))
         from _common import kie
@@ -1167,8 +1199,10 @@ def execute(max_generated_seconds: int, submit: bool,
             "status": ("partial" if failed
                        else "technical-complete-creative-review-required"),
             **({"definiteFailures": list(failed.values()),
-                "nextStep": "creative review of landed jobs; a failed job is retried only "
-                            "as a new frozen manifest with its own approval"} if failed else {}),
+                "nextStep": "creative review of landed jobs; a failed job is retried with "
+                            "--retry-failed under a version 3 retry grant, or as a new frozen "
+                            "manifest (--freeze --only <ids> --selection-reason) with its own "
+                            "approval"} if failed else {}),
             "generatedSecondsCap": max_generated_seconds,
             "count": len(ordered),
             "items": ordered,
