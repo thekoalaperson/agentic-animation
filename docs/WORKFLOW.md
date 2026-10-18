@@ -103,8 +103,7 @@ Previews and auditions run on the coordinator and are labelled
 The timed animatic can be written from the storyboard (`--from-storyboard`,
 using measured narration or an explicit `estimatedSeconds`), can hold a
 wordless beat for authored frames, and can carry one temporary score stem. It
-can therefore preview a cut the measured timeline cannot assemble yet: today
-the timeline clocks every row by its speech.
+can therefore preview a cut before any of its takes exist.
 
 Check current provider availability and credits before a paid run. Save concrete
 job state so interruption does not create duplicate work. Delivery and publication
@@ -147,47 +146,76 @@ Recurring files, by the role they play:
   frozen into each dialogue manifest, so an edit means a new manifest.
 - A frozen execution manifest per paid batch (for example
   `work/grok-dialogue-v1/execution-manifest.json`), its draft beside it, and a
-  separate approval record bound to the manifest's bytes.
+  separate approval record bound to the manifest's bytes. Each paid runner's
+  `--freeze` writes the manifest from its draft with every hash computed and
+  `--print-schema` shows the fields it holds; `paid_approval.py draft` writes
+  the record's skeleton and `check` names what is stale.
 - `.pending.json`, `.vid.json` and other sidecars: persisted provider task IDs
   and the provenance of landed media.
+- Beside a paid manifest: attempt-numbered `credit-preflight` and receipt
+  files that accumulate rather than replace each other, the dialogue runner's
+  `progress.json`, `price-variance.json` and `refusals.jsonl` (each definite
+  provider failure, as raw facts), and `work/upload-log.jsonl`, one line per
+  file uploaded to a provider.
+- `<file>.supplied.json`: a take, cue, picture, reference clip or effect made
+  by hand or brought in, written by `register_supplied_media.py` with its hash,
+  maker and declared rights.
+- `speech-windows-attempt-NNN.json` and its index `speech-windows.json`, beside
+  a dialogue manifest: measured speech windows a review decision may copy.
 - `work/h3-review-ledger-v1.json`: the accepted H3 segments and their verdicts.
-- Review exports: the source-bound decisions that admit a dialogue clip or a
-  score take to the timeline.
+- A decisions file, in plain JSON, and the review exports
+  `admit_review_decisions.py` writes from it: the source-bound records that
+  admit a dialogue clip or a score take to the timeline. The same tool writes an
+  H3 ledger with `--lane h3`.
 - `work/assembly-v1/timeline-inputs.json`: the timeline's configuration. Its
   outputs are `edit-plan.json`, the subtitle timings, `timeline-audit.json`
   and, from `--dry-run`, `timeline-readiness.json`.
 
-No tool in this checkout writes the frozen dialogue manifest, the approval
-record or the review exports; each runner's `--help` and validator define what
-they must hold.
-
 Keys `build_episode_timeline.py` reads from `timeline-inputs.json`, grouped by
-role:
+role. Its `--help` gives each rhythm and sound control with its default, and
+none of them is required.
 
 - Documents: `storyboard`, `narrationManifest`, `dialogueManifest`,
   `h3ReviewLedger`, `productionOverrides`, `subtitleManuscript`, `scoreManifest`,
   `sfxManifest`, `outputDirectory`, and `narrationStateEpisodeRoot` and
-  `scoreStateEpisodeRoot` for state recorded under another root.
-- Admission: `dialogueOutputs` (per scene, including its review and an optional
-  `pictureCrop`, `pictureCropFrom` and `pictureCropReason`),
-  `requireApprovedDialogue`, `requireApprovedScore`, `reviewScope`.
-- Rhythm: `dialogueHandles` (`preSeconds`, `postSeconds`),
-  `preserveCompleteDialogueClips`, `minimumPictureSegmentSeconds`,
+  `scoreStateEpisodeRoot` for state recorded under another root. A lane
+  document is required when a row uses that lane, when the inputs name it, or
+  when it exists at its default path.
+- Admission: `dialogueOutputs` (per scene: its take and review, and optionally
+  `executionManifest` for a take from another frozen manifest, such as a
+  pilot), `requireApprovedDialogue`, `requireApprovedScore`, `reviewScope`.
+- Rhythm: `dialogueHandles` (`preSeconds`, `postSeconds`) and a scene's own
+  `dialogueOutputs[scene].handles`; per scene `pictureCrop`,
+  `pictureCropFrom`, `pictureCropReason`, `pictureWindows`, `audioLead` and
+  `audioTail`; `preserveCompleteDialogueClips`, `minimumPictureSegmentSeconds`,
   `microCutRoleWords`, `allowCausalBorrowing`, `narrationBreathing`,
-  `narrationBreathOverrides`, and the ledger's per-segment in, out, speed and
-  role.
-- Sound and text: `scorePlacements`, `musicBreaths`, `dialogueSubtitleMode`.
+  `narrationBreathOverrides`; `transitions`, `frameAspect` and `cadence`; and
+  the ledger's per-segment in, out, speed and role.
+- Sound and text: `scorePlacements` (each a take or a `silence`, timed by
+  `timelineStart`/`timelineDuration` or by `anchor`/`until` on a measured
+  event, with an optional `allowReprise`), `unscored`, `musicBreaths`,
+  `musicShaping`, `voiceGains`, `dialogueSubtitleMode`.
+
+Storyboard row fields the timeline and its neighbours read, beyond the still
+and its text: `beat`, `speaker`, `delivery`, `voice`, `passage`,
+`source_units`, and for a wordless row `holdSeconds`, `holdFrames` and
+`durationRule`.
 
 What the tools enforce, as facts rather than a sequence to follow:
 
 - A reference is registered before any still that cites it.
 - A dialogue manifest and an H3 plan bind each still's hash, so a still
   retaken afterwards refuses them until they are remade.
-- A paid runner submits only against a frozen manifest and its declared limits;
-  a changed prompt or authority file refuses the manifest as well.
+- A paid runner submits only against a frozen manifest, its declared limits and
+  a current approval record bound to the manifest's bytes; the manifest's own
+  `financialApproval` is reported and never authorizes. A changed prompt,
+  still or authority file refuses the manifest as well. Polling and landing
+  already-recorded task IDs needs no record.
 - The timeline admits a dialogue clip or a score take only through a review
-  export bound to its source and sidecar hashes, and H3 picture only through an
-  accepted ledger segment.
+  export bound to its source and sidecar hashes, and picture only through an
+  accepted ledger segment; a version 2 ledger also names the record that made
+  each segment's bytes, which may be a supplied-media sidecar. A supplied voice
+  take or score cue has no admission route into the timeline yet.
 - The assembler, mixer and subtitle exporter read the timeline's outputs and
   refuse when what they bind has changed.
 - Packaging binds its approvals to the delivered files' hashes.
@@ -277,11 +305,13 @@ sidecar records the SHA-256 of each canon reference.
 `asset_registry.py --impact canon:<path> --projects P1 P2 ...` lists the
 dependents of a canon file across episodes.
 
-Geometry the code checks today: H3 output is 1344x768 or 768x1344; the Grok
-dialogue runner sends 720p at 16:9, and after the clip is paid for it refuses
-any landed clip that is not 16:9. The dialogue dry run and H3 staging warn,
-without refusing, when a still's aspect is more than 0.03 away from the planned
-output, and point to `derive_still.py`. Whether Grok output follows the still's
+Geometry the code checks today: H3 output is 1344x768 or 768x1344. A version 2
+dialogue manifest sends 720p at 16:9; a version 3 manifest freezes its own
+resolution and aspect ratio from the runner's dated table. After a clip is paid
+for, the runner refuses one that does not match the frozen ratio. The dialogue
+dry run, against the manifest's ratio, and H3 staging warn, without refusing,
+when a still's aspect is more than 0.03 away from the planned output, and point
+to `derive_still.py`. Whether Grok output follows the still's
 geometry has not been qualified. The timeline readiness report lists any still
 that opens more than one dialogue job, and says whether those jobs are adjacent.
 That is information for the edit, and a held composition is a legitimate

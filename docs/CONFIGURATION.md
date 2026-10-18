@@ -10,6 +10,7 @@ and the storage holding its media. None must be a sibling of another repository.
 | `AGENTIC_ENV_FILE` | Explicit private env file; never implicitly read checkout secrets |
 | `KIE_KEY` | Kie credential, supplied privately |
 | `ELEVENLABS_API_KEY` | Direct narration credential, supplied privately |
+| `AGENTIC_UPLOAD_LOG` | File where every provider upload is logged; the paid runners set it |
 
 An explicit CLI project path wins over defaults. `AGENTIC_PROJECT_ROOT`
 overrides the profile's `projectRoot`. Channel, authorizer display identity,
@@ -21,6 +22,7 @@ Two optional profile keys are read by an agent, not by any tool. `instructions`
 lists private files holding the user's current preferences; an empty list, or
 no key, is normal. `researchCorpus` names the source texts a project draws on.
 Neither grants authority.
+
 `providers.kie.usdPerCredit` is the operator's own reading of the Kie price.
 Dry runs and sidecars use it to show dollars beside credits. It has no default,
 and without it the tools show credits only. `AGENTIC_UPLOAD_LOG` names the file

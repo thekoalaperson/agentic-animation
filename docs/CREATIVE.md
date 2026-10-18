@@ -113,10 +113,11 @@ not a universal duration grid. Preserve the source so experiments stay reversibl
 Cutting decisions come in pairs, and neither side is the default: one take for a
 line or several; cut on the question or on the answer; hold the speaker or the
 listener; sound leading picture or picture leading sound; a hard cut or a
-dissolve; a scene that stays put or one that leaves and returns. The timeline
-today joins picture with hard cuts and plays each line over its own clip, so a
-dissolve, a line heard over its listener and sound that leads its picture cannot
-be assembled yet.
+dissolve; a scene that stays put or one that leaves and returns. When nothing
+is authored, the timeline joins picture with hard cuts and plays each line over
+its own clip. A dissolve or a dip through colour, a line heard over other
+picture, and sound that leads or trails its picture can each be authored; the
+[workflow](WORKFLOW.md) names the keys.
 
 An action line describes an event, not a shot. Camera and cutting can be one
 idea held across the whole film. Notice the patterns that arrived without being
