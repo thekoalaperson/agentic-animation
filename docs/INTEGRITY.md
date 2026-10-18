@@ -41,6 +41,28 @@ before posting the rest. Its wrapper records the wallet change beside
 `creditsPerRequest` as an observation only, because the Suno poll reports no
 per-task credits.
 
+A version 2 dialogue manifest sends one still at 720p and 16:9. A version 3
+manifest reads its model, resolution and aspect ratio from a dated table in the
+runner; `--print-schema` shows the table, with each value marked exercised or
+provider-published. Its price names the model and resolution it was read for.
+A version 3 job may also send up to six reference images after its first frame.
+They are hash-bound in the execution request and recorded as provenance
+version 3, and the timeline admits the take only with exactly those hashes, in
+order. A job without references keeps its earlier request and records byte
+for byte. References stay unqualified until a one-clip pilot records how the
+first image and the references behave. Each landed job's technical audit
+records how far frame 0 is from its source still, as a number with no
+threshold. Every definite provider failure is appended to `refusals.jsonl`
+beside the manifest as raw facts: task ID, prompt hash, `failCode`, `failMsg`
+and credits, with an empty `operatorResponse`.
+
+An H3 request renders 17n+5 frames. Staging refuses any other `expectedFrames`
+before GPU work. The continuation builder fills a length outside its qualified
+table with an `unqualified` 17n+5 candidate. It snaps up or down only as a
+qualification receipt says. The two-keyframe body (`lastSource`, sent at frame
+index -1) is unexercised at every length until a one-job qualification run is
+recorded.
+
 A hash-bound old job resumes with its recorded runner and manifest. Use an
 explicit migration record when adapting it; do not change old evidence to make
 incompatible files appear to match.

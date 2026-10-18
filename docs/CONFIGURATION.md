@@ -81,6 +81,21 @@ started on the manifest's `financialApproval` alone has no record behind it,
 so the current runner can only reconcile what that batch already posted. Its
 unsubmitted jobs resume with the runner that started the batch.
 
+A definite provider failure is a recorded task that ended `GENERATION_FAILED`.
+The dialogue runner skips it and never posts it again. The run finishes
+`PARTIAL` and names the failed IDs. It still stops after three definite
+failures in a row, or when every job in a concurrency group fails. A retry is a
+new paid POST, so `kie_dialogue_finite.py --submit --retry-failed` runs only
+under a version 3 record. Version 3 is version 2 plus
+`automaticRetryAuthorized: true` and a `retryBudget` of `{jobs, credits}`,
+both set by the person who grants it. Only the dialogue lane accepts version 3.
+The retried request is identical, and the failed record moves to
+`motion/<id>.attempts/attempt-NNN.pending.json`. A job's first attempt counts
+toward `maximumCredits`. Every later attempt counts toward the retry budget.
+A changed prompt is not a retry. Freeze those jobs as a new manifest
+(`--freeze --only`) with its own approval, and admit its takes through
+`dialogueOutputs[scene].executionManifest`.
+
 Old grants and receipts retain their original schema and runner. Migrate paths
 with an external relocation map, not by editing recorded source hashes or
 approval wording. A changed runner hash is not permission to resume old jobs.

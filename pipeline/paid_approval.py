@@ -371,7 +371,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "describe":
             result: Any = {"schemaVersion": 2, "lanes": LANES,
-                           "grantFields": list(GRANT_FIELDS), "note": CLI_EPILOG}
+                           "grantFields": list(GRANT_FIELDS), "note": CLI_EPILOG,
+                           "version3": "version 2 plus automaticRetryAuthorized true and "
+                                       "retryBudget {jobs, credits}, set by the person granting "
+                                       "retries; accepted only by grok-dialogue --retry-failed"}
         elif args.command == "draft":
             result = draft_record(args.lane, args.manifest, args.out, args.project)
         else:
