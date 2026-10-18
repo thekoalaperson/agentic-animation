@@ -1,15 +1,14 @@
 """Transcript evidence for dialogue clips, with the Whisper call replaced offline."""
 import json
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
 
 from pipeline import measure_dialogue_speech as measure
 from pipeline import prepare_dialogue_review as review
 from pipeline.audit_sfx_speech import SimpleSegment
-from pipeline.test_prepare_dialogue_review import demo_project, digest
+from pipeline.test_prepare_dialogue_review import (demo_project, digest, latest_windows,
+                                                   measure_windows)
 
 
 class CompareLineTest(unittest.TestCase):
@@ -44,6 +43,10 @@ class MeasureTest(unittest.TestCase):
                 return [SimpleSegment({"text": " पंक्ति", "start": 0.5, "end": 1.6,
                                        "avg_logprob": -0.3, "no_speech_prob": 0.1})], info
 
+            # The implementer's flow: measure offline first, transcribe, measure again.
+            self.assertEqual(measure_windows(manifest, project, "--minimum-handle", "0").returncode, 0)
+            first = manifest.parent / "speech-windows-attempt-001.json"
+            before = first.read_bytes()
             output = project / "work/transcripts.json"
             report = measure.measure(jobs, output, model_name="fake", language="hi",
                                      manifest_sha256=digest(manifest), transcribe=transcribe)
@@ -55,16 +58,17 @@ class MeasureTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
                 measure.measure(jobs, output, model_name="fake", language="hi",
                                 manifest_sha256=digest(manifest), transcribe=transcribe)
-            done = subprocess.run([sys.executable, str(Path(review.__file__)), str(manifest),
-                                   "--project", str(project), "--max-jobs", "1",
-                                   "--measure-speech-windows", "--minimum-handle", "0",
-                                   "--transcript-evidence", str(output)],
-                                  capture_output=True, text=True)
+            done = measure_windows(manifest, project, "--minimum-handle", "0",
+                                   "--transcript-evidence", str(output))
             self.assertEqual(done.returncode, 0, done.stderr)
-            windows = json.loads((manifest.parent / "speech-windows.json").read_text())
-            window = windows["items"][0]["speechWindow"]
-            self.assertLessEqual(window["start"], 0.5)
-            self.assertGreaterEqual(window["end"], 1.6)
+            index, windows = latest_windows(manifest)
+            self.assertEqual(index["latest"], "speech-windows-attempt-002.json")
+            self.assertEqual(first.read_bytes(), before)
+            self.assertIsNone(json.loads(before)["items"][0]["transcriptSpan"])
+            item = windows["items"][0]
+            self.assertEqual(item["transcriptSpan"], {"start": 0.5, "end": 1.6})
+            self.assertLessEqual(item["speechWindow"]["start"], 0.5)
+            self.assertGreaterEqual(item["speechWindow"]["end"], 1.6)
             self.assertEqual(windows["transcriptEvidenceSha256"], digest(output))
 
 

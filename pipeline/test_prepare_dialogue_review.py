@@ -45,15 +45,26 @@ def demo_project(root: Path, layout="private/demo-project"):
     return project, manifest, video
 
 
+def measure_windows(manifest, project, *extra):
+    return subprocess.run([sys.executable, str(SCRIPT), str(manifest), "--project",
+                           str(project), "--max-jobs", "1", "--measure-speech-windows", *extra],
+                          capture_output=True, text=True)
+
+
+def latest_windows(manifest):
+    """The latest measurement, read through the speech-windows.json attempt index."""
+    index = json.loads((manifest.parent / "speech-windows.json").read_text())
+    return index, json.loads((manifest.parent / index["latest"]).read_text())
+
+
 class SpeechWindowTest(unittest.TestCase):
     def test_window_measurement_runs_offline_in_any_project_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, manifest, video = demo_project(Path(tmp))
-            done = subprocess.run([sys.executable, str(SCRIPT), str(manifest), "--project",
-                                   str(project), "--max-jobs", "1", "--measure-speech-windows"],
-                                  capture_output=True, text=True)
+            done = measure_windows(manifest, project)
             self.assertEqual(done.returncode, 0, done.stderr)
-            doc = json.loads((manifest.parent / "speech-windows.json").read_text())
+            index, doc = latest_windows(manifest)
+            self.assertEqual(index["latest"], "speech-windows-attempt-001.json")
             item = doc["items"][0]
             self.assertEqual(doc["manifestSha256"], digest(manifest))
             self.assertEqual(item["sourceSha256"], digest(video))
@@ -65,14 +76,30 @@ class SpeechWindowTest(unittest.TestCase):
             self.assertAlmostEqual(item["speechWindow"]["end"], item["detected"]["end"] + 0.25, places=5)
             self.assertEqual(doc["admission"], "not implied")
 
+    def test_a_second_measurement_adds_an_attempt_and_keeps_the_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, manifest, _ = demo_project(Path(tmp))
+            self.assertEqual(measure_windows(manifest, project).returncode, 0)
+            first = manifest.parent / "speech-windows-attempt-001.json"
+            before = first.read_bytes()
+            # The same measurement again adds nothing.
+            self.assertEqual(measure_windows(manifest, project).returncode, 0)
+            self.assertFalse((manifest.parent / "speech-windows-attempt-002.json").exists())
+            # Other thresholds were refused as an immutable change; now they are a new attempt.
+            done = measure_windows(manifest, project, "--minimum-handle", "0.5")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            index, doc = latest_windows(manifest)
+            self.assertEqual([row["path"] for row in index["attempts"]],
+                             ["speech-windows-attempt-001.json", "speech-windows-attempt-002.json"])
+            self.assertEqual(doc["thresholds"]["minimumHandleSeconds"], 0.5)
+            self.assertEqual(first.read_bytes(), before)
+
     def test_changed_clip_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, manifest, video = demo_project(Path(tmp))
             with video.open("ab") as handle:
                 handle.write(b"x")
-            done = subprocess.run([sys.executable, str(SCRIPT), str(manifest), "--project",
-                                   str(project), "--max-jobs", "1", "--measure-speech-windows"],
-                                  capture_output=True, text=True)
+            done = measure_windows(manifest, project)
             self.assertNotEqual(done.returncode, 0)
             self.assertIn("provenance changed", done.stderr)
 

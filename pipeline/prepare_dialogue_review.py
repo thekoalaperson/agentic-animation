@@ -3,8 +3,11 @@
 
 No paid API calls. A sheet is evidence for review, never an acceptance record.
 Sheets render on the qualified GPU host. --measure-speech-windows runs anywhere
-ffmpeg runs and writes speech-windows.json: conservative, hash-bound speech
-windows that a review decision may copy as the clip's speechWindow. With
+ffmpeg runs. Each measurement is a new speech-windows-attempt-NNN.json:
+conservative, hash-bound speech windows that a review decision may copy as the
+clip's speechWindow. Earlier attempts stay; speech-windows.json indexes them,
+so a second run with transcript evidence, other thresholds or another host adds
+an attempt instead of refusing. With
 --observation-prompt and --observation-max-credits it also writes
 sheet-observation-manifest.json for observe_media_finite.py.
 """
@@ -17,6 +20,11 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+
+if __package__:
+    from ._common import atomic_json, attempt_records, write_attempt_json
+else:
+    from _common import atomic_json, attempt_records, write_attempt_json
 
 
 def sha(path):
@@ -108,10 +116,12 @@ def speech_window(duration, silences, handle, transcript_span=None):
 
 def measure_speech_windows(manifest, root, jobs, *, noise_db, minimum_silence, handle,
                            transcripts=None):
-    """Write the offline, hash-bound speech-windows.json beside the manifest.
+    """Write one offline, hash-bound speech-windows attempt beside the manifest.
 
     This is measurement, not admission: the review decisions copy a chosen
-    window into the record the timeline reads as speechWindow.
+    window into the record the timeline reads as speechWindow. A run whose
+    document equals the latest attempt adds nothing; any other run adds an
+    attempt and never replaces one. speech-windows.json is the attempt index.
     """
     here = manifest.parent
     ffmpeg = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
@@ -152,8 +162,14 @@ def measure_speech_windows(manifest, root, jobs, *, noise_db, minimum_silence, h
                       "is never narrower than a supplied transcript span and falls back to the "
                       "full clip when no speech is found. Admission copies a chosen window."),
            "admission": "not implied", "items": items}
-    target = here / "speech-windows.json"
-    save(target, doc)
+    attempts = attempt_records(here, "speech-windows")
+    if attempts and attempts[-1]["record"] == doc:
+        target = here / attempts[-1]["path"]
+    else:
+        target = write_attempt_json(here, "speech-windows", doc)
+    atomic_json(here / "speech-windows.json", {
+        "kind": "dialogue-speech-windows-index", "manifestSha256": doc["manifestSha256"],
+        "latest": target.name, "attempts": attempt_records(here, "speech-windows")})
     return target, doc
 
 
@@ -192,7 +208,7 @@ def main():
     ap.add_argument("--ids", help="Explicit comma-separated completed subset; never changes source manifest")
     windows = ap.add_argument_group("offline speech windows (ffmpeg only, any host)")
     windows.add_argument("--measure-speech-windows", action="store_true",
-                         help="write speech-windows.json and stop; no sheets, no worker needed")
+                         help="add a speech-windows attempt and stop; no sheets, no worker needed")
     windows.add_argument("--noise-db", type=float, default=-35.0)
     windows.add_argument("--minimum-silence", type=float, default=0.30)
     windows.add_argument("--minimum-handle", type=float, default=0.25)
@@ -217,7 +233,8 @@ def main():
             manifest, root, verified_jobs(plan, manifest, root, here, selected),
             noise_db=a.noise_db, minimum_silence=a.minimum_silence, handle=a.minimum_handle,
             transcripts=a.transcript_evidence)
-        print(json.dumps({"speechWindows": str(target), "items": len(doc["items"]),
+        print(json.dumps({"speechWindows": str(target),
+                          "index": str(here / "speech-windows.json"), "items": len(doc["items"]),
                           "fallbacks": sum(x["fallbackToFullClip"] for x in doc["items"]),
                           "networkCalls": 0}))
         return
