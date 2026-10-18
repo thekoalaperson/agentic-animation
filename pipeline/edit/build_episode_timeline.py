@@ -503,6 +503,31 @@ def _require_hex_sha(value: Any, label: str) -> str:
     return text
 
 
+def review_binding_paths(
+    review_type: str, *, dialogue_path: Path, execution_path: Path | None = None,
+    narration_path: Path | None = None, score_manifest_path: Path | None = None,
+    production_path: Path | None = None,
+) -> list[Path]:
+    """The documents a review export must bind, in the order the timeline checks them.
+
+    A dialogue review binds the dialogue manifest, a correction's own
+    execution manifest and the production overrides. A score review binds the
+    score manifest, the narration and dialogue manifests and the overrides.
+    """
+    if review_type == "dialogue":
+        paths = [dialogue_path]
+        if execution_path is not None and execution_path != dialogue_path:
+            paths.append(execution_path)
+    elif review_type == "score":
+        paths = [path for path in (score_manifest_path, narration_path, dialogue_path)
+                 if path is not None]
+    else:
+        raise ValueError(f"no review export lane named {review_type!r}")
+    if production_path:
+        paths.append(production_path)
+    return paths
+
+
 def _review_approval(
     *, episode: Path, repo: Path, owner: Path, evidence: dict[str, Any],
     review_type: str, item_id: str, source: Path, source_sha: str,
@@ -560,12 +585,57 @@ def _review_approval(
             matches.append(row)
     if len(matches) != 1 or _normal_verdict(matches[0].get("decision")) not in ACCEPTED:
         raise ValueError(f"{item_id}: exactly one source-bound approved review decision is required")
-    return {
+    result = {
         "reviewExport": _portable_path(review_path, episode),
         "reviewExportSha256": review_sha,
         "reviewFingerprint": fingerprint,
         "reviewedAt": matches[0].get("reviewedAt"),
     }
+    # Who looked and how, when the review says so. Absence never refuses.
+    for key in REVIEW_NOTE_KEYS:
+        if matches[0].get(key) not in (None, "", []):
+            result[key] = matches[0][key]
+    return result
+
+
+REVIEW_NOTE_KEYS = ("reviewedBy", "reviewer", "method")
+
+
+def _reviewer_kinds(record: dict[str, Any]) -> set[str]:
+    """The kinds of reviewer a record names: ``human``, ``agent`` or neither."""
+    raw = record.get("reviewer")
+    rows = raw if isinstance(raw, list) else [raw]
+    kinds = {row.get("kind") for row in rows if isinstance(row, dict)} & {"human", "agent"}
+    if not kinds and str(record.get("reviewedBy") or "").startswith("agent:"):
+        kinds = {"agent"}
+    return kinds
+
+
+def _review_summary(lanes: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Count, per lane, who reviewed what was admitted, from the records alone."""
+    summary = {}
+    for lane, records in lanes.items():
+        if not records:
+            continue
+        kinds = [_reviewer_kinds(record) for record in records]
+        agent = sum("agent" in row for row in kinds)
+        person = sum("human" in row for row in kinds)
+        unrecorded = sum(not row for row in kinds)
+        methods: dict[str, int] = {}
+        for record in records:
+            raw = record.get("method")
+            for method in raw if isinstance(raw, list) else [raw]:
+                if isinstance(method, str) and method.strip():
+                    methods[method] = methods.get(method, 0) + 1
+        parts = [f"{len(records)} admitted", f"{agent} agent-reviewed",
+                 f"{person} watched by a person"]
+        if unrecorded:
+            parts.append(f"{unrecorded} with no reviewer recorded")
+        summary[lane] = {"admitted": len(records), "agentReviewed": agent,
+                         "personReviewed": person, "reviewerUnrecorded": unrecorded,
+                         "methods": dict(sorted(methods.items())),
+                         "line": f"{lane}: " + ", ".join(parts)}
+    return summary
 
 
 def _is_micro_role(role: str, configured: set[str]) -> bool:
@@ -704,6 +774,61 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
     }
 
 
+def lane_documents(episode: Path, repo: Path, config_path: Path,
+                   config: dict[str, Any]) -> dict[str, str]:
+    """Name each document this timeline config reads, before reading any.
+
+    The admission writer calls this too, so the review bindings it computes
+    are the ones the timeline later checks.
+    """
+    # Which lane documents a film needs depends on what its rows are. Peek at
+    # the storyboard and override first; build_timeline still reports them.
+    storyboard_raw = config.get("storyboard", "story/storyboard_plan.json")
+    peek_rows = _peek_json(_resolve_path(episode, repo, config_path, storyboard_raw)).get("stills")
+    peek_overrides: dict[str, dict[str, Any]] = {}
+    if config.get("productionOverrides"):
+        try:
+            peek_overrides = _production_overrides(_peek_json(
+                _resolve_path(episode, repo, config_path, config["productionOverrides"])))
+        except ValueError:
+            peek_overrides = {}
+    peek_kinds = set()
+    for row in peek_rows if isinstance(peek_rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            peek_kinds.add(_row_delivery(row, peek_overrides.get(str(row.get("still_id")), {}))[0])
+        except ValueError:
+            peek_kinds.add("dialogue" if row.get("speaker") else "narration")
+    if not isinstance(peek_rows, list) or not peek_rows:
+        peek_kinds = {"narration", "dialogue"}  # unreadable board: keep every lane required
+    def lane_document(key: str, default: str, needed: bool) -> str | None:
+        # A lane document is required when a row needs it, when the config
+        # names it, or when it exists at its default path. The last keeps an
+        # existing project's documents, and so its fingerprint, unchanged.
+        if needed or key in config or _resolve_path(episode, repo, config_path, default).is_file():
+            return config.get(key, default)
+        return None
+
+    required_docs = {"storyboard": storyboard_raw}
+    narration_raw = lane_document("narrationManifest", "work/narration-hi-v1/manifest.json",
+                                  "narration" in peek_kinds)
+    if narration_raw is not None:
+        required_docs["narrationManifest"] = narration_raw
+    required_docs["dialogueManifest"] = config.get(
+        "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
+    )
+    ledger_raw = lane_document("h3ReviewLedger", "work/h3-review-ledger-v1.json",
+                               bool(peek_kinds & {"narration", "picture"}))
+    if ledger_raw is not None:
+        required_docs["h3ReviewLedger"] = ledger_raw
+    if config.get("productionOverrides"):
+        required_docs["productionOverrides"] = config["productionOverrides"]
+    if config.get('subtitleManuscript'):
+        required_docs['subtitleManuscript'] = config['subtitleManuscript']
+    return required_docs
+
+
 def build_timeline(
     episode: Path,
     config_path: Path,
@@ -754,51 +879,7 @@ def build_timeline(
         }
         return value
 
-    # Which lane documents a film needs depends on what its rows are. Peek at
-    # the storyboard and override first; the loop below still reports them.
-    storyboard_raw = config.get("storyboard", "story/storyboard_plan.json")
-    peek_rows = _peek_json(_resolve_path(episode, repo, config_path, storyboard_raw)).get("stills")
-    peek_overrides: dict[str, dict[str, Any]] = {}
-    if config.get("productionOverrides"):
-        try:
-            peek_overrides = _production_overrides(_peek_json(
-                _resolve_path(episode, repo, config_path, config["productionOverrides"])))
-        except ValueError:
-            peek_overrides = {}
-    peek_kinds = set()
-    for row in peek_rows if isinstance(peek_rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            peek_kinds.add(_row_delivery(row, peek_overrides.get(str(row.get("still_id")), {}))[0])
-        except ValueError:
-            peek_kinds.add("dialogue" if row.get("speaker") else "narration")
-    if not isinstance(peek_rows, list) or not peek_rows:
-        peek_kinds = {"narration", "dialogue"}  # unreadable board: keep every lane required
-    def lane_document(key: str, default: str, needed: bool) -> str | None:
-        # A lane document is required when a row needs it, when the config
-        # names it, or when it exists at its default path. The last keeps an
-        # existing project's documents, and so its fingerprint, unchanged.
-        if needed or key in config or _resolve_path(episode, repo, config_path, default).is_file():
-            return config.get(key, default)
-        return None
-
-    required_docs = {"storyboard": storyboard_raw}
-    narration_raw = lane_document("narrationManifest", "work/narration-hi-v1/manifest.json",
-                                  "narration" in peek_kinds)
-    if narration_raw is not None:
-        required_docs["narrationManifest"] = narration_raw
-    required_docs["dialogueManifest"] = config.get(
-        "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
-    )
-    ledger_raw = lane_document("h3ReviewLedger", "work/h3-review-ledger-v1.json",
-                               bool(peek_kinds & {"narration", "picture"}))
-    if ledger_raw is not None:
-        required_docs["h3ReviewLedger"] = ledger_raw
-    if config.get("productionOverrides"):
-        required_docs["productionOverrides"] = config["productionOverrides"]
-    if config.get('subtitleManuscript'):
-        required_docs['subtitleManuscript'] = config['subtitleManuscript']
+    required_docs = lane_documents(episode, repo, config_path, config)
     docs: dict[str, tuple[Path, dict[str, Any]]] = {}
     for label, raw in required_docs.items():
         path = _resolve_path(episode, repo, config_path, raw)
@@ -971,6 +1052,7 @@ def build_timeline(
             errors.append({'type':'subtitle-manuscript', 'error':str(exc)})
 
     h3_by_scene: dict[str, list[dict[str, Any]]] = {}
+    h3_reviews: list[dict[str, Any]] = []
     routes: dict[str, str] = {}
     for row in rows:
         scene_id = str(row["still_id"])
@@ -1191,6 +1273,7 @@ def build_timeline(
                         }
                     )
             candidates.append(candidate)
+            h3_reviews.append({key: segment[key] for key in REVIEW_NOTE_KEYS if key in segment})
         h3_by_scene[scene_id] = candidates
         if (row_kind[scene_id] == "picture" and route in PICTURE_ROUTES and not candidates
                 and picture_rule.get(scene_id, ("take",))[0] == "take"):
@@ -1336,11 +1419,9 @@ def build_timeline(
                                           prompt_path.read_text(encoding='utf-8'))
                 if not isinstance(source_doc.get("taskId"), str) or not source_doc["taskId"]:
                     raise ValueError(f"{scene_id}: dialogue sidecar has no paid taskId")
-                required_bindings = [dialogue_path]
-                if execution_path != dialogue_path:
-                    required_bindings.append(execution_path)
-                if production_path:
-                    required_bindings.append(production_path)
+                required_bindings = review_binding_paths(
+                    "dialogue", dialogue_path=dialogue_path, execution_path=execution_path,
+                    production_path=production_path)
                 review = _review_approval(
                     episode=episode, repo=repo, owner=config_path, evidence=output,
                     review_type="dialogue", item_id=source_scene_id, source=source,
@@ -1520,10 +1601,9 @@ def build_timeline(
                 ]
                 if state_item.get("status") != "DOWNLOADED" or len(state_matches) != 1:
                     raise ValueError(f"{movement}: score finite state does not admit this candidate")
-                required_bindings = [path for path in (score_manifest_path, narration_path, dialogue_path)
-                                     if path is not None]
-                if production_path:
-                    required_bindings.append(production_path)
+                required_bindings = review_binding_paths(
+                    "score", dialogue_path=dialogue_path, narration_path=narration_path,
+                    score_manifest_path=score_manifest_path, production_path=production_path)
                 review = _review_approval(
                     episode=episode, repo=repo, owner=config_path, evidence=placement,
                     review_type="score", item_id=movement, source=track,
@@ -1570,6 +1650,14 @@ def build_timeline(
         "media": measured,
         "outputsWritten": [str(readiness_path)],
     }
+    review_lanes = {
+        "dialogue": [media[3] for media in dialogue_media.values()],
+        "score": validated_score_placements,
+        "h3": h3_reviews,
+    }
+    if any(key in record for records in review_lanes.values() for record in records
+           for key in REVIEW_NOTE_KEYS):
+        readiness["reviewSummary"] = _review_summary(review_lanes)
     if narration_state_path is not None and narration_state_path.is_file():
         readiness["documents"]["narrationState"] = {
             "path": str(narration_state_path), "sha256": _sha256(narration_state_path)
@@ -2143,8 +2231,28 @@ def build_timeline(
     return readiness, edit_plan
 
 
+HELP_DOCUMENTS = """\
+documents read, named in timeline-inputs.json (defaults in brackets):
+  storyboard        the authored rows, one per still [story/storyboard_plan.json]
+  narrationManifest narration lane items and their finite state, from
+                    eleven_batch_finite.py; needed only when a row is narrated
+                    [work/narration-hi-v1/manifest.json]
+  dialogueManifest  the frozen Grok dialogue jobs that kie_dialogue_finite.py ran
+                    [work/grok-dialogue-v1/draft-manifest.json]
+  h3ReviewLedger    picture verdicts per row; needed only when a row uses H3 or
+                    wordless picture. admit_review_decisions.py --lane h3 writes
+                    one from review_finite.py's local-audit.json, or write it by
+                    hand [work/h3-review-ledger-v1.json]
+
+A dialogue take (dialogueOutputs) or score take (scorePlacements) is admitted
+only through a source-bound schema-2 review export, which
+admit_review_decisions.py writes from a plain decisions file. Accepted verdict
+words: """ + ", ".join(sorted(ACCEPTED)) + "."
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=HELP_DOCUMENTS,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("episode", type=Path)
     parser.add_argument(
         "--input",

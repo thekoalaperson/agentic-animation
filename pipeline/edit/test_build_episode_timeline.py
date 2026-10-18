@@ -1081,6 +1081,9 @@ class TimelineBuilderTest(unittest.TestCase):
         ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
         self.assertTrue(ready["ready"])
         self.assertEqual(plan["scorePlacements"][0]["trackSha256"], track_sha)
+        # A review row that names no reviewer or method adds nothing to the plan.
+        self.assertEqual(set(plan["scorePlacements"][0]) - set(config["scorePlacements"][0]),
+                         {"executionManifest", "executionManifestSha256", "reviewedAt"})
 
         track.write_bytes(b"swapped-score")
         ready, plan = timeline.build_timeline(
@@ -1242,6 +1245,7 @@ class TimelineBuilderTest(unittest.TestCase):
     def test_films_without_new_markers_gain_no_new_fields(self):
         ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
         self.assertNotIn("pictureScenes", ready)
+        self.assertNotIn("reviewSummary", ready)  # nothing names who reviewed, so nothing is summarised
         audit = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
         self.assertNotIn("pictureCount", audit)
         narration = {"id", "shot", "kind", "speaker", "audio", "picture", "audioSha256", "start",
