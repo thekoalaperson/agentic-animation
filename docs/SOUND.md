@@ -43,7 +43,8 @@ silent, and continuous scoring is one answer. The fields that carry it are the
 `gainDb`, `fadeInSeconds`/`fadeOutSeconds`) and `musicBreaths` (a range of
 shots, a level and a reason; level 0 is silence). Today the mixer requires
 placements to cover the measured clock from start to end, so silence is made
-with a breath inside a placement rather than with a gap.
+with a breath inside a placement rather than with a gap. A film with no audible
+score therefore still needs one admitted take, held at level 0 by a breath.
 
 The score lane today accepts instrumental requests only, with an empty lyrics
 prompt. The music ranker and the effects renderer read eight fixed emotion keys

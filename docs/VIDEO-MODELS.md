@@ -14,7 +14,7 @@ operators or third parties, not confirmed here).
 
 | Where | Runner (code) | Provider (page) |
 |---|---|---|
-| Stills | The registered target is a PNG; the row's `size` is recorded, not enforced. | Depends on the image tool. |
+| Stills | The registered target is a PNG; the row's `size` is recorded, not enforced. | |
 | H3 picture | 1344x768 or 768x1344, short edge 768. Staging warns when a source's aspect is more than 0.03 from the planned output. | Self-hosted; see H3 below. |
 | Grok dialogue | Sends `resolution: 720p` and `aspect_ratio: 16:9` with one still. After the clip is paid for, refuses any landed clip narrower than 1200x675 or more than 0.03 from 16:9. The dry run warns when a still is more than 0.03 from 16:9. | `aspect_ratio` "is invalid if it is a single image" (page, 2026-10-18). Whether output follows the still's geometry is not stated and has not been qualified here. |
 | Delivery | 1920x1080 long form, 1080x1920 Short. | |
@@ -30,8 +30,9 @@ Runner (code: `h3/stage_finite.py`, `h3/box/finite_client.py`):
 - One non-empty prompt per item, 4 to 15 seconds, short edge 768,
   `steps` of 20, 30 or 50, and an output of 1344x768 or 768x1344.
 - `expectedFrames` is at most 400 and within 0.75 s of `seconds` at 24 fps. The
-  landed clip must have exactly that many frames. The only qualified request in
-  code is 7 seconds at 175 frames (`build_measured_deficit_manifest.py`).
+  landed clip must have exactly that many frames. When a project names no
+  `qualifiedRequest`, `build_measured_deficit_manifest.py` defaults to 7 seconds
+  at 175 frames; that is a default, not the only length.
 - The client sends `task: fl2va` with the first still as a keyframe at
   `frame_index` 0, `flow_shift` 12.0 and `audio_flow_shift` 3.0. Generated
   audio is stripped later.

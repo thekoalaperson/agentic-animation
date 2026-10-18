@@ -57,19 +57,19 @@ supplies creative approval.
 Each kind of look costs something different and catches something different.
 They come in no fixed order, and any of them may be skipped.
 
+- One continuous watch of the working cut, with sound, costs its runtime. It
+  catches what only accumulates: rhythm, repetition and fatigue.
+- The stills sheet in story order costs nothing beyond the stills. It catches
+  identity, state and continuity errors while they are cheapest to fix.
+- A pilot of the riskiest shots costs a few paid clips. It catches route
+  behaviour that no page states.
 - A cold read of the plan, against its own direction and against the provider
   facts, costs minutes. It catches a plan that contradicts itself, a request no
   runner sends, and major choices that were inherited rather than decided.
-- The stills sheet in story order costs nothing beyond the stills. It catches
-  identity, state and continuity errors while they are cheapest to fix.
+- Watching every take of a batch costs the batch's runtime. It catches the
+  performances and the drift that a few clips are too small to show.
 - The timed animatic costs a coordinator render. It catches pacing, held
-  silence, late or early music and a reordered memory before any motion spend.
-- A pilot of the riskiest shots costs a few paid clips. It catches route
-  behaviour that no page states.
-- Watching the main batch's takes costs the batch. It catches the performances
-  and the drift that a pilot is too small to show.
-- One continuous watch of the working cut, with sound, costs its runtime. It
-  catches what only accumulates: rhythm, repetition and fatigue.
+  silence, late or early music and a reordered memory before motion is paid for.
 
 Review each take against this film's own direction and the technical facts, not
 against any look these docs mention.
@@ -81,7 +81,9 @@ Recurring files, by the role they play:
 - `story/storyboard_plan.json`: the rows, in story order. The timeline binds it
   as a whole file, so free-text notes go on `generation_manifest.json` rows.
 - `story/generation_manifest.json` and a still policy: the stills, their
-  references and continuity facts.
+  references and continuity facts. Stills made by hand or brought in from a
+  third party or another tool register through `--origin` (see Stills and
+  canon below).
 - `story/GOAL.md`: the dialogue runner's default authority file. Its hash is
   frozen into each dialogue manifest, so an edit means a new manifest.
 - A frozen execution manifest per paid batch (for example
