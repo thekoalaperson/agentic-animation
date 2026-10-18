@@ -100,7 +100,7 @@ class AbsoluteSfxMixInputTests(unittest.TestCase):
         design = json.loads(self.absolute_design.read_text())
         design['generationApiAllowed'] = True
         write_json(self.absolute_design, design)
-        with self.assertRaisesRegex(adapter.ContractError, 'self-hosted route'):
+        with self.assertRaisesRegex(adapter.ContractError, 'no generation API'):
             self.build()
         self.regenerate()
         self.edit_plan.write_text(self.edit_plan.read_text() + ' ')

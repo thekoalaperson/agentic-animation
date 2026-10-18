@@ -394,6 +394,51 @@ class DesignedSfxContractTests(unittest.TestCase):
             return  # Rejecting an unsupported model is also an honest outcome.
         self.assertNotIn("StableAudio3", result["route"])
 
+    def test_small_sfx_receipt_route_is_unchanged_whether_declared_or_defaulted(self):
+        result, _, _ = self.render_synthetic()
+        self.assertEqual(result["route"], sfx.SFX_MODELS[sfx.DEFAULT_SFX_MODEL])
+        spec = self.design["sourceBatches"]["a"]
+        brief = sfx.read(self.ep / spec["brief"]["path"])
+        brief.pop("model")
+        self.rewrite_batch("a", brief=brief)
+        self.assertEqual(self.render_synthetic()[0]["route"],
+                         "self-hosted-text-to-audio/StableAudio3-Small-SFX+deterministic-edits")
+
+    def recorded(self, **job_changes):
+        spec = self.design["sourceBatches"]["b"]
+        brief = sfx.read(self.ep / spec["brief"]["path"])
+        brief.pop("model", None)
+        brief["route"] = "recorded-or-library"
+        brief["jobs"][0].update(prompt=None, origin="demo-recordist field take, demo-room",
+                                licence="demo licence record, dated; verify current terms")
+        brief["jobs"][0].update(job_changes)
+        self.rewrite_batch("b", brief=brief)
+        self.design["cues"].append(self.cue(id="cue-b", sourceBatch="b", shot=2))
+
+    def test_recorded_or_library_source_names_its_origin_and_licence(self):
+        self.recorded()
+        result, _, _ = self.render_synthetic()
+        self.assertEqual(result["route"], " + ".join(sorted([sfx.RECORDED_RECEIPT_ROUTE,
+                                                              sfx.SFX_MODELS[sfx.DEFAULT_SFX_MODEL]])))
+        recorded = result["cues"][1]
+        self.assertIsNone(recorded["sourcePrompt"])
+        self.assertEqual(recorded["origin"], "demo-recordist field take, demo-room")
+        self.assertEqual(result["sourceRoutes"], {"a": sfx.DEFAULT_SFX_MODEL, "b": "recorded-or-library"})
+
+    def test_recorded_source_without_origin_or_terms_and_promptless_generation_are_refused(self):
+        for changes in ({"origin": ""}, {"licence": None}, {"prompt": "a lamp hum"}):
+            with self.subTest(changes):
+                self.recorded(**changes)
+                with self.assertRaises(REJECTED):
+                    self.load()
+                self.design["cues"].pop()
+        spec = self.design["sourceBatches"]["a"]
+        brief = sfx.read(self.ep / spec["brief"]["path"])
+        brief["jobs"][0]["prompt"] = None
+        self.rewrite_batch("a", brief=brief)
+        with self.assertRaises(REJECTED):
+            self.load()
+
     def test_working_receipt_does_not_claim_a_human_or_final_watch(self):
         result, _, _ = self.render_synthetic()
         self.assertFalse(result["finalApproved"])

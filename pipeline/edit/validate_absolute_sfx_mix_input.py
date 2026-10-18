@@ -24,7 +24,7 @@ from typing import Any
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 SAMPLE_RATE = 48_000
 CHANNELS = 2
-ROUTE = "self-hosted-text-to-audio/StableAudio3-Small-SFX+deterministic-edits"
+ROUTE = "self-hosted-text-to-audio/StableAudio3-Small-SFX+deterministic-edits"  # the Small-SFX-only receipt
 
 
 class ContractError(RuntimeError):
@@ -144,7 +144,7 @@ def build_contract(episode: Path, absolute_design_path: Path, render_audit_path:
     if design.get("version") != 2 or design.get("workingAudioOnly") is not False:
         raise ContractError("Final admission requires designed-SFX v2; working previews and legacy receipts are refused")
     if design.get("generationApiAllowed") is not False or not design.get("authority"):
-        raise ContractError("SFX design must declare the authorized self-hosted route")
+        raise ContractError("SFX design must declare its authority and allow no generation API")
     if design.get("hardSfxSilenceWindows"):
         raise ContractError("This renderer does not certify legacy hard-silence windows; use a supported authored design")
     for key, design_key in (("editPlan", "clock"), ("pictureSegments", "picture")):
@@ -168,7 +168,9 @@ def build_contract(episode: Path, absolute_design_path: Path, render_audit_path:
     runtime = finite(plan.get("runtimeSeconds"), "runtime")
     if runtime <= 0:
         raise ContractError("Measured runtime must be positive")
-    if audit.get("route") != ROUTE or audit.get("workingAudioOnly") is not False:
+    # The receipt names the route its batches declared (ROUTE for Small-SFX alone).
+    if (audit.get("route") != renderer.receipt_route(render_contract.get("sourceRoutes", {}))
+            or audit.get("workingAudioOnly") is not False):
         raise ContractError("Render receipt is not an independent final-capable SFX render")
     verify_file_hash(renderer_path, audit.get("rendererSha256"), "retained renderer")
     verify_file_hash(paths["absoluteDesign"], audit.get("designSha256"), "rendered design")
