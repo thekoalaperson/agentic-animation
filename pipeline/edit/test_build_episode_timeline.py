@@ -1566,6 +1566,9 @@ class TimelineBuilderTest(unittest.TestCase):
 
     def test_dialogue_passage_counts_once_and_keeps_each_halfs_words(self):
         self._speak_second_row_as_dialogue()
+        timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        unlinked = json.loads((self.ep / "work/assembly-v1/timeline-audit.json").read_text())
+        self.assertEqual(unlinked["dialogueCount"], 2)
         rows = [dict(r) for r in self.rows]
         rows[2]["passage"] = "demo-s002"
         self.write_rows(rows)
