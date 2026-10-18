@@ -8,7 +8,9 @@ thumbnails and the upload kit are optional panels. Optional
 timeline's ``timeline-readiness.json``, or given as lines),
 ``checked`` (what was checked and by which method) and ``notChecked`` (what
 could not be) are shown beside the film, so a person sees what the review
-covered. The page is self-contained apart from relative media; nothing here
+covered. Optional ``mastering`` (the ``loudnormSecondPass`` object from the
+body master audit) says whether loudness was reached with one gain or by
+riding the level, with the loudness range before and after. The page is self-contained apart from relative media; nothing here
 uploads or publishes.
 """
 import argparse
@@ -39,6 +41,9 @@ def validate(data):
     for key in ('checked', 'notChecked'):
         if key in data and not isinstance(data[key], list):
             raise ValueError(f'{key} must be a list')
+    if 'mastering' in data and (not isinstance(data['mastering'], dict)
+                                or data['mastering'].get('normalizationType') not in ('linear', 'dynamic')):
+        raise ValueError('mastering must be the master audit loudnormSecondPass object')
     if 'reviewSummary' in data and not isinstance(data['reviewSummary'], (list, dict)):
         raise ValueError('reviewSummary must be the readiness object or a list of lines')
 

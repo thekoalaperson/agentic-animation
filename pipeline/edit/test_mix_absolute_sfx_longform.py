@@ -333,6 +333,87 @@ class MixerFixture(unittest.TestCase):
         with self.assertRaisesRegex(mixer.MixError, "only silence"):
             self.build()
 
+    def test_v1_contract_is_unchanged_without_authored_settings(self) -> None:
+        contract = self.build()
+        self.assertEqual(contract["settings"], mixer.default_settings())
+        self.assertNotIn("settingsVersion", contract["settings"])
+        explicit = mixer.build_mix_contract(
+            self.episode, sfx_input_path=self.sfx_contract_path, edit_plan_path=self.plan_path,
+            picture_path=self.picture, voice_path=self.voice, music_path=self.music,
+            probe=self.probe, sfx_revalidator=self.accept_sfx, settings=mixer.default_settings())
+        self.assertEqual(json.dumps(contract, sort_keys=True), json.dumps(explicit, sort_keys=True))
+
+    def test_v2_settings_are_bounded_recorded_and_rebuilt(self) -> None:
+        authored = {"settingsVersion": 2, "musicGainDb": 3.0, "targetLra": "measured",
+                    "musicDuck": {"threshold": 0.05, "ratio": 2.5, "attackMs": 30, "releaseMs": 800},
+                    "targetIntegratedLufs": -20, "refuseDynamicMastering": True,
+                    "reason": "A quiet film that should stay quiet."}
+        contract = mixer.build_mix_contract(
+            self.episode, sfx_input_path=self.sfx_contract_path, edit_plan_path=self.plan_path,
+            picture_path=self.picture, voice_path=self.voice, music_path=self.music,
+            probe=self.probe, sfx_revalidator=self.accept_sfx, settings=authored)
+        settings = contract["settings"]
+        self.assertEqual(settings["musicDuck"]["ratio"], 2.5)
+        self.assertEqual(settings["sfxDuck"], mixer.default_settings()["sfxDuck"])
+        self.assertEqual(settings["targetTruePeakDbtp"], -1.5)
+        self.assertNotEqual(contract["contractFingerprint"], self.build()["contractFingerprint"])
+        saved = self.assembly / "absolute-mix-contract.json"
+        write_json(saved, contract)
+        self.assertEqual(mixer.verify_saved_contract(
+            self.episode, saved, probe=self.probe, sfx_revalidator=self.accept_sfx), contract)
+        self.assertIn("ratio=2.5", mixer.filter_graph(contract))
+        self.assertEqual(mixer.second_pass_lra(settings, {"input_lra": "17.40"}), 17.4)
+        self.assertEqual(mixer.second_pass_lra(settings, {"input_lra": "0.00"}), 1.0)
+        self.assertEqual(mixer.measurement_lra(settings), 11.0)
+
+    def test_v2_settings_out_of_bounds_or_unversioned_are_refused(self) -> None:
+        cases = {
+            "settingsVersion 2": {"musicGainDb": 3.0},
+            "-6..6": {"settingsVersion": 2, "musicGainDb": 9.0},
+            "ratio 1-12": {"settingsVersion": 2, "sfxDuck": {"threshold": 0.02, "ratio": 20,
+                                                             "attackMs": 8, "releaseMs": 360}},
+            "-27..-12": {"settingsVersion": 2, "targetIntegratedLufs": -8},
+            "-3..-1": {"settingsVersion": 2, "targetTruePeakDbtp": -0.5},
+            "measured": {"settingsVersion": 2, "targetLra": "wide"},
+            "boolean": {"settingsVersion": 2, "refuseDynamicMastering": "yes"},
+            "unknown": {"settingsVersion": 2, "limiter": True},
+        }
+        for message, settings in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(mixer.MixError, message):
+                mixer.validate_settings(settings)
+
+    def test_second_pass_type_is_recorded_and_dynamic_names_choices(self) -> None:
+        record = mixer.second_pass_record(
+            {"normalization_type": "dynamic", "input_lra": "18.20", "output_lra": "2.00",
+             "input_i": "-30.1", "output_i": "-14.2"}, 11.0)
+        self.assertEqual((record["normalizationType"], record["inputLra"], record["outputLra"]),
+                         ("dynamic", 18.2, 2.0))
+        message = mixer.dynamic_mastering_message(record)
+        for choice in ("measured", "fixedGainMaster", "refuseDynamicMastering off"):
+            self.assertIn(choice, message)
+        with self.assertRaisesRegex(mixer.MixError, "normalization type"):
+            mixer.second_pass_record({"input_lra": "1"}, 11.0)
+
+    def test_info_log_level_lets_loudnorm_report_a_dynamic_fallback(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is unavailable")
+        # Short loud bursts over a quiet bed: one gain cannot meet -14 LUFS at -1.5 dBTP.
+        source = self.work / "wide.wav"
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "aevalsrc='if(lt(mod(t,10),0.02),0.95,0.03)*sin(2*PI*440*t)':s=48000:d=40",
+                        "-ac", "2", str(source)], check=True)
+        settings = mixer.default_settings()
+        first = mixer.loudness(source, settings)
+        norm = (f"loudnorm=I=-14.0:TP=-1.5:LRA=11.0:measured_I={first['input_i']}:"
+                f"measured_TP={first['input_tp']}:measured_LRA={first['input_lra']}:"
+                f"measured_thresh={first['input_thresh']}:offset={first['target_offset']}:"
+                "linear=true:print_format=json")
+        result = subprocess.run([ffmpeg, "-nostats", "-v", "info", "-i", str(source), "-af", norm,
+                                 "-f", "null", "-"], capture_output=True, check=True)
+        record = mixer.second_pass_record(mixer.parse_loudnorm(result.stderr), 11.0)
+        self.assertEqual(record["normalizationType"], "dynamic")
+
     def test_render_run_must_preserve_semantic_segments_exactly_once(self) -> None:
         path = self.assembly / "picture-render-runs.json"
         runs = json.loads(path.read_text())
@@ -419,6 +500,11 @@ class MixerFixture(unittest.TestCase):
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertNotIn("-shortest", command)
         self.assertEqual(command[command.index("-t") + 1], "6.000000000")
+        self.assertEqual(command[:4], ["ffmpeg", "-y", "-v", "error"])
+        loud = mixer.body_mux_command(self.picture, self.work / "premaster.wav", self.work / "body.mp4",
+                                      "loudnorm=I=-14:TP=-1.5:LRA=11", self.runtime, log_level="info")
+        self.assertEqual([part for part in loud if part not in ("-nostats", "info")],
+                         [part for part in command if part != "error"])
 
     def test_output_guard_refuses_deliverables_and_external_paths(self) -> None:
         with self.assertRaisesRegex(mixer.MixError, "deliverables"):

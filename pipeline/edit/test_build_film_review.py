@@ -31,6 +31,15 @@ class FilmReviewTest(unittest.TestCase):
         data = working_cut(files={"720": {"path": "a.mp4", "sha256": "a" * 64}, "4k": {"note": "elsewhere"}})
         self.assertIn("a.mp4", review.render(data, TEMPLATE))
 
+    def test_mastering_facts_travel_with_the_page(self):
+        mastering = {"normalizationType": "dynamic", "inputLra": 18.2, "outputLra": 9.0, "targetLra": 11.0}
+        page = review.render(working_cut(mastering=mastering), TEMPLATE)
+        payload = json.loads(page.split("const DATA=", 1)[1].split(";\n", 1)[0])
+        self.assertEqual(payload["mastering"], mastering)
+        self.assertIn("the level was ridden", page)
+        with self.assertRaisesRegex(ValueError, "loudnormSecondPass"):
+            review.render(working_cut(mastering={"normalizationType": "guess"}), TEMPLATE)
+
     def test_refusals_name_what_is_missing(self):
         cases = {
             "working cut": working_cut(files={"short": {"path": "s.mp4", "sha256": "b" * 64}}),

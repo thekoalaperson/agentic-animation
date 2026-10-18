@@ -23,6 +23,7 @@ const base=DATA.files['720']?'720':'1080';
 {const lines=[];const summary=DATA.reviewSummary;if(Array.isArray(summary))lines.push(...summary);else if(summary)for(const lane of Object.values(summary))lines.push(lane.line);
  for(const row of DATA.checked||[])lines.push('Checked: '+(typeof row==='string'?row:row.what+(row.method?' — '+row.method:'')));
  for(const row of DATA.notChecked||[])lines.push('Not checked: '+row);
+ if(DATA.mastering){const m=DATA.mastering;lines.push('Mastering: loudnorm '+m.normalizationType+', loudness range '+m.inputLra+' LU in, '+m.outputLra+' LU out (target '+m.targetLra+')'+(m.normalizationType==='dynamic'?'; the level was ridden, not one gain':''))}
  for(const line of lines){const li=document.createElement('li');li.textContent=line;$('coverage-list').append(li)}$('coverage').hidden=!lines.length;}
 function events(){return ['short','reels'].includes(asset)?DATA.shortEvents:DATA.events}
 function recordKey(){const e=events()[sceneIndex];return DATA.files[asset].sha256+':'+(e?e.id:'ending')}

@@ -11,6 +11,7 @@ script never writes to ``deliverables/``, never invokes a provider, never uses
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -508,12 +509,64 @@ def default_settings() -> dict[str, Any]:
     }
 
 
+def check_bus_settings(settings: dict[str, Any], *, exact: bool = True) -> None:
+    """The score gain and sidechain bounds every mix in this repository honours."""
+    gain = finite(settings.get("musicGainDb"), "musicGainDb")
+    if not -6 <= gain <= 6:
+        raise MixError("musicGainDb must lie within -6..6 dB")
+    names = {"threshold", "ratio", "attackMs", "releaseMs"}
+    for key in ("musicDuck", "sfxDuck"):
+        duck = settings.get(key)
+        if not isinstance(duck, dict) or not names <= set(duck) or (exact and set(duck) != names):
+            raise MixError(f"{key} needs threshold, ratio, attackMs and releaseMs")
+        values = {name: finite(value, f"{key} {name}") for name, value in duck.items()}
+        if (not .005 <= values["threshold"] <= .1 or not 1 <= values["ratio"] <= 12
+                or not 1 <= values["attackMs"] <= 100 or not 100 <= values["releaseMs"] <= 1500):
+            raise MixError(f"{key} is outside threshold .005-.1, ratio 1-12, attack 1-100 ms, release 100-1500 ms")
+
+
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    if settings != default_settings():
+    """Version 1 is exactly ``default_settings()``; version 2 is authored within bounds.
+
+    A version 2 file names ``settingsVersion: 2`` and only the values it changes.
+    Every other value keeps today's default, and the contract records the whole
+    effective set, so its fingerprint binds every chosen value.
+    """
+    if settings == default_settings():
+        return settings
+    if not isinstance(settings, dict) or settings.get("settingsVersion") != 2:
         raise MixError(
-            "Mixer settings differ from the reviewed v1 contract; author a new version instead"
+            "Mixer settings differ from the reviewed v1 contract; author settingsVersion 2 instead"
         )
-    return settings
+    unknown = set(settings) - set(default_settings()) - {"settingsVersion", "refuseDynamicMastering", "reason"}
+    if unknown:
+        raise MixError(f"unknown mixer settings: {', '.join(sorted(unknown))}")
+    result = {**default_settings(), "refuseDynamicMastering": False, **copy.deepcopy(settings)}
+    check_bus_settings(result)
+    if not -27 <= finite(result["targetIntegratedLufs"], "targetIntegratedLufs") <= -12:
+        raise MixError("targetIntegratedLufs must lie within -27..-12")
+    if not -3 <= finite(result["targetTruePeakDbtp"], "targetTruePeakDbtp") <= -1:
+        raise MixError("targetTruePeakDbtp must lie within -3..-1")
+    lra = result["targetLra"]
+    if lra != "measured" and (isinstance(lra, (bool, str)) or not 1 <= finite(lra, "targetLra") <= 50):
+        raise MixError('targetLra must be a number within 1..50 or "measured"')
+    if type(result["refuseDynamicMastering"]) is not bool:
+        raise MixError("refuseDynamicMastering must be a boolean")
+    if "reason" in result and (not isinstance(result["reason"], str) or not result["reason"].strip()):
+        raise MixError("a settings reason must be text")
+    return result
+
+
+def measurement_lra(settings: dict[str, Any]) -> float:
+    """A first pass only measures; its LRA target does not change what it reports."""
+    return 11.0 if settings["targetLra"] == "measured" else settings["targetLra"]
+
+
+def second_pass_lra(settings: dict[str, Any], first_pass: dict[str, Any]) -> float:
+    """``measured`` asks loudnorm for the film's own range, within loudnorm's 1..50."""
+    if settings["targetLra"] != "measured":
+        return settings["targetLra"]
+    return min(50.0, max(1.0, finite(first_pass.get("input_lra"), "measured input LRA")))
 
 
 def build_mix_contract(
@@ -527,6 +580,7 @@ def build_mix_contract(
     height: int = 720,
     probe: Callable[[Path], dict[str, Any]] = probe_media,
     sfx_revalidator: Callable[[Path, dict[str, Any]], dict[str, Any]] = revalidate_sfx_contract,
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     episode = episode.resolve()
     if height != 720:
@@ -589,7 +643,7 @@ def build_mix_contract(
     verify_hash(stem, sfx.get("sfxStem", {}).get("sha256"), "SFX stem")
     verify_audio_probe(probe(stem), runtime, expected_audio_frames, "SFX stem", codec="pcm_f32le")
     notches = validate_notches(sfx.get("scoreNotchAutomation"), runtime)
-    settings = validate_settings(default_settings())
+    settings = validate_settings(default_settings() if settings is None else settings)
     evidence = {
         key: {"path": portable(path, episode), "sha256": sha256_file(path)}
         for key, path in paths.items()
@@ -663,6 +717,7 @@ def verify_saved_contract(
         height=720,
         probe=probe,
         sfx_revalidator=sfx_revalidator,
+        settings=saved.get("settings"),
     )
     if current != saved:
         raise MixError("saved mix contract differs from a fresh preflight")
@@ -704,11 +759,40 @@ def loudness(path: Path, settings: dict[str, Any]) -> dict[str, Any]:
         [
             "ffmpeg", "-hide_banner", "-i", str(path), "-vn", "-af",
             f"loudnorm=I={settings['targetIntegratedLufs']}:TP={settings['targetTruePeakDbtp']}:"
-            f"LRA={settings['targetLra']}:print_format=json",
+            f"LRA={measurement_lra(settings)}:print_format=json",
             "-f", "null", "-",
         ]
     )
     return parse_loudnorm(result.stderr)
+
+
+def second_pass_record(measured: dict[str, Any], target_lra: float) -> dict[str, Any]:
+    """What the second loudnorm pass actually did, read from its own JSON report."""
+    kind = measured.get("normalization_type")
+    if kind not in ("linear", "dynamic"):
+        raise MixError("ffmpeg loudnorm did not report its normalization type")
+    return {
+        "normalizationType": kind,
+        "targetLra": target_lra,
+        "inputLra": finite(measured.get("input_lra"), "second-pass input LRA"),
+        "outputLra": finite(measured.get("output_lra"), "second-pass output LRA"),
+        "inputIntegratedLufs": finite(measured.get("input_i"), "second-pass input loudness"),
+        "outputIntegratedLufs": finite(measured.get("output_i"), "second-pass output loudness"),
+        "note": ("linear: one gain for the whole film, its dynamics kept" if kind == "linear" else
+                 "dynamic: loudnorm could not meet the targets with one gain and rode the level, "
+                 "which narrows the film's dynamic range"),
+    }
+
+
+def dynamic_mastering_message(record: dict[str, Any]) -> str:
+    return (
+        f"loudnorm fell back to dynamic gain (input LRA {record['inputLra']}, output LRA "
+        f"{record['outputLra']}, target LRA {record['targetLra']}). Some ways to choose instead: "
+        'targetLra "measured" or a higher number, a lower targetIntegratedLufs or targetTruePeakDbtp, '
+        "the measured fixed gain with a qualified limiter in master_review_audio.py (fixedGainMaster), "
+        "or leaving refuseDynamicMastering off and accepting the dynamic pass. Each changes the film's "
+        "dynamics differently."
+    )
 
 
 def decode_samples(path: Path) -> np.ndarray:
@@ -790,10 +874,15 @@ def body_mux_command(
     output: Path,
     normalizer: str,
     runtime: float,
+    log_level: str = "error",
 ) -> list[str]:
-    """Return the exact body mux command; intentionally never uses -shortest."""
+    """Return the exact body mux command; intentionally never uses -shortest.
+
+    ``log_level`` changes only what ffmpeg prints (``info`` lets loudnorm report
+    its second pass), never the encoded bytes.
+    """
     return [
-        "ffmpeg", "-y", "-v", "error", "-i", str(picture),
+        "ffmpeg", "-y", *(["-nostats"] if log_level != "error" else []), "-v", log_level, "-i", str(picture),
         "-i", str(premaster), "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-af", normalizer, "-ar", str(SR), "-c:a", "aac",
         "-b:a", "256k", "-t", f"{runtime:.9f}",
@@ -828,27 +917,35 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
     plan = read_json(paths["editPlan"], "edit plan")
     settings = contract["settings"]
     first_pass = loudness(outputs["premaster"], settings)
+    target_lra = second_pass_lra(settings, first_pass)
     norm = (
         f"loudnorm=I={settings['targetIntegratedLufs']}:TP={settings['targetTruePeakDbtp']}:"
-        f"LRA={settings['targetLra']}:measured_I={first_pass['input_i']}:"
+        f"LRA={target_lra}:measured_I={first_pass['input_i']}:"
         f"measured_TP={first_pass['input_tp']}:measured_LRA={first_pass['input_lra']}:"
         f"measured_thresh={first_pass['input_thresh']}:offset={first_pass['target_offset']}:"
-        "linear=true:print_format=summary"
+        "linear=true:print_format=json"
     )
     body_partial = outputs["bodyMaster"].with_name(
         f".{outputs['bodyMaster'].name}.{os.getpid()}.partial.mp4"
     )
     # Exact input durations were already proven. Explicit -t fixes the intended
     # clock without hiding a short stream; -shortest is intentionally absent.
-    run(
+    muxed = run(
         body_mux_command(
             paths["picture"],
             outputs["premaster"],
             body_partial,
             norm,
             contract["runtimeSeconds"],
+            log_level="info",
         )
     )
+    second_pass = second_pass_record(parse_loudnorm(muxed.stderr), target_lra)
+    if second_pass["normalizationType"] == "dynamic":
+        if settings.get("refuseDynamicMastering") is True:
+            body_partial.unlink(missing_ok=True)
+            raise MixError(dynamic_mastering_message(second_pass))
+        print(f"warning: {dynamic_mastering_message(second_pass)}", file=sys.stderr, flush=True)
     run(["ffmpeg", "-v", "error", "-i", str(body_partial), "-f", "null", "-"])
     os.replace(body_partial, outputs["bodyMaster"])
     final_probe = probe_media(outputs["bodyMaster"])
@@ -874,8 +971,9 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
         raise MixError("picture packets changed during audio mux")
     delivered = loudness(outputs["bodyMaster"], settings)
     if (
-        abs(finite(delivered.get("input_i"), "delivered integrated loudness") + 14.0) > 0.5
-        or finite(delivered.get("input_tp"), "delivered true peak") > -1.0
+        abs(finite(delivered.get("input_i"), "delivered integrated loudness")
+            - settings["targetIntegratedLufs"]) > 0.5
+        or finite(delivered.get("input_tp"), "delivered true peak") > settings["targetTruePeakDbtp"] + 0.5
     ):
         raise MixError("delivered loudness or true peak is outside the acceptance window")
     bus_audit = {
@@ -910,6 +1008,7 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
         "contract": {"path": portable(contract_path, episode), "sha256": sha256_file(contract_path)},
         "busAudit": {"path": portable(outputs["busAudit"], episode), "sha256": sha256_file(outputs["busAudit"])},
         "deliveredLoudness": delivered,
+        "loudnormSecondPass": second_pass,
         "picturePacketsUnchanged": True,
         "picturePacketHashes": {
             "source": source_picture_packets,
@@ -931,6 +1030,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--picture", default="work/assembly-v1/picture-720p.mp4")
     parser.add_argument("--voice", default="work/assembly-v1/voice-hi-48k24.wav")
     parser.add_argument("--music", default="work/assembly-v1/music-wave-48k24.wav")
+    parser.add_argument(
+        "--settings", type=Path,
+        help="optional JSON with settingsVersion 2 and the values it changes: musicGainDb -6..6, "
+             "musicDuck/sfxDuck {threshold .005-.1, ratio 1-12, attackMs 1-100, releaseMs 100-1500}, "
+             "targetIntegratedLufs -27..-12, targetTruePeakDbtp -3..-1, targetLra 1..50 or "
+             '"measured", refuseDynamicMastering (default false: a dynamic loudnorm pass warns and '
+             "is recorded). Without it the reviewed v1 defaults apply.")
     parser.add_argument("--write-contract", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--contract", type=Path)
@@ -946,6 +1052,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.contract is not None:
                 raise MixError("--contract is accepted only with --execute")
+            settings = (read_json(episode_path(episode, args.settings, "mixer settings"), "mixer settings")
+                        if args.settings is not None else None)
             contract = build_mix_contract(
                 episode,
                 sfx_input_path=episode_path(episode, args.sfx_input, "SFX input"),
@@ -953,6 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
                 picture_path=episode_path(episode, args.picture, "picture"),
                 voice_path=episode_path(episode, args.voice, "voice"),
                 music_path=episode_path(episode, args.music, "music"),
+                settings=settings,
             )
             if args.write_contract is not None:
                 target = work_output(episode, args.write_contract, "mix contract output")
