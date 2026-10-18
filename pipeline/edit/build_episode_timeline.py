@@ -37,6 +37,7 @@ from _common import is_below as _is_below, sha256_file as _sha256
 from dialogue_provenance import canonical_sha as _canonical_sha, validate_dialogue_request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from subtitle_manuscript import apply_manuscript
+from assemble_longform import resolve_music_shaping, voice_gain_db
 
 
 DELIVERY_FPS = 24
@@ -335,6 +336,583 @@ def _production_overrides(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+DELIVERIES = {"synced", "unsynced", "wordless"}
+PICTURE_ROUTES = {"h3", "picture"}  # "h3" is the historical name of the silent picture route
+ORIGIN_KINDS = {"h3-ingest", "kie-video", "derivative", "supplied"}
+
+
+def _is_silence_placement(row: Any) -> bool:
+    return isinstance(row, dict) and row.get("silence") is True
+
+
+def _silence_placement(row: dict[str, Any]) -> dict[str, Any]:
+    """An authored stretch with no score. It binds no media, so it needs no review.
+
+    Gaps between placements are already silence; this marker only names one.
+    """
+    movement = row.get("movement")
+    start, duration = row.get("timelineStart"), row.get("timelineDuration")
+    if not isinstance(movement, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", movement):
+        raise ValueError("a silence placement needs a movement name")
+    if (isinstance(start, bool) or not isinstance(start, (int, float)) or not math.isfinite(start)
+            or start < 0 or isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration <= 0):
+        raise ValueError(f"{movement}: silence timelineStart/duration are invalid")
+    if any(key in row for key in ("track", "trackSha256", "sidecar", "sidecarSha256", "take")):
+        raise ValueError(f"{movement}: a silence placement names no score take")
+    if "reason" in row and (not isinstance(row["reason"], str) or not row["reason"].strip()):
+        raise ValueError(f"{movement}: a silence reason must be text")
+    return {"movement": movement, "silence": True, "timelineStart": start, "timelineDuration": duration,
+            **({"reason": row["reason"]} if "reason" in row else {})}
+
+
+def _beat_identity(row: dict[str, Any] | None) -> Any:
+    """A beat may be authored as an object with a number or as a bare scalar."""
+    beat = row.get("beat") if isinstance(row, dict) else None
+    return beat.get("number") if isinstance(beat, dict) else beat
+
+
+def _row_delivery(row: dict[str, Any], override: dict[str, Any]) -> tuple[str, str | None]:
+    """Classify one storyboard row as dialogue, narration or picture.
+
+    Routing still follows the storyboard ``speaker``: any truthy speaker is a
+    lip-sync take. ``delivery`` and ``voice`` may come from the storyboard row
+    or from the frozen production override; when both carry one they must agree.
+    Returns ``(kind, voice)``; raises ValueError naming the row.
+    """
+    scene_id = row.get("still_id")
+    values = {}
+    for key in ("delivery", "voice"):
+        own, frozen = row.get(key), override.get(key)
+        if own is not None and frozen is not None and own != frozen:
+            raise ValueError(f"{scene_id}: storyboard {key} {own!r} differs from production override {frozen!r}")
+        values[key] = own if own is not None else frozen
+    delivery, voice = values["delivery"], values["voice"]
+    if delivery is not None and delivery not in DELIVERIES:
+        raise ValueError(f"{scene_id}: unknown delivery {delivery!r}; use synced, unsynced or wordless")
+    if voice is not None and (not isinstance(voice, str) or not voice.strip()):
+        raise ValueError(f"{scene_id}: voice must name who is heard")
+    if row.get("speaker"):
+        if delivery not in (None, "synced") or voice is not None:
+            raise ValueError(
+                f"{scene_id}: the storyboard row's speaker {row['speaker']!r} always routes to a lip-sync "
+                "take; for a voice heard over picture, clear the storyboard row's speaker and write "
+                "delivery 'unsynced' with 'voice'")
+        return "dialogue", None
+    if delivery == "synced":
+        raise ValueError(f"{scene_id}: synced delivery needs a storyboard speaker")
+    if delivery == "wordless":
+        if voice is not None:
+            raise ValueError(f"{scene_id}: a wordless row has no voice")
+        return "picture", None
+    return "narration", voice
+
+
+def _passages(rows: list[dict[str, Any]], overrides: dict[str, dict[str, Any]], row_kind: dict[str, str],
+              row_voice: dict[str, str], errors: list[dict[str, Any]]) -> dict[str, str]:
+    """Read optional ``passage`` links: a row continuing the speech of the row before it.
+
+    Both halves keep their own words and their own clip; the link only says
+    they are one utterance. It must name the directly preceding row, spoken
+    by the same speaker or voice in the same way.
+    """
+    links: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        scene_id = str(row.get("still_id", ""))
+        own, frozen = row.get("passage"), overrides.get(scene_id, {}).get("passage")
+        if own is None and frozen is None:
+            continue
+        previous = rows[index - 1] if index else None
+        prior_id = str(previous.get("still_id", "")) if previous else None
+        prior_kind = row_kind.get(prior_id) if prior_id else None
+        link = own if own is not None else frozen
+        if own is not None and frozen is not None and own != frozen:
+            problem = f"storyboard passage {own!r} differs from production override {frozen!r}"
+        elif link != prior_id:
+            problem = "passage must name the row directly before it"
+        elif row_kind[scene_id] not in ("dialogue", "narration") or prior_kind != row_kind[scene_id]:
+            problem = "both halves of a passage must be spoken the same way"
+        elif (row_kind[scene_id] == "dialogue" and row.get("speaker") != previous.get("speaker")
+              or row_voice.get(scene_id) != row_voice.get(prior_id)):
+            problem = "both halves of a passage must have the same speaker"
+        else:
+            links[scene_id] = link
+            continue
+        errors.append({"type": "storyboard-passage", "sceneId": scene_id, "error": f"{scene_id}: {problem}"})
+    return links
+
+
+def _picture_rule(row: dict[str, Any]) -> tuple[str, int | None]:
+    """Return a picture row's duration rule and, for an authored hold, its frames."""
+    scene_id = row.get("still_id")
+    rule = row.get("durationRule")
+    seconds, frames = row.get("holdSeconds"), row.get("holdFrames")
+    if seconds is not None and frames is not None:
+        raise ValueError(f"{scene_id}: give holdSeconds or holdFrames, not both")
+    held = seconds is not None or frames is not None
+    if rule is None:
+        rule = "authored" if held else "take"
+    if rule == "take":
+        if held:
+            raise ValueError(f"{scene_id}: a take-clocked picture row takes its length from the accepted take; remove the hold")
+        return "take", None
+    if rule != "authored":
+        raise ValueError(f"{scene_id}: a picture row is clocked by 'take' or 'authored', not {rule!r}")
+    if frames is not None:
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames <= 0:
+            raise ValueError(f"{scene_id}: holdFrames must be a positive integer")
+        return "authored", frames
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
+        raise ValueError(f"{scene_id}: an authored hold needs positive finite holdSeconds or holdFrames")
+    exact = seconds * DELIVERY_FPS
+    if abs(exact - round(exact)) > 1e-6:
+        raise ValueError(f"{scene_id}: holdSeconds {seconds} is not a whole number of {DELIVERY_FPS} fps frames")
+    return "authored", round(exact)
+
+
+def _finite_seconds(value: Any) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value))
+
+
+def _scene_handles(dialogue_outputs: dict[str, Any], row_kind: dict[str, str],
+                   film_pre: float, film_post: float) -> dict[str, tuple[float, float, str]]:
+    """Read per-scene ``handles``, the override of the film-wide ``dialogueHandles``.
+
+    A missing side keeps the film-wide value. Handles widen the kept window
+    around measured speech only, so a negative value, which would cut speech,
+    is refused; the clip's natural frames still bound both sides.
+    """
+    result = {}
+    for scene_id, output in dialogue_outputs.items():
+        raw = output.get("handles") if isinstance(output, dict) else None
+        if raw is None:
+            continue
+        if row_kind.get(scene_id) != "dialogue":
+            raise TimelineIncomplete(f"Dialogue handles name no dialogue scene: {scene_id}")
+        if (not isinstance(raw, dict) or not set(raw) <= {"preSeconds", "postSeconds", "reason"}
+                or not set(raw) & {"preSeconds", "postSeconds"}
+                or not isinstance(raw.get("reason"), str) or not raw["reason"].strip()
+                or any(not _finite_seconds(raw[key]) or raw[key] < 0
+                       for key in ("preSeconds", "postSeconds") if key in raw)):
+            raise TimelineIncomplete(
+                f"Dialogue handles need non-negative finite preSeconds and/or postSeconds and an authored reason: {scene_id}")
+        result[scene_id] = (float(raw.get("preSeconds", film_pre)), float(raw.get("postSeconds", film_post)),
+                            raw["reason"].strip())
+    return result
+
+
+PICTURE_WINDOW_KEYS = {"from", "to", "source", "sourceSha256", "sourceStart", "role", "reason"}
+
+
+def _whole_frames(value: Any, label: str) -> int:
+    if not _finite_seconds(value) or value < 0:
+        raise ValueError(f"{label} must be non-negative finite seconds")
+    frames = value * DELIVERY_FPS
+    if abs(frames - round(frames)) > 1e-6:
+        raise ValueError(f"{label} {value} is not a whole number of {DELIVERY_FPS} fps frames")
+    return round(frames)
+
+
+def _picture_window_shape(raw: Any) -> list[dict[str, Any]]:
+    """Check authored ``pictureWindows`` before any picture is placed.
+
+    Each window covers ``from``..``to`` seconds of the event's kept window with
+    other accepted picture, played at speed 1.0 from ``sourceStart`` seconds of
+    that source. The event's own audio stays its clock; the rest stays native.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("pictureWindows must be a non-empty array")
+    result, cursor = [], 0
+    for index, window in enumerate(raw):
+        label = f"picture window {index}"
+        if not isinstance(window, dict) or set(window) != PICTURE_WINDOW_KEYS:
+            raise ValueError(f"{label} needs exactly {sorted(PICTURE_WINDOW_KEYS)}")
+        left = _whole_frames(window["from"], f"{label} from")
+        right = _whole_frames(window["to"], f"{label} to")
+        if right <= left or left < cursor:
+            raise ValueError(f"{label} must end after it starts and must not overlap the window before it")
+        for key in ("source", "role", "reason"):
+            if not isinstance(window[key], str) or not window[key].strip():
+                raise ValueError(f"{label} needs a non-empty {key}")
+        result.append({"from": left, "to": right,
+                       "sourceStart": _whole_frames(window["sourceStart"], f"{label} sourceStart"),
+                       "source": window["source"],
+                       "sourceSha256": _require_hex_sha(window["sourceSha256"], f"{label} sourceSha256"),
+                       "role": window["role"].strip(), "reason": window["reason"].strip()})
+        cursor = right
+    return result
+
+
+def _resolve_picture_windows(
+    event: dict[str, Any], windows: list[dict[str, Any]], *, episode: Path, repo: Path,
+    config_path: Path, h3_by_scene: dict[str, list[dict[str, Any]]],
+    dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]],
+    minimum_frames: int, micro_words: set[str],
+) -> list[dict[str, Any]]:
+    """Bind each picture window to frames a review already accepted.
+
+    A window's source is an accepted ledger segment at speed 1.0 (its frames
+    inside the accepted in/out), or another admitted dialogue clip with its
+    audio dropped. A borrowed dialogue window must lie wholly outside that
+    clip's measured speech, so no silent lip movement reaches the cut; with
+    no measured speech window the borrow is refused.
+    """
+    duration_frames = round(event["duration"] * DELIVERY_FPS)
+    resolved = []
+    for index, window in enumerate(windows):
+        label = f"{event['id']} picture window {index}"
+        frames = window["to"] - window["from"]
+        first, last = window["sourceStart"], window["sourceStart"] + frames
+        if window["to"] > duration_frames:
+            raise ValueError(f"{label} ends after the event's kept window ({duration_frames} frames)")
+        source = _resolve_path(episode, repo, config_path, window["source"])
+        sha = window["sourceSha256"]
+        kind = scene = None
+        for scene_id, candidates in h3_by_scene.items():
+            for candidate in candidates:
+                if (candidate["path"] == source and candidate["sha256"] == sha
+                        and candidate["speed"] == 1.0 and candidate["sourceStartFrame"] <= first
+                        and last <= candidate["sourceEndFrame"]):
+                    kind, scene = "segment", scene_id
+                    break
+            if kind:
+                break
+        if kind is None:
+            for scene_id, (path, info, entry, output) in dialogue_media.items():
+                if scene_id == event["id"] or path != source or output.get("sha256") != sha:
+                    continue
+                natural = info.video_frames or math.floor((info.video_duration or info.duration) * DELIVERY_FPS + 1e-6)
+                speech = _speech_window(entry, output)
+                if speech is None:
+                    raise ValueError(f"{label} borrows {scene_id}, whose speech window is unmeasured")
+                if last > natural:
+                    raise ValueError(f"{label} runs past the end of {scene_id}'s clip")
+                if first / DELIVERY_FPS < speech[1] and last / DELIVERY_FPS > speech[0]:
+                    raise ValueError(f"{label} would show {scene_id} speaking; borrow only frames outside its measured speech")
+                kind, scene = "dialogue", scene_id
+                break
+        if kind is None:
+            raise ValueError(f"{label} source is neither an accepted speed-1.0 segment holding those frames "
+                             "nor another admitted dialogue clip")
+        if frames < minimum_frames and not _is_micro_role(window["role"], micro_words):
+            raise ValueError(f"{label} is shorter than minimumPictureSegmentSeconds; name its micro-cut role")
+        resolved.append({
+            "from": round(window["from"] / DELIVERY_FPS, 6), "to": round(window["to"] / DELIVERY_FPS, 6),
+            "frames": frames, "source": _portable_path(source, episode), "sourceSha256": sha,
+            "sourceStart": round(first / DELIVERY_FPS, 6), "sourceKind": kind, "sourceSceneId": scene,
+            "role": window["role"], "reason": window["reason"],
+        })
+    return resolved
+
+
+def _cover_native_parts(native: list[tuple[int, int, Any]],
+                        windows: list[dict[str, Any]]) -> list[tuple[int, int, Any]]:
+    """Lay picture windows over a dialogue event's native parts, in frame order.
+
+    A native part keeps its crop; a covered part carries its resolved window
+    in place of the crop. With no windows the native parts come back unchanged.
+    """
+    if not windows:
+        return native
+    covers = [(round(w["from"] * DELIVERY_FPS), round(w["to"] * DELIVERY_FPS), w) for w in windows]
+    parts = []
+    for left, right, crop in native:
+        cursor = left
+        for cover_left, cover_right, _ in covers:
+            if cover_right <= cursor or cover_left >= right:
+                continue
+            if cover_left > cursor:
+                parts.append((cursor, cover_left, crop))
+            cursor = min(right, cover_right)
+        if cursor < right:
+            parts.append((cursor, right, crop))
+    return sorted(parts + covers, key=lambda part: part[0])
+
+
+def _record_split_edits(blocks: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
+    """Name a split edit where a picture window continues its neighbour's picture.
+
+    When a dialogue event opens on the frames that directly follow the previous
+    picture, its sound arrives before its own picture (J). When it closes on the
+    frames that directly precede the next picture, the next picture arrives
+    while its sound still plays (L). The renderer merges such source-contiguous
+    windows into one run, so the picture does not restart at the boundary.
+    """
+    by_id = {event["id"]: event for event in events}
+
+    def source_span(candidate: dict[str, Any]) -> tuple[str, str, int, int] | None:
+        if abs(float(candidate.get("speed", 1.0)) - 1.0) > 1e-9:
+            return None
+        start = round(float(candidate["sourceStart"]) * DELIVERY_FPS)
+        return (candidate["path"], candidate["sourceSha256"], start, start + int(candidate["frames"]))
+
+    for index, block in enumerate(blocks):
+        cover = block["candidates"][0] if block["kind"] == "dialogue-fixed-sync" else {}
+        if "pictureWindow" not in cover:
+            continue
+        event = by_id[block["events"][0]]
+        here = source_span(cover)
+        neighbours = []
+        if index and abs(block["start"] - event["start"]) < 1e-6 and blocks[index - 1]["candidates"]:
+            neighbours.append(("J", "start", blocks[index - 1], blocks[index - 1]["candidates"][-1]))
+        if (index + 1 < len(blocks) and abs(block["start"] + block["duration"] - event["end"]) < 1e-6
+                and blocks[index + 1]["candidates"]):
+            neighbours.append(("L", "end", blocks[index + 1], blocks[index + 1]["candidates"][0]))
+        for kind, boundary, other_block, other in neighbours:
+            there = source_span(other)
+            if here is None or there is None or here[:2] != there[:2]:
+                continue
+            if (there[3] == here[2]) if kind == "J" else (here[3] == there[2]):
+                event.setdefault("splitEdits", []).append({
+                    "kind": kind, "boundary": boundary,
+                    "with": other.get("sceneId") or other_block["events"][-1 if kind == "J" else 0],
+                    "seconds": block["duration"],
+                })
+
+
+def _audio_overlaps(scene_id: str, output: dict[str, Any], measured: bool, start: float,
+                    source_start: float, audio_after: float) -> dict[str, Any]:
+    """Read authored ``audioLead``/``audioTail``: native sound heard across a cut.
+
+    A lead plays the clip's own audio from before its kept window under the
+    previous picture; a tail plays it on after the window under the next. Both
+    are bounded by native audio that exists beyond the kept window and never
+    invented. Because the kept window holds the measured speech, an overlap
+    carries the bed and breath but no words, so an unmeasured clip has none.
+    """
+    result = {}
+    for key, room, label in (("audioLead", min(source_start, start), "before"),
+                             ("audioTail", audio_after, "after")):
+        raw = output.get(key)
+        if raw is None:
+            continue
+        if (not isinstance(raw, dict) or set(raw) != {"seconds", "reason"} or not _finite_seconds(raw["seconds"])
+                or raw["seconds"] <= 0 or not isinstance(raw["reason"], str) or not raw["reason"].strip()):
+            raise TimelineIncomplete(f"{key} needs positive finite seconds and an authored reason: {scene_id}")
+        if not measured:
+            raise TimelineIncomplete(f"{key} needs a measured speech window, so the overlap carries no words: {scene_id}")
+        if raw["seconds"] > room + 1e-6:
+            raise TimelineIncomplete(
+                f"{key} asks for {raw['seconds']}s but only {max(room, 0):.6f}s of native audio exists {label} "
+                f"the kept window of {scene_id} within the film")
+        result[key] = {"seconds": raw["seconds"], "reason": raw["reason"].strip()}
+    return result
+
+
+def _frame_settings(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the optional film-wide ``frameAspect`` matte and stepped ``cadence``.
+
+    The delivery container stays 16:9 at 24 fps: a matte crops the picture to
+    its shape and letterboxes or pillarboxes it, and a cadence of 2 or 3 holds
+    each picture frame for that many delivery frames.
+    """
+    result: dict[str, Any] = {}
+    aspect = config.get("frameAspect")
+    if aspect is not None:
+        ratio = None
+        if isinstance(aspect, str) and re.fullmatch(r"\d+(\.\d+)?:\d+(\.\d+)?", aspect):
+            width, height = (float(part) for part in aspect.split(":"))
+            ratio = width / height if height else None
+        elif _finite_seconds(aspect):
+            ratio = float(aspect)
+        if ratio is None or not 0.5 <= ratio <= 3.0:
+            raise TimelineIncomplete("frameAspect must be a ratio such as \"4:3\" or a number from 0.5 to 3.0")
+        result.update(aspect=aspect, aspectRatio=round(ratio, 6))
+    cadence = config.get("cadence")
+    if cadence is not None:
+        if cadence not in (1, 2, 3) or isinstance(cadence, bool):
+            raise TimelineIncomplete("cadence holds each picture frame for 1, 2 or 3 delivery frames")
+        if cadence != 1:
+            result["cadence"] = cadence
+    return result or None
+
+
+def _voice_gains(config: dict[str, Any], row_kind: dict[str, str]) -> dict[str, tuple[float, str]]:
+    """Read ``voiceGains``: a scene's voice level after the shared speech target, with a reason."""
+    raw = config.get("voiceGains", {})
+    if not isinstance(raw, dict):
+        raise TimelineIncomplete("voiceGains must map scene IDs to {gainDb, reason}")
+    result = {}
+    for scene_id, row in raw.items():
+        if row_kind.get(scene_id) not in ("narration", "dialogue") or not isinstance(row, dict):
+            raise TimelineIncomplete(f"voiceGains names no spoken scene: {scene_id}")
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise TimelineIncomplete(f"voiceGains for {scene_id} needs a reason")
+        try:
+            result[scene_id] = (voice_gain_db(row.get("gainDb"), f"voiceGains gainDb of {scene_id}"), reason)
+        except ValueError as exc:
+            raise TimelineIncomplete(str(exc)) from exc
+    return result
+
+
+TRANSITION_KINDS = {"dissolve", "dip-to-black", "dip-to-white"}
+
+
+def _resolve_transitions(
+    raw: Any, events: list[dict[str, Any]], blocks: list[dict[str, Any]], *, episode: Path, repo: Path,
+    config_path: Path, h3_by_scene: dict[str, list[dict[str, Any]]],
+    dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Resolve authored transitions at event boundaries; a boundary not named is a cut.
+
+    A transition sits on a picture cut at the end of the event it names. A dip
+    fades the outgoing picture to a colour and the incoming picture up from it,
+    using only frames the cut already shows. A dissolve overlaps the two
+    pictures, so it needs frames the cut did not show: the outgoing shot's
+    unused tail and the incoming shot's unused head, inside what review
+    accepted and, for dialogue picture, outside its measured speech. It is
+    centred on the cut where both sides hold enough and shifted toward the
+    side that does otherwise; the timeline refuses when the frames do not exist.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("transitions must be an array")
+    placed = []
+    for block in blocks:
+        cursor = round(block["start"] * DELIVERY_FPS)
+        for candidate in block["candidates"]:
+            placed.append((cursor, int(candidate["frames"]), candidate, block))
+            cursor += int(candidate["frames"])
+    index_by_id = {event["id"]: position for position, event in enumerate(events)}
+
+    def bounds(candidate: dict[str, Any], block: dict[str, Any]) -> tuple[float, float, float, list[tuple[float, float]]]:
+        """Accepted source frames around a placed candidate: (low, high, speed, speech ranges)."""
+        window = candidate.get("pictureWindow")
+        sha = candidate["sourceSha256"]
+        path = _resolve_path(episode, repo, config_path, candidate["path"])
+        if window and window["sourceKind"] == "dialogue" or not window and block["kind"] == "dialogue-fixed-sync":
+            donor = window["sourceSceneId"] if window else block["events"][0]
+            _, info, entry, output = dialogue_media[donor]
+            natural = info.video_frames or math.floor((info.video_duration or info.duration) * DELIVERY_FPS + 1e-6)
+            speech = _speech_window(entry, output) if window else None  # an event's own speech is inside its kept window
+            return 0.0, float(natural), 1.0, ([(speech[0] * DELIVERY_FPS, speech[1] * DELIVERY_FPS)] if speech else [])
+        scene = window["sourceSceneId"] if window else candidate.get("sceneId")
+        first = float(candidate["sourceStart"]) * DELIVERY_FPS
+        for raw_candidate in h3_by_scene.get(str(scene), []):
+            if (raw_candidate["path"] == path and raw_candidate["sha256"] == sha
+                    and raw_candidate["sourceStartFrame"] <= first + 1e-6 < raw_candidate["sourceEndFrame"]):
+                return (float(raw_candidate["sourceStartFrame"]), float(raw_candidate["sourceEndFrame"]),
+                        float(raw_candidate["speed"]), [])
+        raise ValueError(f"no accepted source bounds for picture at {candidate['path']}")
+
+    def unused(candidate: dict[str, Any], block: dict[str, Any]) -> tuple[int, int]:
+        """Output frames the cut did not show before (head) and after (tail) this candidate."""
+        low, high, speed, speech = bounds(candidate, block)
+        start = float(candidate["sourceStart"]) * DELIVERY_FPS
+        end = start + int(candidate["frames"]) * speed
+        head, tail = math.floor((start - low) / speed + 1e-6), math.floor((high - end) / speed + 1e-6)
+        for speech_start, speech_end in speech:
+            if speech_start >= end - 1e-6:
+                tail = min(tail, math.floor((speech_start - end) / speed + 1e-6))
+            if speech_end <= start + 1e-6:
+                head = min(head, math.floor((start - speech_end) / speed + 1e-6))
+        return max(head, 0), max(tail, 0)
+
+    result, seen = [], set()
+    for position, row in enumerate(raw):
+        label = f"transition {position}"
+        if (not isinstance(row, dict) or set(row) != {"after", "kind", "frames", "reason"}
+                or row["kind"] not in TRANSITION_KINDS or isinstance(row["frames"], bool)
+                or not isinstance(row["frames"], int) or row["frames"] < 2
+                or not isinstance(row["reason"], str) or not row["reason"].strip()):
+            raise ValueError(f"{label} needs after, kind ({', '.join(sorted(TRANSITION_KINDS))}), "
+                             "a whole number of frames (2 or more) and an authored reason")
+        after = row["after"]
+        if after not in index_by_id or index_by_id[after] == len(events) - 1 or after in seen:
+            raise ValueError(f"{label} must name, once, an event that another event follows")
+        seen.add(after)
+        boundary = round(events[index_by_id[after]]["end"] * DELIVERY_FPS)
+        cut = next((k for k in range(len(placed) - 1)
+                    if placed[k][0] + placed[k][1] == boundary and placed[k + 1][0] == boundary), None)
+        if cut is None:
+            raise ValueError(f"{label}: no picture cut falls at the end of {after}")
+        (_, out_frames, outgoing, out_block), (_, in_frames, incoming, in_block) = placed[cut], placed[cut + 1]
+        if incoming.get("continuationOf") or (
+                outgoing["sourceSha256"] == incoming["sourceSha256"]
+                and abs(float(outgoing["sourceStart"]) * DELIVERY_FPS
+                        + out_frames * float(outgoing.get("speed", 1.0))
+                        - float(incoming["sourceStart"]) * DELIVERY_FPS) < 1e-3):
+            raise ValueError(f"{label}: the picture continues across the end of {after}; there is no cut to soften")
+        frames = row["frames"]
+        if row["kind"] == "dissolve":
+            _, tail_room = unused(outgoing, out_block)
+            head_room, _ = unused(incoming, in_block)
+            head = min(head_room, frames // 2)
+            tail = frames - head
+            if tail > tail_room:
+                tail = tail_room
+                head = frames - tail
+            if head > head_room or tail > tail_room:
+                raise ValueError(f"{label}: a {frames}-frame dissolve needs {frames} unused frames; the outgoing "
+                                 f"shot holds {tail_room} after the cut and the incoming {head_room} before it")
+            shown_out, shown_in = head, tail  # frames of each shot already on screen that the overlap covers
+        else:
+            tail, head = 0, 0
+            shown_out, shown_in = frames - frames // 2, frames // 2
+        # A dip's fade-out reaches its colour on the shot's last frame, so it needs one frame before it.
+        if shown_out > out_frames - (row["kind"] != "dissolve") or shown_in > in_frames:
+            raise ValueError(f"{label}: the {frames}-frame {row['kind']} is longer than a shot on one side of the cut")
+        result.append({
+            "after": after, "before": events[index_by_id[after] + 1]["id"], "kind": row["kind"],
+            "frames": frames, "timelineFrame": boundary,
+            "outgoingFrames": shown_out, "incomingFrames": shown_in,
+            "outgoingUnusedTailFrames": tail, "incomingUnusedHeadFrames": head,
+            "reason": row["reason"].strip(),
+        })
+    return sorted(result, key=lambda row: row["timelineFrame"])
+
+
+def _speech_rule(row: dict[str, Any]) -> None:
+    scene_id = row.get("still_id")
+    if row.get("durationRule") not in (None, "speech") or any(
+            row.get(key) is not None for key in ("holdSeconds", "holdFrames")):
+        raise ValueError(f"{scene_id}: a speech row is clocked by its measured audio; durationRule must be 'speech' with no hold")
+
+
+def _peek_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _verify_segment_origin(episode: Path, repo: Path, ledger_path: Path,
+                           segment: dict[str, Any], source_sha: str) -> dict[str, Any]:
+    """Bind a version-2 ledger segment to the record that produced its bytes."""
+    origin = segment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") not in ORIGIN_KINDS:
+        raise ValueError(f"segment must record its origin as one of {sorted(ORIGIN_KINDS)}")
+    record_path = _resolve_path(episode, repo, ledger_path, origin.get("record") or "")
+    if not origin.get("record") or not _is_below(record_path, episode):
+        raise ValueError("origin record must be ingested below the episode root")
+    record_sha = _require_hex_sha(origin.get("recordSha256"), "origin recordSha256")
+    if not record_path.is_file() or _sha256(record_path) != record_sha:
+        raise ValueError(f"origin record is missing or its hash changed: {record_path}")
+    record = _read_json_evidence(record_path, "picture origin record")
+    kind = origin["kind"]
+    if kind == "h3-ingest":
+        items = record.get("items")
+        # An ingest receipt names its outputs per item; a flat hash is not one.
+        bound = isinstance(items, list) and any(
+            isinstance(item, dict) and item.get("silentSha256") == source_sha for item in items)
+    elif kind == "kie-video":
+        bound = (record.get("outputSha256") == source_sha and record.get("sha256") == source_sha
+                 and isinstance(record.get("taskId"), str) and bool(record["taskId"]))
+    elif kind == "derivative":
+        parent = str(record.get("sourceSha256") or "")
+        bound = (record.get("outputSha256") == source_sha
+                 and re.fullmatch(r"[0-9a-f]{64}", parent) is not None and parent != source_sha
+                 and isinstance(record.get("parameters"), dict) and bool(record["parameters"]))
+    else:
+        bound = source_sha in (record.get("sha256"), record.get("fileSha256"))
+    if not bound:
+        raise ValueError(f"{kind} origin record does not name this source hash")
+    return {"kind": kind, "record": _portable_path(record_path, episode), "recordSha256": record_sha}
+
+
 def _state_path_matches(recorded: Any, actual: Path, episode: Path,
                         original_episode_root: Any = None) -> bool:
     """Retain immutable worker receipts across an explicitly declared relocation.
@@ -373,6 +951,31 @@ def _require_hex_sha(value: Any, label: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", text):
         raise ValueError(f"{label} must be an explicit SHA-256 digest")
     return text
+
+
+def review_binding_paths(
+    review_type: str, *, dialogue_path: Path, execution_path: Path | None = None,
+    narration_path: Path | None = None, score_manifest_path: Path | None = None,
+    production_path: Path | None = None,
+) -> list[Path]:
+    """The documents a review export must bind, in the order the timeline checks them.
+
+    A dialogue review binds the dialogue manifest, a correction's own
+    execution manifest and the production overrides. A score review binds the
+    score manifest, the narration and dialogue manifests and the overrides.
+    """
+    if review_type == "dialogue":
+        paths = [dialogue_path]
+        if execution_path is not None and execution_path != dialogue_path:
+            paths.append(execution_path)
+    elif review_type == "score":
+        paths = [path for path in (score_manifest_path, narration_path, dialogue_path)
+                 if path is not None]
+    else:
+        raise ValueError(f"no review export lane named {review_type!r}")
+    if production_path:
+        paths.append(production_path)
+    return paths
 
 
 def _review_approval(
@@ -432,12 +1035,57 @@ def _review_approval(
             matches.append(row)
     if len(matches) != 1 or _normal_verdict(matches[0].get("decision")) not in ACCEPTED:
         raise ValueError(f"{item_id}: exactly one source-bound approved review decision is required")
-    return {
+    result = {
         "reviewExport": _portable_path(review_path, episode),
         "reviewExportSha256": review_sha,
         "reviewFingerprint": fingerprint,
         "reviewedAt": matches[0].get("reviewedAt"),
     }
+    # Who looked and how, when the review says so. Absence never refuses.
+    for key in REVIEW_NOTE_KEYS:
+        if matches[0].get(key) not in (None, "", []):
+            result[key] = matches[0][key]
+    return result
+
+
+REVIEW_NOTE_KEYS = ("reviewedBy", "reviewer", "method")
+
+
+def _reviewer_kinds(record: dict[str, Any]) -> set[str]:
+    """The kinds of reviewer a record names: ``human``, ``agent`` or neither."""
+    raw = record.get("reviewer")
+    rows = raw if isinstance(raw, list) else [raw]
+    kinds = {row.get("kind") for row in rows if isinstance(row, dict)} & {"human", "agent"}
+    if not kinds and str(record.get("reviewedBy") or "").startswith("agent:"):
+        kinds = {"agent"}
+    return kinds
+
+
+def _review_summary(lanes: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Count, per lane, who reviewed what was admitted, from the records alone."""
+    summary = {}
+    for lane, records in lanes.items():
+        if not records:
+            continue
+        kinds = [_reviewer_kinds(record) for record in records]
+        agent = sum("agent" in row for row in kinds)
+        person = sum("human" in row for row in kinds)
+        unrecorded = sum(not row for row in kinds)
+        methods: dict[str, int] = {}
+        for record in records:
+            raw = record.get("method")
+            for method in raw if isinstance(raw, list) else [raw]:
+                if isinstance(method, str) and method.strip():
+                    methods[method] = methods.get(method, 0) + 1
+        parts = [f"{len(records)} admitted", f"{agent} agent-reviewed",
+                 f"{person} reviewed by a person"]
+        if unrecorded:
+            parts.append(f"{unrecorded} with no reviewer recorded")
+        summary[lane] = {"admitted": len(records), "agentReviewed": agent,
+                         "personReviewed": person, "reviewerUnrecorded": unrecorded,
+                         "methods": dict(sorted(methods.items())),
+                         "line": f"{lane}: " + ", ".join(parts)}
+    return summary
 
 
 def _is_micro_role(role: str, configured: set[str]) -> bool:
@@ -532,12 +1180,16 @@ def _candidate_output(row: dict[str, Any], episode: Path) -> dict[str, Any]:
         result["microCutJustification"] = row["microCutJustification"]
     if row.get("continuationOf"):
         result["continuationOf"] = row["continuationOf"]
+    if row.get("origin"):
+        result["origin"] = row["origin"]
     return result
 
 
 def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str) -> dict[str, Any]:
     shots = []
     for event in events:
+        if event["kind"] == "picture":
+            continue  # wordless picture produces no cue
         text = event["subtitleTextHi" if language == "hi" else "subtitleTextEn"]
         shots.append(
             {
@@ -547,7 +1199,7 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
                 "audioAt": event["subtitleAudioAt"],
                 "audioDuration": event["subtitleAudioDuration"],
                 "dialogue": event["kind"] == "dialogue",
-                "speaker": event.get("speaker"),
+                "speaker": event.get("speaker") or event.get("voice"),
                 "text": text,
                 "sourceLanguage": "hi",
             }
@@ -555,6 +1207,8 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
         if event.get('subtitleCuePairs'):
             shots[-1].update(cueParts=[p[language] for p in event['subtitleCuePairs']],
                              cueWeights=event['subtitleCueWeights'])
+        if event.get('passage'):
+            shots[-1]['passage'] = event['passage']  # continues the previous shot's utterance
     return {
         "schemaVersion": 1,
         "kind": "hindi-master-subtitle-timing-input",
@@ -568,6 +1222,61 @@ def _subtitle_doc(language: str, events: list[dict[str, Any]], fingerprint: str)
         ),
         "shots": shots,
     }
+
+
+def lane_documents(episode: Path, repo: Path, config_path: Path,
+                   config: dict[str, Any]) -> dict[str, str]:
+    """Name each document this timeline config reads, before reading any.
+
+    The admission writer calls this too, so the review bindings it computes
+    are the ones the timeline later checks.
+    """
+    # Which lane documents a film needs depends on what its rows are. Peek at
+    # the storyboard and override first; build_timeline still reports them.
+    storyboard_raw = config.get("storyboard", "story/storyboard_plan.json")
+    peek_rows = _peek_json(_resolve_path(episode, repo, config_path, storyboard_raw)).get("stills")
+    peek_overrides: dict[str, dict[str, Any]] = {}
+    if config.get("productionOverrides"):
+        try:
+            peek_overrides = _production_overrides(_peek_json(
+                _resolve_path(episode, repo, config_path, config["productionOverrides"])))
+        except ValueError:
+            peek_overrides = {}
+    peek_kinds = set()
+    for row in peek_rows if isinstance(peek_rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            peek_kinds.add(_row_delivery(row, peek_overrides.get(str(row.get("still_id")), {}))[0])
+        except ValueError:
+            peek_kinds.add("dialogue" if row.get("speaker") else "narration")
+    if not isinstance(peek_rows, list) or not peek_rows:
+        peek_kinds = {"narration", "dialogue"}  # unreadable board: keep every lane required
+    def lane_document(key: str, default: str, needed: bool) -> str | None:
+        # A lane document is required when a row needs it, when the config
+        # names it, or when it exists at its default path. The last keeps an
+        # existing project's documents, and so its fingerprint, unchanged.
+        if needed or key in config or _resolve_path(episode, repo, config_path, default).is_file():
+            return config.get(key, default)
+        return None
+
+    required_docs = {"storyboard": storyboard_raw}
+    narration_raw = lane_document("narrationManifest", "work/narration-hi-v1/manifest.json",
+                                  "narration" in peek_kinds)
+    if narration_raw is not None:
+        required_docs["narrationManifest"] = narration_raw
+    required_docs["dialogueManifest"] = config.get(
+        "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
+    )
+    ledger_raw = lane_document("h3ReviewLedger", "work/h3-review-ledger-v1.json",
+                               bool(peek_kinds & {"narration", "picture"}))
+    if ledger_raw is not None:
+        required_docs["h3ReviewLedger"] = ledger_raw
+    if config.get("productionOverrides"):
+        required_docs["productionOverrides"] = config["productionOverrides"]
+    if config.get('subtitleManuscript'):
+        required_docs['subtitleManuscript'] = config['subtitleManuscript']
+    return required_docs
 
 
 def build_timeline(
@@ -620,20 +1329,7 @@ def build_timeline(
         }
         return value
 
-    required_docs = {
-        "storyboard": config.get("storyboard", "story/storyboard_plan.json"),
-        "narrationManifest": config.get(
-            "narrationManifest", "work/narration-hi-v1/manifest.json"
-        ),
-        "dialogueManifest": config.get(
-            "dialogueManifest", "work/grok-dialogue-v1/draft-manifest.json"
-        ),
-        "h3ReviewLedger": config.get("h3ReviewLedger", "work/h3-review-ledger-v1.json"),
-    }
-    if config.get("productionOverrides"):
-        required_docs["productionOverrides"] = config["productionOverrides"]
-    if config.get('subtitleManuscript'):
-        required_docs['subtitleManuscript'] = config['subtitleManuscript']
+    required_docs = lane_documents(episode, repo, config_path, config)
     docs: dict[str, tuple[Path, dict[str, Any]]] = {}
     for label, raw in required_docs.items():
         path = _resolve_path(episode, repo, config_path, raw)
@@ -666,10 +1362,10 @@ def build_timeline(
         raise TimelineIncomplete("Required timeline documents are missing or invalid")
 
     storyboard_path, storyboard = docs["storyboard"]
-    narration_path, narration_doc = docs["narrationManifest"]
+    narration_path, narration_doc = docs.get("narrationManifest", (None, {}))
     dialogue_path, dialogue_doc = docs["dialogueManifest"]
-    ledger_path, ledger_doc = docs["h3ReviewLedger"]
-    ledger_available = ledger_path.is_file()
+    ledger_path, ledger_doc = docs.get("h3ReviewLedger", (None, {}))
+    ledger_available = ledger_path is not None and ledger_path.is_file()
     try:
         overrides = _production_overrides(docs.get("productionOverrides", (config_path, {}))[1])
     except ValueError as exc:
@@ -682,6 +1378,33 @@ def build_timeline(
     if len(scene_ids) != len(set(scene_ids)) or any(not item for item in scene_ids):
         errors.append({"type": "storyboard", "error": "Scene IDs are empty or duplicated"})
 
+    # One classification for every later branch: dialogue (a lip-sync take),
+    # narration (speech heard over picture, any voice) or picture (wordless).
+    row_kind: dict[str, str] = {}
+    row_voice: dict[str, str] = {}
+    picture_rule: dict[str, tuple[str, int | None]] = {}
+    for row in rows:
+        scene_id = str(row.get("still_id", ""))
+        try:
+            kind, voice = _row_delivery(row, overrides.get(scene_id, {}))
+            if kind == "picture":
+                picture_rule[scene_id] = _picture_rule(row)
+            else:
+                _speech_rule(row)
+        except ValueError as exc:
+            errors.append({"type": "storyboard-delivery", "sceneId": scene_id, "error": str(exc)})
+            kind, voice = ("dialogue" if row.get("speaker") else "narration"), None
+            if kind == "narration" and "narration_hi" not in row:
+                kind = "invalid"
+        row_kind[scene_id] = kind
+        if voice:
+            row_voice[scene_id] = voice
+    row_passage = _passages(rows, overrides, row_kind, row_voice, errors)
+    ledger_version = ledger_doc.get("schemaVersion", 1) if ledger_available else 1
+    if isinstance(ledger_version, bool) or not isinstance(ledger_version, int) or ledger_version < 1:
+        errors.append({"type": "h3-ledger", "error": "ledger schemaVersion must be a positive integer"})
+        ledger_version = 2  # unknown versions get the stricter origin rule
+
     narration = _narration_entries(narration_doc)
     dialogues = _dialogue_entries(dialogue_doc)
     ledger = _ledger_entries(ledger_doc)
@@ -693,7 +1416,7 @@ def build_timeline(
     if not isinstance(score_placements_raw, list):
         errors.append({"type": "config", "error": "scorePlacements must be an array"})
         score_placements_raw = []
-    if config.get('requireApprovedScore') and not score_placements_raw:
+    if config.get('requireApprovedScore') and all(_is_silence_placement(row) for row in score_placements_raw):
         missing.append({'type':'score-admission', 'reason':'This episode requires a reviewed score; no score placements are admitted.'})
 
     production_path = docs.get("productionOverrides", (None, {}))[0]
@@ -710,19 +1433,18 @@ def build_timeline(
                 "actual": production_sha,
             })
 
-    narration_state_path = _resolve_path(
-        episode,
-        repo,
-        config_path,
-        config.get(
-            "narrationState",
-            str(narration_path.with_suffix(".eleven-state.json")),
-        ),
+    narration_state_raw = config.get(
+        "narrationState",
+        str(narration_path.with_suffix(".eleven-state.json")) if narration_path else None,
     )
+    narration_state_path = (_resolve_path(episode, repo, config_path, narration_state_raw)
+                            if narration_state_raw else None)
     narration_state: dict[str, Any] | None = None
-    if narration_state_path.is_file():
+    if narration_state_path is not None and narration_state_path.is_file():
         try:
             narration_state = _read_json_evidence(narration_state_path, "narration finite state")
+            if narration_path is None:
+                raise ValueError("narration finite state names no narration manifest to bind")
             if narration_state.get("manifestSha256") != _sha256(narration_path):
                 raise ValueError("narration finite state does not bind the current manifest")
         except ValueError as exc:
@@ -733,7 +1455,7 @@ def build_timeline(
     for row in rows:
         scene_id = str(row["still_id"])
         override = overrides.get(scene_id, {})
-        if row.get("speaker"):
+        if row_kind[scene_id] == "dialogue":
             effective_hi = str(override.get("narration_hi") or row["narration_hi"])
             source_scene_id = dialogue_outputs.get(scene_id, {}).get("sourceSceneId", scene_id) if isinstance(dialogue_outputs.get(scene_id), dict) else scene_id
             dialogue_row = dialogues.get(source_scene_id, {})
@@ -753,6 +1475,8 @@ def build_timeline(
                 effective_hi, str(override.get("narration_en") or row["narration_en"]),
                 config.get('dialogueSubtitleMode', 'source'))
             continue
+        if row_kind[scene_id] != "narration":
+            continue  # picture rows carry no words and produce no subtitle
         narration_row = narration.get(scene_id, {})
         submitted_hi = str(narration_row.get("text") or row["narration_hi"])
         if override.get("narration_hi") and override["narration_hi"] != submitted_hi:
@@ -778,6 +1502,7 @@ def build_timeline(
             errors.append({'type':'subtitle-manuscript', 'error':str(exc)})
 
     h3_by_scene: dict[str, list[dict[str, Any]]] = {}
+    h3_reviews: list[dict[str, Any]] = []
     routes: dict[str, str] = {}
     for row in rows:
         scene_id = str(row["still_id"])
@@ -790,9 +1515,14 @@ def build_timeline(
         route = str(entry.get("pictureRoute", "")).strip().lower()
         routes[scene_id] = route
         expected_route = "grok-dialogue" if row.get("speaker") else "h3"
-        if route not in {"h3", "grok-dialogue", "omit"}:
+        if route not in PICTURE_ROUTES | {"grok-dialogue", "omit"}:
             errors.append({"type": "h3-route", "sceneId": scene_id, "route": route})
             continue
+        if (row_kind[scene_id] == "picture" and route == "omit"
+                and picture_rule.get(scene_id, ("take",))[0] == "take"):
+            errors.append({"type": "picture-route", "sceneId": scene_id,
+                           "error": "a take-clocked picture row needs its own accepted segment; "
+                                    "a row whose picture a neighbour owns needs an authored hold"})
         if row.get("speaker") and route != "grok-dialogue":
             errors.append(
                 {
@@ -839,6 +1569,20 @@ def build_timeline(
                     }
                 )
                 continue
+            origin = None
+            if (ledger_version >= 2 or row_kind[scene_id] == "picture") and not declared_sha:
+                # A version-2 ledger, and every wordless picture row, admits
+                # only segments whose bytes the ledger itself names.
+                errors.append({"type": "picture-segment-hash", "sceneId": scene_id, "index": index,
+                               "error": "accepted segment must declare its sourceSha256"})
+                continue
+            if ledger_version >= 2:
+                try:
+                    origin = _verify_segment_origin(episode, repo, ledger_path, segment, actual_sha)
+                except ValueError as exc:
+                    errors.append({"type": "picture-origin", "sceneId": scene_id, "index": index,
+                                   "source": str(source), "error": str(exc)})
+                    continue
             if info.video_streams != 1 or info.audio_streams != 0:
                 errors.append(
                     {
@@ -918,6 +1662,8 @@ def build_timeline(
                 "role": role,
                 "verdict": verdict,
             }
+            if origin is not None:
+                candidate["origin"] = origin
             if segment.get("continuationOf") is not None:
                 try:
                     link = segment['continuationOf']
@@ -977,8 +1723,13 @@ def build_timeline(
                         }
                     )
             candidates.append(candidate)
+            h3_reviews.append({key: segment[key] for key in REVIEW_NOTE_KEYS if key in segment})
         h3_by_scene[scene_id] = candidates
-        if route == "h3" and not candidates and dry_run:
+        if (row_kind[scene_id] == "picture" and route in PICTURE_ROUTES and not candidates
+                and picture_rule.get(scene_id, ("take",))[0] == "take"):
+            # The take is this row's clock; without one there is nothing to measure.
+            missing.append({"type": "picture-take", "sceneId": scene_id})
+        elif route in PICTURE_ROUTES and not candidates and dry_run:
             missing.append({"type": "approved-h3-coverage", "sceneId": scene_id})
 
     # Resolve and measure the complete speech inventory before writing timings.
@@ -986,7 +1737,9 @@ def build_timeline(
     dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]] = {}
     for row in rows:
         scene_id = str(row["still_id"])
-        if row.get("speaker"):
+        if row_kind[scene_id] in ("picture", "invalid"):
+            continue  # wordless picture needs no speech admission
+        if row_kind[scene_id] == "dialogue":
             selection = dialogue_outputs.get(scene_id)
             source_scene_id = selection.get("sourceSceneId", scene_id) if isinstance(selection, dict) else scene_id
             entry = dialogues.get(source_scene_id)
@@ -1116,11 +1869,9 @@ def build_timeline(
                                           prompt_path.read_text(encoding='utf-8'))
                 if not isinstance(source_doc.get("taskId"), str) or not source_doc["taskId"]:
                     raise ValueError(f"{scene_id}: dialogue sidecar has no paid taskId")
-                required_bindings = [dialogue_path]
-                if execution_path != dialogue_path:
-                    required_bindings.append(execution_path)
-                if production_path:
-                    required_bindings.append(production_path)
+                required_bindings = review_binding_paths(
+                    "dialogue", dialogue_path=dialogue_path, execution_path=execution_path,
+                    production_path=production_path)
                 review = _review_approval(
                     episode=episode, repo=repo, owner=config_path, evidence=output,
                     review_type="dialogue", item_id=source_scene_id, source=source,
@@ -1146,6 +1897,8 @@ def build_timeline(
                                 or not math.isfinite(crop_from) or not 0 < crop_from < info.duration
                                 or abs(crop_from * DELIVERY_FPS - round(crop_from * DELIVERY_FPS)) > 1e-6):
                             raise ValueError("Timed dialogue crop must start at an interior native frame boundary")
+                if output.get("pictureWindows") is not None:
+                    admitted["pictureWindows"] = _picture_window_shape(output["pictureWindows"])
                 admitted.update({
                     "sourceSceneId": source_scene_id,
                     "sha256": actual_sha,
@@ -1203,7 +1956,20 @@ def build_timeline(
 
     validated_score_placements: list[dict[str, Any]] = []
     score_documents: dict[str, dict[str, Any]] = {}
-    if score_placements_raw:
+    unscored = config.get("unscored", False)
+    if type(unscored) is not bool:
+        errors.append({"type": "config", "error": "unscored must be a boolean"})
+        unscored = False
+    scored_placements = [row for row in score_placements_raw if not _is_silence_placement(row)]
+    if unscored and (scored_placements or config.get("requireApprovedScore")):
+        errors.append({"type": "score-admission",
+                       "error": "an unscored film may carry only silence placements and cannot require a score"})
+    if score_placements_raw and not scored_placements:
+        try:
+            validated_score_placements = [_silence_placement(row) for row in score_placements_raw]
+        except ValueError as exc:
+            errors.append({"type": "score-admission", "error": str(exc)})
+    elif score_placements_raw:
         score_manifest_path = _resolve_path(
             episode, repo, config_path,
             config.get("scoreManifest", "work/music-score-v1/execution-manifest.json"),
@@ -1232,6 +1998,14 @@ def build_timeline(
             cues = {str(row.get("id")): row for row in score_doc.get("cues", [])}
             seen_score_placements: set[str] = set()
             for pos, placement in enumerate(score_placements_raw):
+                if _is_silence_placement(placement):
+                    # Authored order is kept: a silence sits between admitted takes.
+                    silence = _silence_placement(placement)
+                    if silence["movement"] in seen_score_placements:
+                        raise ValueError(f"score placement {pos} duplicates {silence['movement']}")
+                    seen_score_placements.add(silence["movement"])
+                    validated_score_placements.append(silence)
+                    continue
                 if not isinstance(placement, dict):
                     raise ValueError(f"score placement {pos} must be an object")
                 movement = str(placement.get("movement") or "")
@@ -1300,9 +2074,9 @@ def build_timeline(
                 ]
                 if state_item.get("status") != "DOWNLOADED" or len(state_matches) != 1:
                     raise ValueError(f"{movement}: score finite state does not admit this candidate")
-                required_bindings = [score_manifest_path, narration_path, dialogue_path]
-                if production_path:
-                    required_bindings.append(production_path)
+                required_bindings = review_binding_paths(
+                    "score", dialogue_path=dialogue_path, narration_path=narration_path,
+                    score_manifest_path=score_manifest_path, production_path=production_path)
                 review = _review_approval(
                     episode=episode, repo=repo, owner=config_path, evidence=placement,
                     review_type="score", item_id=movement, source=track,
@@ -1329,8 +2103,10 @@ def build_timeline(
         "ready": not missing and not errors,
         "dryRun": dry_run,
         "storyboardScenes": len(rows),
-        "narrationScenes": sum(not bool(row.get("speaker")) for row in rows),
-        "dialogueScenes": sum(bool(row.get("speaker")) for row in rows),
+        "narrationScenes": sum(kind == "narration" for kind in row_kind.values()),
+        "dialogueScenes": sum(kind == "dialogue" for kind in row_kind.values()),
+        **({"pictureScenes": sum(kind == "picture" for kind in row_kind.values())}
+           if "picture" in row_kind.values() else {}),
         "measuredNarration": len(narration_media),
         "measuredDialogue": len(dialogue_media),
         "approvedH3Scenes": sum(bool(value) for value in h3_by_scene.values()),
@@ -1347,7 +2123,15 @@ def build_timeline(
         "media": measured,
         "outputsWritten": [str(readiness_path)],
     }
-    if narration_state_path.is_file():
+    review_lanes = {
+        "dialogue": [media[3] for media in dialogue_media.values()],
+        "score": validated_score_placements,
+        "h3": h3_reviews,
+    }
+    if any(key in record for records in review_lanes.values() for record in records
+           for key in REVIEW_NOTE_KEYS):
+        readiness["reviewSummary"] = _review_summary(review_lanes)
+    if narration_state_path is not None and narration_state_path.is_file():
         readiness["documents"]["narrationState"] = {
             "path": str(narration_state_path), "sha256": _sha256(narration_state_path)
         }
@@ -1374,7 +2158,7 @@ def build_timeline(
     breath_overrides = config.get("narrationBreathOverrides", {})
     if not isinstance(breath_overrides, dict):
         raise TimelineIncomplete("narrationBreathOverrides must map scene IDs to seconds and reason")
-    narration_ids = {str(row['still_id']) for row in rows if not row.get('speaker')}
+    narration_ids = {scene_id for scene_id, kind in row_kind.items() if kind == 'narration'}
     for scene_id, override in breath_overrides.items():
         if scene_id not in narration_ids or not isinstance(override, dict):
             raise TimelineIncomplete(f"Narration breath override has no narration scene: {scene_id}")
@@ -1386,9 +2170,17 @@ def build_timeline(
     handles = config.get("dialogueHandles", {})
     dialogue_pre = float(handles.get("preSeconds", 0.70))
     dialogue_post = float(handles.get("postSeconds", 0.90))
+    scene_handles = _scene_handles(dialogue_outputs, row_kind, dialogue_pre, dialogue_post)
     preserve_dialogue = config.get("preserveCompleteDialogueClips", False)
     if type(preserve_dialogue) is not bool:
         raise TimelineIncomplete("preserveCompleteDialogueClips must be a boolean")
+    frame = _frame_settings(config)
+    voice_gains = _voice_gains(config, row_kind)
+    try:
+        music_shaping = (resolve_music_shaping(config["musicShaping"], list(row_kind))
+                         if "musicShaping" in config else None)
+    except ValueError as exc:
+        raise TimelineIncomplete(str(exc)) from exc
 
     events: list[dict[str, Any]] = []
     cursor_frames = 0
@@ -1402,6 +2194,7 @@ def build_timeline(
             if natural_frames <= 0:
                 raise TimelineIncomplete(f"Dialogue has no video frames: {scene_id}")
             speech = _speech_window(entry, output)
+            authored_handles = None
             if speech is None:
                 source_start_frame = 0
                 source_end_frame = natural_frames
@@ -1425,16 +2218,22 @@ def build_timeline(
                     raise TimelineIncomplete(
                         f"Invalid dialogue speech window for {scene_id}: {speech_start}..{speech_end}"
                     )
-                source_start_frame = max(0, math.floor((speech_start - dialogue_pre) * DELIVERY_FPS + 1e-7))
+                pre, post = scene_handles.get(scene_id, (dialogue_pre, dialogue_post, None))[:2]
+                source_start_frame = max(0, math.floor((speech_start - pre) * DELIVERY_FPS + 1e-7))
                 source_end_frame = min(
                     natural_frames,
-                    math.ceil((speech_end + dialogue_post) * DELIVERY_FPS - 1e-7),
+                    math.ceil((speech_end + post) * DELIVERY_FPS - 1e-7),
                 )
                 handle_basis = "measured-full-speech-window-plus-authored-handles"
+                authored_handles = scene_handles.get(scene_id)
                 if preserve_dialogue:
                     source_start_frame = 0
                     source_end_frame = natural_frames
                     handle_basis = "measured-subtitle-window-complete-native-performance"
+                    authored_handles = None
+            if scene_id in scene_handles and authored_handles is None:
+                warnings.append({"type": "dialogue-handles-unused", "sceneId": scene_id,
+                                 "reason": "the complete native clip is kept, so per-scene handles have no effect"})
             duration_frames = source_end_frame - source_start_frame
             duration = duration_frames / DELIVERY_FPS
             source_start = source_start_frame / DELIVERY_FPS
@@ -1472,6 +2271,10 @@ def build_timeline(
                     "basis": handle_basis,
                     "preSeconds": round(subtitle_at, 6),
                     "postSeconds": round(duration - subtitle_at - subtitle_duration, 6),
+                    **({"authored": {"preSeconds": authored_handles[0],
+                                     "postSeconds": authored_handles[1],
+                                     "reason": authored_handles[2]}}
+                       if authored_handles else {}),
                 },
                 "admission": {
                     "sidecar": output["sidecar"],
@@ -1486,12 +2289,42 @@ def build_timeline(
                 "subtitleTextHi": effective_text[scene_id]["hi"],
                 "subtitleTextEn": effective_text[scene_id]["en"],
             }
+            event.update(_audio_overlaps(scene_id, output, speech is not None, start, source_start,
+                                         (info.audio_duration or duration) - source_start - duration))
             cursor_frames += duration_frames
+        elif row_kind[scene_id] == "picture":
+            rule, hold_frames = picture_rule[scene_id]
+            if rule == "take":
+                duration_frames = sum(int(c["availableFrames"]) for c in h3_by_scene.get(scene_id, []))
+            else:
+                duration_frames = hold_frames
+            if not duration_frames:
+                raise TimelineIncomplete(f"Picture row {scene_id} has no accepted take to clock it")
+            duration = duration_frames / DELIVERY_FPS
+            # Wordless picture: no voice, no subtitle cue, no narration breath.
+            event = {
+                "id": scene_id,
+                "shot": _scene_number(scene_id),
+                "kind": "picture",
+                "speaker": None,
+                "audio": None,
+                "picture": None,
+                "start": round(start, 6),
+                "duration": round(duration, 6),
+                "end": round(start + duration, 6),
+                "durationRule": {"rule": rule, "frames": duration_frames,
+                                 "basis": ("measured accepted take at its authored speed" if rule == "take"
+                                           else "authored frame-aligned hold filled from accepted segments")},
+                "text": "",
+            }
+            cursor_frames += duration_frames
+            events.append(event)
+            continue
         else:
             source, info = narration_media[scene_id]
             audio_duration = info.audio_duration or info.duration
             next_row = rows[index + 1] if index + 1 < len(rows) else None
-            if next_row is None or next_row.get("beat", {}).get("number") != row.get("beat", {}).get("number"):
+            if next_row is None or _beat_identity(next_row) != _beat_identity(row):
                 breath_target = beat_end_target
                 breath_reason = "beat-boundary"
             elif next_row.get("speaker"):
@@ -1517,6 +2350,7 @@ def build_timeline(
                 "shot": _scene_number(scene_id),
                 "kind": "narration",
                 "speaker": None,
+                **({"voice": row_voice[scene_id]} if scene_id in row_voice else {}),
                 "audio": _portable_path(source, episode),
                 "picture": None,
                 "audioSha256": measured[str(source)]["sha256"],
@@ -1537,10 +2371,26 @@ def build_timeline(
                 "subtitleTextEn": effective_text[scene_id]["en"],
             }
             cursor_frames += duration_frames
+        if scene_id in row_passage:
+            event['passage'] = row_passage[scene_id]
         if effective_text[scene_id].get('cuePairs'):
             event['subtitleCuePairs'] = effective_text[scene_id]['cuePairs']
             event['subtitleCueWeights'] = effective_text[scene_id]['cueWeights']
         events.append(event)
+
+    minimum_picture_frames = round(float(config.get("minimumPictureSegmentSeconds", 1.3)) * DELIVERY_FPS)
+    micro_words = set(config.get("microCutRoleWords", MICRO_CUT_ROLE_WORDS))
+    for event in events:
+        windows = dialogue_media[event["id"]][3].get("pictureWindows") if event["kind"] == "dialogue" else None
+        if not windows:
+            continue
+        try:
+            event["pictureWindows"] = _resolve_picture_windows(
+                event, windows, episode=episode, repo=repo, config_path=config_path,
+                h3_by_scene=h3_by_scene, dialogue_media=dialogue_media,
+                minimum_frames=minimum_picture_frames, micro_words=micro_words)
+        except ValueError as exc:
+            errors.append({"type": "picture-window", "sceneId": event["id"], "error": str(exc)})
 
     for event_index, event in enumerate(events):
         for candidate_index, candidate in enumerate(h3_by_scene.get(event['id'], [])):
@@ -1549,15 +2399,14 @@ def build_timeline(
                 continue
             parent = events[event_index-1] if event_index else {}
             selected_endpoint = (parent.get('sourceStart', 0) + parent.get('duration', 0)) * DELIVERY_FPS
+            covered_end = any(abs(w['to'] - parent.get('duration', 0)) < 1e-6
+                              for w in parent.get('pictureWindows', []))
             if (candidate_index != 0 or parent.get('kind') != 'dialogue'
                     or parent.get('picture') != link['source']
                     or parent.get('audioSha256') != link['sourceSha256']
-                    or abs(selected_endpoint-link['endFrameExclusive']) > 1e-3):
+                    or abs(selected_endpoint-link['endFrameExclusive']) > 1e-3 or covered_end):
                 errors.append(dict(type='h3-continuation-contract',sceneId=event['id'],
                                    error='Selected preceding dialogue no longer ends on the bound native endpoint'))
-
-    minimum_picture_frames = round(float(config.get("minimumPictureSegmentSeconds", 1.3)) * DELIVERY_FPS)
-    micro_words = set(config.get("microCutRoleWords", MICRO_CUT_ROLE_WORDS))
     blocks: list[dict[str, Any]] = []
     coverage_borrowing: list[dict[str, Any]] = []
     block_number = 0
@@ -1574,9 +2423,38 @@ def build_timeline(
                 if not 0 < cut_frame < duration_frames:
                     raise TimelineIncomplete(f"Timed crop falls outside the kept dialogue window: {event['id']}")
                 windows = [(0, cut_frame, None), (cut_frame, duration_frames, event["pictureCrop"])]
+            windows = _cover_native_parts(windows, event.get("pictureWindows", []))
             for part, (left, right, crop) in enumerate(windows, 1):
                 part_frames = right - left
                 part_duration = round(part_frames / DELIVERY_FPS, 6)
+                if isinstance(crop, dict) and "sourceKind" in crop:
+                    # Picture covered by other accepted frames; the event's audio is untouched.
+                    cover = crop
+                    candidate = {
+                        "path": cover["source"],
+                        "sourceStart": cover["sourceStart"],
+                        "duration": part_duration,
+                        "frames": part_frames,
+                        "role": cover["role"],
+                        "status": "approved",
+                        "sourceSha256": cover["sourceSha256"],
+                        "pictureWindow": {"sourceKind": cover["sourceKind"],
+                                          "sourceSceneId": cover["sourceSceneId"],
+                                          "reason": cover["reason"]},
+                    }
+                    status = "ready"
+                else:
+                    candidate = {
+                        "path": event["picture"],
+                        "sourceStart": round((source_start_frame + left) / DELIVERY_FPS, 6),
+                        "duration": part_duration,
+                        "frames": part_frames,
+                        "role": "dialogue-fixed-sync",
+                        "status": "approved",
+                        "sourceSha256": event["audioSha256"],
+                        **({"crop": crop} if crop else {}),
+                    }
+                    status = "ready-native-picture-audio-sync"
                 blocks.append(
                 {
                     "id": f"b{block_number:03d}" + (f"-p{part}" if len(windows) > 1 else ""),
@@ -1584,28 +2462,20 @@ def build_timeline(
                     "start": round(event["start"] + left / DELIVERY_FPS, 6),
                     "duration": part_duration,
                     "events": [event["id"]],
-                    "candidates": [
-                        {
-                            "path": event["picture"],
-                            "sourceStart": round((source_start_frame + left) / DELIVERY_FPS, 6),
-                            "duration": part_duration,
-                            "frames": part_frames,
-                            "role": "dialogue-fixed-sync",
-                            "status": "approved",
-                            "sourceSha256": event["audioSha256"],
-                            **({"crop": crop} if crop else {}),
-                        }
-                    ],
+                    "candidates": [candidate],
                     "availableSeconds": part_duration,
                     "selectedSeconds": part_duration,
-                    "status": "ready-native-picture-audio-sync",
+                    "status": status,
                 }
                 )
             index += 1
             continue
 
         end_index = index
-        while end_index < len(events) and events[end_index]["kind"] == "narration":
+        # Wordless picture joins the neighbouring narration run, so an authored
+        # hold is filled by trimming accepted takes and causal borrowing works
+        # across it exactly as it does between narration events.
+        while end_index < len(events) and events[end_index]["kind"] in ("narration", "picture"):
             end_index += 1
         block_events = events[index:end_index]
         target_by_scene = {
@@ -1709,6 +2579,29 @@ def build_timeline(
         )
         index = end_index
 
+    _record_split_edits(blocks, events)
+    for event in events:
+        if event["id"] in voice_gains:
+            event["voiceGainDb"], event["voiceGainReason"] = voice_gains[event["id"]]
+    for event in events:
+        tail = event.get("audioTail", {}).get("seconds", 0)
+        if tail and event["end"] + tail > cursor_frames / DELIVERY_FPS + 1e-6:
+            raise TimelineIncomplete(f"Audio tail runs past the end of the film: {event['id']}")
+    transitions = []
+    # Cut positions are known only once every block is covered; a deficit is reported first.
+    if config.get("transitions") is not None and all(
+            block["status"] != "blocked-coverage-deficit" for block in blocks):
+        try:
+            transitions = _resolve_transitions(
+                config["transitions"], events, blocks, episode=episode, repo=repo, config_path=config_path,
+                h3_by_scene=h3_by_scene, dialogue_media=dialogue_media)
+        except ValueError as exc:
+            errors.append({"type": "transition", "error": str(exc)})
+    if transitions:
+        readiness["transitions"] = transitions
+    if frame:
+        readiness["frame"] = frame
+
     # Preserve the exact allocation evidence even when picture coverage is
     # short.  A continuation planner must be able to prove which accepted
     # source frames were consumed before it commissions another H3 frame; a
@@ -1807,6 +2700,11 @@ def build_timeline(
             "accepted generated motion only; H3 picture is silent; Grok dialogue picture/audio stay coupled; "
             "no still padding, dead holds, implicit retiming, or invented media; an H3 speed is legal only "
             "when explicitly authored on its approved ledger segment"
+        ) if not any(event.get("pictureWindows") for event in events) else (
+            "accepted generated motion only; H3 picture is silent; Grok dialogue audio stays on its own "
+            "measured time map while its picture may be covered, in authored windows, by other accepted "
+            "picture at speed 1.0; no still padding, dead holds, implicit retiming, or invented media; an "
+            "H3 speed is legal only when explicitly authored on its approved ledger segment"
         ),
         "timingPolicy": (
             "measured complete Hindi speech; default frame-aligned 0.35-0.55 second narration breaths "
@@ -1820,6 +2718,14 @@ def build_timeline(
         "musicBreaths": config.get("musicBreaths", []),
         "sfxManifest": config.get("sfxManifest"),
     }
+    if unscored:
+        edit_plan["unscored"] = True
+    if music_shaping is not None:
+        edit_plan["musicShaping"] = music_shaping
+    if transitions:
+        edit_plan["transitions"] = transitions
+    if frame:
+        edit_plan["frame"] = frame
     subtitle_hi = _subtitle_doc("hi", events, fingerprint)
     subtitle_en = _subtitle_doc("en", events, fingerprint)
     explicit_retimes = [
@@ -1850,8 +2756,11 @@ def build_timeline(
         "timelineFingerprint": fingerprint,
         "runtimeSeconds": edit_plan["runtimeSeconds"],
         "eventCount": len(events),
-        "narrationCount": sum(row["kind"] == "narration" for row in events),
-        "dialogueCount": sum(row["kind"] == "dialogue" for row in events),
+        # Both counts are utterances: a passage's second half continues one rather than starting one.
+        "narrationCount": sum(row["kind"] == "narration" and not row.get("passage") for row in events),
+        "dialogueCount": sum(row["kind"] == "dialogue" and not row.get("passage") for row in events),
+        **({"pictureCount": sum(row["kind"] == "picture" for row in events)}
+           if any(row["kind"] == "picture" for row in events) else {}),
         "pictureBlockCount": len(blocks),
         "coverageBorrowing": coverage_borrowing,
         "explicitH3Retimes": explicit_retimes,
@@ -1886,8 +2795,90 @@ def build_timeline(
     return readiness, edit_plan
 
 
+HELP_DOCUMENTS = """\
+documents read, named in timeline-inputs.json (defaults in brackets):
+  storyboard        the authored rows, one per still [story/storyboard_plan.json]
+  narrationManifest narration lane items and their finite state, from
+                    eleven_batch_finite.py; needed only when a row is narrated
+                    [work/narration-hi-v1/manifest.json]
+  dialogueManifest  the frozen Grok dialogue jobs that kie_dialogue_finite.py ran
+                    [work/grok-dialogue-v1/draft-manifest.json]
+  h3ReviewLedger    picture verdicts per row; needed only when a row uses H3 or
+                    wordless picture. admit_review_decisions.py --lane h3 writes
+                    one from review_finite.py's local-audit.json, or write it by
+                    hand [work/h3-review-ledger-v1.json]
+
+A dialogue take (dialogueOutputs) or score take (scorePlacements) is admitted
+only through a source-bound schema-2 review export, which
+admit_review_decisions.py writes from a plain decisions file. Accepted verdict
+words: """ + ", ".join(sorted(ACCEPTED)) + """.
+
+rhythm controls, in timeline-inputs.json unless named otherwise (default after
+the colon; nothing here is required):
+  dialogueHandles                  air kept around measured speech, film-wide:
+                                   preSeconds 0.70, postSeconds 0.90
+  dialogueOutputs[scene].handles   that scene's own preSeconds/postSeconds and a
+                                   reason: the film-wide handles
+  preserveCompleteDialogueClips    keep every whole native clip: false
+  dialogueOutputs[scene].pictureCrop, pictureCropFrom, pictureCropReason
+                                   an even-pixel crop of the native picture, from
+                                   an optional interior frame: none
+  dialogueOutputs[scene].pictureWindows
+                                   [{from, to, source, sourceSha256, sourceStart,
+                                   role, reason}] seconds of the line covered by
+                                   an accepted speed-1.0 segment or another
+                                   admitted clip's picture outside its measured
+                                   speech; the line's audio stays the clock: none
+  dialogueOutputs[scene].audioLead, audioTail
+                                   {seconds, reason} of the clip's own sound
+                                   heard before or after its kept window; a
+                                   Short cut from the scene hears the line
+                                   without it: none
+  minimumPictureSegmentSeconds     shorter windows warn, or need a role word: 1.3
+  microCutRoleWords                role words that mark a deliberate short cut:
+                                   """ + ", ".join(sorted(MICRO_CUT_ROLE_WORDS)) + """
+  narrationBreathing               sameBeatSeconds 0.40, beatEndSeconds 0.50,
+                                   beforeDialogueSeconds 0.35, minimumSeconds
+                                   0.35, maximumSeconds 0.55
+  narrationBreathOverrides         {scene: {seconds, reason}}: none
+  storyboard holdSeconds, holdFrames, durationRule
+                                   a wordless row's authored hold: its take
+  ledger segment in, out, speed, role
+                                   the accepted source window: whole take, speed
+                                   1.0 (0.5..4.0 when authored), approved-h3
+  allowCausalBorrowing             a narration or picture event short of its own
+                                   accepted picture borrows its nearest
+                                   neighbour's surplus: true
+  musicBreaths                     [{shots, level, reason}] score dips: none
+  musicShaping                     how the score follows the dramatic wave:
+                                   mode wave, floor 0.14, range 0.82, exponent
+                                   1.55, dialogueScale 0.78, smoothingSeconds
+                                   0.3, and events {scene: {..., reason}}; mode
+                                   take-dynamics keeps each take's own level
+                                   (gain, fades, breaths only, no wave): none
+  voiceGains                       {scene: {gainDb -12..6, reason}} a line's
+                                   level after the shared speech target: none
+  scorePlacements gaps, {movement, silence: true, timelineStart,
+  timelineDuration, reason}        stretches with no score; a gap between
+                                   placements is silence: none
+  unscored                         the film has no score, so an empty
+                                   scorePlacements list is intended: false
+  transitions                      [{after, kind, frames, reason}], kind dissolve,
+                                   dip-to-black or dip-to-white: every boundary
+                                   is a cut
+  frameAspect, cadence             a matte inside the 16:9 container, and each
+                                   picture frame held 2 or 3 delivery frames;
+                                   subtitles are still placed against the whole
+                                   container, so they may sit on the matte; a
+                                   stepped part is stepped before its dissolve
+                                   and its phase restarts at each render run:
+                                   none, 1
+"""
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=HELP_DOCUMENTS,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("episode", type=Path)
     parser.add_argument(
         "--input",

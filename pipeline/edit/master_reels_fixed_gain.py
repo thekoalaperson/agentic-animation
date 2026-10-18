@@ -41,6 +41,8 @@ def limiter(limit, release):
 def voice_rows(candidate, reference, plan):
     rows = []
     for event in plan['events']:
+        if event.get('kind') == 'picture':
+            continue  # wordless picture has no speech window to compare
         lo = event['start'] + event['subtitleAudioAt'] + .2
         hi = event['start'] + event['subtitleAudioAt'] + event['subtitleAudioDuration'] - .2
         start, end = round(lo * sync.SR), round(hi * sync.SR)

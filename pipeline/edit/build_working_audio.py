@@ -90,12 +90,8 @@ def mix_working(ep, config_path, config, audition=False, host=None):
         raise RuntimeError('Working mix cannot overwrite canonical assembly')
     output.mkdir(parents=True,exist_ok=True)
     settings=config['settings']
-    if not -6<=float(settings['musicGainDb'])<=6:
-        raise RuntimeError('Unbounded working score gain')
-    for key in ('musicDuck','sfxDuck'):
-        d=settings[key]
-        if not all(math.isfinite(float(v)) for v in d.values()) or not .005<=d['threshold']<=.1 or not 1<=d['ratio']<=12 or not 1<=d['attackMs']<=100 or not 100<=d['releaseMs']<=1500:
-            raise RuntimeError('Unbounded working sidechain')
+    # The same bounds the long-form mixer's authored settings use.
+    mix.check_bus_settings(settings,exact=False)
     notches=mix.validate_notches(config.get('scoreNotchAutomation',[]),runtime)
     if notches:
         if 'speechProtectionAudit' not in paths:
@@ -171,7 +167,8 @@ def main(argv=None):
     if not output.is_relative_to(ep / "work") or output.name == "assembly-v1":
         raise RuntimeError("Working audio must stay in a separate work directory")
     output.mkdir(parents=True, exist_ok=True)
-    plan = clock if voice_only else dict(clock, **{k: score[k] for k in ("scorePlacements", "musicBreaths", "musicNormalization")})
+    plan = clock if voice_only else dict(clock, **{k: score[k] for k in ("scorePlacements", "musicBreaths", "musicNormalization")},
+                                         **{k: score[k] for k in ("musicShaping",) if k in score})
     voice = assembly.build_voice(ep, output, plan)
     outputs = {"voice": voice}
     if not voice_only:

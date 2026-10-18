@@ -11,6 +11,7 @@ script never writes to ``deliverables/``, never invokes a provider, never uses
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -291,22 +292,50 @@ def validate_events(plan: dict[str, Any], runtime: float) -> None:
         raise MixError("edit-plan events do not end at runtime")
 
 
+def silent_placement(row: Any) -> bool:
+    """An authored stretch of no score: it names no track and binds no media."""
+    return isinstance(row, dict) and row.get("silence") is True
+
+
 def validate_score_placements(episode: Path, plan: dict[str, Any], runtime: float) -> None:
+    """Placements are ordered, never overlap and stay inside the measured clock.
+
+    A gap between placements is silence, so a film may score only some of its
+    events. An empty list is accepted only from a plan that declares itself
+    unscored, so a forgotten score is still caught. Every placement that names
+    a track keeps its full hash binding.
+    """
     rows = plan.get("scorePlacements")
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list):
         raise MixError("the source-bound score placement list is required")
+    unscored = plan.get("unscored", False)
+    if type(unscored) is not bool:
+        raise MixError("unscored must be a boolean")
+    if not rows and not unscored:
+        raise MixError("the source-bound score placement list is required; "
+                       "a film with no score declares unscored: true")
+    if unscored and any(not silent_placement(row) for row in rows):
+        raise MixError("an unscored film may carry only silence placements")
     cursor = 0.0
     seen: set[str] = set()
     for row in rows:
+        if not isinstance(row, dict):
+            raise MixError("score placements must be objects")
         movement = str(row.get("movement", ""))
         if not movement or movement in seen:
             raise MixError("score movement names are missing or duplicated")
         seen.add(movement)
         start = finite(row.get("timelineStart"), f"{movement} timelineStart")
         duration = finite(row.get("timelineDuration"), f"{movement} timelineDuration")
-        if abs(start - cursor) > 1e-5 or duration <= 0:
-            raise MixError("score placements must cover the measured clock contiguously")
+        if start < cursor - 1e-5 or duration <= 0:
+            raise MixError(f"score placements must be ordered and must not overlap: {movement}")
         cursor = start + duration
+        if cursor > runtime + 1e-5:
+            raise MixError(f"score placement {movement} runs past the measured runtime")
+        if silent_placement(row):
+            if any(key in row for key in ("track", "trackSha256", "sidecar", "sidecarSha256")):
+                raise MixError(f"silence placement {movement} must not name a score track")
+            continue
         for path_key, sha_key in (
             ("track", "trackSha256"),
             ("sidecar", "sidecarSha256"),
@@ -317,8 +346,6 @@ def validate_score_placements(episode: Path, plan: dict[str, Any], runtime: floa
                 continue
             path = episode_path(episode, row.get(path_key, ""), f"{movement} {path_key}")
             verify_hash(path, row.get(sha_key), f"{movement} {path_key}")
-    if abs(cursor - runtime) > 1e-5:
-        raise MixError("score placements do not end at measured runtime")
 
 
 def validate_render_runs(
@@ -337,7 +364,18 @@ def validate_render_runs(
         raise MixError("picture render runs do not cover the exact delivery frame count")
     for run in render_runs:
         member_ids = run.get("memberSegmentIds", [])
-        if len(member_ids) > 1:
+        if run.get("role") == "dissolve-transition-run":
+            # Two or more sources overlapped by authored dissolves: the sources'
+            # frames, less each overlap, must be exactly the run's frames.
+            sources, dissolves = run.get("sources"), run.get("dissolves")
+            if (not isinstance(sources, list) or len(sources) < 2 or not isinstance(dissolves, list)
+                    or len(dissolves) != len(sources) - 1
+                    or sum(int(row.get("frames", -1)) for row in sources) - sum(dissolves) != int(run.get("frames", -1))
+                    or sum(int(row.get("shownFrames", -1)) for row in sources) != int(run.get("frames", -1))):
+                raise MixError("dissolve picture run does not account for its sources' frames")
+            if len(run.get("memberRoles", [])) != len(member_ids):
+                raise MixError("coalesced picture run lost semantic role evidence")
+        elif len(member_ids) > 1:
             if run.get("role") != "source-contiguous-role-preserving-render-run":
                 raise MixError("coalesced picture run lacks its continuity declaration")
             if len(run.get("memberRoles", [])) != len(member_ids):
@@ -361,6 +399,12 @@ def validate_assembly_evidence(
     if not isinstance(conform, list) or len(conform) != len(placements):
         raise MixError("music-conform audit does not cover all score movements")
     for decision, placement in zip(conform, placements):
+        if silent_placement(placement):
+            if (decision.get("movement") != placement["movement"] or decision.get("silence") is not True
+                    or abs(finite(decision.get("timelineDuration"), "conform timelineDuration")
+                           - finite(placement.get("timelineDuration"), "placement timelineDuration")) > 1e-5):
+                raise MixError("music-conform audit differs from the authored silence placements")
+            continue
         source = episode_path(episode, placement["track"], "score track")
         if (
             decision.get("movement") != placement["movement"]
@@ -465,12 +509,68 @@ def default_settings() -> dict[str, Any]:
     }
 
 
+def check_bus_settings(settings: dict[str, Any], *, exact: bool = True) -> None:
+    """The score gain and sidechain bounds every mix in this repository honours."""
+    gain = finite(settings.get("musicGainDb"), "musicGainDb")
+    if not -6 <= gain <= 6:
+        raise MixError("musicGainDb must lie within -6..6 dB")
+    names = {"threshold", "ratio", "attackMs", "releaseMs"}
+    for key in ("musicDuck", "sfxDuck"):
+        duck = settings.get(key)
+        if not isinstance(duck, dict) or not names <= set(duck) or (exact and set(duck) != names):
+            raise MixError(f"{key} needs threshold, ratio, attackMs and releaseMs")
+        values = {name: finite(value, f"{key} {name}") for name, value in duck.items()}
+        if (not .005 <= values["threshold"] <= .1 or not 1 <= values["ratio"] <= 12
+                or not 1 <= values["attackMs"] <= 100 or not 100 <= values["releaseMs"] <= 1500):
+            raise MixError(f"{key} is outside threshold .005-.1, ratio 1-12, attack 1-100 ms, release 100-1500 ms")
+
+
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    if settings != default_settings():
+    """Version 1 is exactly ``default_settings()``; version 2 is authored within bounds.
+
+    A version 2 file names ``settingsVersion: 2`` and only the values it changes;
+    inside ``musicDuck`` and ``sfxDuck`` too, a single value may be named alone.
+    Every other value keeps today's default, and the contract records the whole
+    effective set, so its fingerprint binds every chosen value.
+    """
+    if settings == default_settings():
+        return settings
+    if not isinstance(settings, dict) or settings.get("settingsVersion") != 2:
         raise MixError(
-            "Mixer settings differ from the reviewed v1 contract; author a new version instead"
+            "Mixer settings differ from the reviewed v1 contract; author settingsVersion 2 instead"
         )
-    return settings
+    unknown = set(settings) - set(default_settings()) - {"settingsVersion", "refuseDynamicMastering", "reason"}
+    if unknown:
+        raise MixError(f"unknown mixer settings: {', '.join(sorted(unknown))}")
+    result = {**default_settings(), "refuseDynamicMastering": False, **copy.deepcopy(settings)}
+    for key in ("musicDuck", "sfxDuck"):
+        if isinstance(settings.get(key), dict):
+            result[key] = {**default_settings()[key], **result[key]}
+    check_bus_settings(result)
+    if not -27 <= finite(result["targetIntegratedLufs"], "targetIntegratedLufs") <= -12:
+        raise MixError("targetIntegratedLufs must lie within -27..-12")
+    if not -3 <= finite(result["targetTruePeakDbtp"], "targetTruePeakDbtp") <= -1:
+        raise MixError("targetTruePeakDbtp must lie within -3..-1")
+    lra = result["targetLra"]
+    if lra != "measured" and (isinstance(lra, (bool, str)) or not 1 <= finite(lra, "targetLra") <= 50):
+        raise MixError('targetLra must be a number within 1..50 or "measured"')
+    if type(result["refuseDynamicMastering"]) is not bool:
+        raise MixError("refuseDynamicMastering must be a boolean")
+    if "reason" in result and (not isinstance(result["reason"], str) or not result["reason"].strip()):
+        raise MixError("a settings reason must be text")
+    return result
+
+
+def measurement_lra(settings: dict[str, Any]) -> float:
+    """A first pass only measures; its LRA target does not change what it reports."""
+    return 11.0 if settings["targetLra"] == "measured" else settings["targetLra"]
+
+
+def second_pass_lra(settings: dict[str, Any], first_pass: dict[str, Any]) -> float:
+    """``measured`` asks loudnorm for the film's own range, within loudnorm's 1..50."""
+    if settings["targetLra"] != "measured":
+        return settings["targetLra"]
+    return min(50.0, max(1.0, finite(first_pass.get("input_lra"), "measured input LRA")))
 
 
 def build_mix_contract(
@@ -484,6 +584,7 @@ def build_mix_contract(
     height: int = 720,
     probe: Callable[[Path], dict[str, Any]] = probe_media,
     sfx_revalidator: Callable[[Path, dict[str, Any]], dict[str, Any]] = revalidate_sfx_contract,
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     episode = episode.resolve()
     if height != 720:
@@ -546,7 +647,7 @@ def build_mix_contract(
     verify_hash(stem, sfx.get("sfxStem", {}).get("sha256"), "SFX stem")
     verify_audio_probe(probe(stem), runtime, expected_audio_frames, "SFX stem", codec="pcm_f32le")
     notches = validate_notches(sfx.get("scoreNotchAutomation"), runtime)
-    settings = validate_settings(default_settings())
+    settings = validate_settings(default_settings() if settings is None else settings)
     evidence = {
         key: {"path": portable(path, episode), "sha256": sha256_file(path)}
         for key, path in paths.items()
@@ -620,6 +721,7 @@ def verify_saved_contract(
         height=720,
         probe=probe,
         sfx_revalidator=sfx_revalidator,
+        settings=saved.get("settings"),
     )
     if current != saved:
         raise MixError("saved mix contract differs from a fresh preflight")
@@ -661,11 +763,40 @@ def loudness(path: Path, settings: dict[str, Any]) -> dict[str, Any]:
         [
             "ffmpeg", "-hide_banner", "-i", str(path), "-vn", "-af",
             f"loudnorm=I={settings['targetIntegratedLufs']}:TP={settings['targetTruePeakDbtp']}:"
-            f"LRA={settings['targetLra']}:print_format=json",
+            f"LRA={measurement_lra(settings)}:print_format=json",
             "-f", "null", "-",
         ]
     )
     return parse_loudnorm(result.stderr)
+
+
+def second_pass_record(measured: dict[str, Any], target_lra: float) -> dict[str, Any]:
+    """What the second loudnorm pass actually did, read from its own JSON report."""
+    kind = measured.get("normalization_type")
+    if kind not in ("linear", "dynamic"):
+        raise MixError("ffmpeg loudnorm did not report its normalization type")
+    return {
+        "normalizationType": kind,
+        "targetLra": target_lra,
+        "inputLra": finite(measured.get("input_lra"), "second-pass input LRA"),
+        "outputLra": finite(measured.get("output_lra"), "second-pass output LRA"),
+        "inputIntegratedLufs": finite(measured.get("input_i"), "second-pass input loudness"),
+        "outputIntegratedLufs": finite(measured.get("output_i"), "second-pass output loudness"),
+        "note": ("linear: one gain for the whole film, its dynamics kept" if kind == "linear" else
+                 "dynamic: loudnorm could not meet the targets with one gain and rode the level, "
+                 "which narrows the film's dynamic range"),
+    }
+
+
+def dynamic_mastering_message(record: dict[str, Any]) -> str:
+    return (
+        f"loudnorm fell back to dynamic gain (input LRA {record['inputLra']}, output LRA "
+        f"{record['outputLra']}, target LRA {record['targetLra']}). Some ways to choose instead: "
+        'targetLra "measured" or a higher number, a lower targetIntegratedLufs or targetTruePeakDbtp, '
+        "the measured fixed gain with a qualified limiter in master_review_audio.py (fixedGainMaster), "
+        "or leaving refuseDynamicMastering off and accepting the dynamic pass. Each changes the film's "
+        "dynamics differently."
+    )
 
 
 def decode_samples(path: Path) -> np.ndarray:
@@ -731,6 +862,104 @@ def intelligibility(voice: Path, premaster: Path, events: list[dict[str, Any]]) 
     }
 
 
+SILENT_LUFS = -70.0  # BS.1770's absolute gate: anything quieter counts as silence
+
+
+def momentary_loudness(path: Path) -> list[tuple[float, float, float]]:
+    """BS.1770 momentary (400 ms) loudness every 100 ms, from ffmpeg's ebur128.
+
+    Returns ``(windowStart, windowEnd, lufs)`` in seconds on the file's clock.
+    """
+    result = run([
+        "ffmpeg", "-nostats", "-hide_banner", "-v", "error", "-i", str(path), "-map", "0:a:0",
+        "-af", "aresample=48000,asetnsamples=n=4800:p=0,ebur128=metadata=1,"
+               "ametadata=mode=print:key=lavfi.r128.M:file=-",
+        "-f", "null", "-",
+    ])
+    rows, at = [], None
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("frame:"):
+            at = float(line.rsplit("pts_time:", 1)[1])
+        elif line.startswith("lavfi.r128.M=") and at is not None:
+            # The value attached to the 100 ms frame starting at ``at`` covers
+            # the 400 ms that end when that frame ends.
+            rows.append((round(at - 0.3, 6), round(at + 0.1, 6), float(line.split("=", 1)[1])))
+    return rows
+
+
+def event_loudness(windows: list[tuple[float, float, float]], start: float, end: float) -> float | None:
+    """Energy mean of the momentary windows wholly inside one event, in LUFS.
+
+    ``None`` when the event is shorter than one window; ``SILENT_LUFS`` or
+    below means nothing measurable sounded there.
+    """
+    inside = [lufs for first, last, lufs in windows if first >= start - 1e-6 and last <= end + 1e-6]
+    if not inside:
+        return None
+    power = float(np.mean([10 ** ((value + 0.691) / 10) for value in inside]))
+    return round(-0.691 + 10 * math.log10(max(power, 1e-30)), 3)
+
+
+def plan_following(events: list[dict[str, Any]], buses: dict[str, Path], breaths: list[dict[str, Any]],
+                   wave_targets: list[dict[str, Any]] | None,
+                   measure: Callable[[Path], list[tuple[float, float, float]]] = momentary_loudness,
+                   ) -> dict[str, Any]:
+    """Measure each event on each bus and flag only contradictions of the plan.
+
+    A flag is raised when an authored zero-level breath still sounds on the
+    score bus, when the authored wave rises into an event but the score bus
+    falls, or when mastering moved one event's level against the rest. Nothing
+    here judges whether the mix sounds right.
+    """
+    measured = {name: measure(path) for name, path in buses.items()}
+    rows = []
+    for event in events:
+        row = {"event": event["id"], "kind": event["kind"]}
+        for name, windows in measured.items():
+            row[name + "Lufs"] = event_loudness(windows, float(event["start"]), float(event["end"]))
+        rows.append(row)
+    flags = []
+    zero_breath_shots = {shot for breath in breaths if float(breath.get("level", 1)) == 0
+                         for shot in range(int(breath["shots"][0]), int(breath["shots"][1]) + 1)}
+    for event, row in zip(events, rows):
+        music = row.get("musicLufs")
+        if event.get("shot") in zero_breath_shots and music is not None and music > SILENT_LUFS:
+            flags.append({"event": event["id"], "kind": "zero-breath-sounds",
+                          "detail": f"an authored level-0 breath measures {music} LUFS on the score bus"})
+    if wave_targets is not None and len(wave_targets) == len(rows):
+        for previous, current, before, after in zip(wave_targets, wave_targets[1:], rows, rows[1:]):
+            rise = float(current.get("envelopeTarget") or 0) / max(float(previous.get("envelopeTarget") or 0), 1e-9)
+            heard = (None if before.get("musicLufs") is None or after.get("musicLufs") is None
+                     or min(before["musicLufs"], after["musicLufs"]) <= SILENT_LUFS
+                     else after["musicLufs"] - before["musicLufs"])
+            if rise >= 1.12 and heard is not None and heard < -1.0:
+                flags.append({"event": after["event"], "kind": "authored-rise-falls",
+                              "detail": f"the wave raises the score {20 * math.log10(rise):.1f} dB into this event "
+                                        f"but the score bus falls {-heard:.1f} LU"})
+    if "premaster" in measured and "master" in measured:
+        offsets = [row["masterLufs"] - row["premasterLufs"] for row in rows
+                   if row.get("masterLufs") is not None and row.get("premasterLufs") is not None
+                   and min(row["masterLufs"], row["premasterLufs"]) > SILENT_LUFS]
+        if offsets:
+            median = float(np.median(offsets))
+            for row in rows:
+                if (row.get("masterLufs") is not None and row.get("premasterLufs") is not None
+                        and min(row["masterLufs"], row["premasterLufs"]) > SILENT_LUFS
+                        and abs(row["masterLufs"] - row["premasterLufs"] - median) > 1.0):
+                    flags.append({"event": row["event"], "kind": "mastering-moved-event-level",
+                                  "detail": f"mastering changed this event by "
+                                            f"{row['masterLufs'] - row['premasterLufs']:.1f} LU against the "
+                                            f"film's {median:.1f} LU"})
+    return {
+        "method": ("BS.1770 momentary loudness (ffmpeg ebur128), energy-averaged over the 400 ms windows "
+                   "wholly inside each event; the score bus is the music stem before sidechain ducking"),
+        "silentBelowLufs": SILENT_LUFS,
+        "events": rows,
+        "flags": flags,
+        "listeningVerdict": None,
+    }
+
+
 def packet_hash(path: Path) -> str:
     result = run(
         [
@@ -747,10 +976,15 @@ def body_mux_command(
     output: Path,
     normalizer: str,
     runtime: float,
+    log_level: str = "error",
 ) -> list[str]:
-    """Return the exact body mux command; intentionally never uses -shortest."""
+    """Return the exact body mux command; intentionally never uses -shortest.
+
+    ``log_level`` changes only what ffmpeg prints (``info`` lets loudnorm report
+    its second pass), never the encoded bytes.
+    """
     return [
-        "ffmpeg", "-y", "-v", "error", "-i", str(picture),
+        "ffmpeg", "-y", *(["-nostats"] if log_level != "error" else []), "-v", log_level, "-i", str(picture),
         "-i", str(premaster), "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-af", normalizer, "-ar", str(SR), "-c:a", "aac",
         "-b:a", "256k", "-t", f"{runtime:.9f}",
@@ -785,27 +1019,35 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
     plan = read_json(paths["editPlan"], "edit plan")
     settings = contract["settings"]
     first_pass = loudness(outputs["premaster"], settings)
+    target_lra = second_pass_lra(settings, first_pass)
     norm = (
         f"loudnorm=I={settings['targetIntegratedLufs']}:TP={settings['targetTruePeakDbtp']}:"
-        f"LRA={settings['targetLra']}:measured_I={first_pass['input_i']}:"
+        f"LRA={target_lra}:measured_I={first_pass['input_i']}:"
         f"measured_TP={first_pass['input_tp']}:measured_LRA={first_pass['input_lra']}:"
         f"measured_thresh={first_pass['input_thresh']}:offset={first_pass['target_offset']}:"
-        "linear=true:print_format=summary"
+        "linear=true:print_format=json"
     )
     body_partial = outputs["bodyMaster"].with_name(
         f".{outputs['bodyMaster'].name}.{os.getpid()}.partial.mp4"
     )
     # Exact input durations were already proven. Explicit -t fixes the intended
     # clock without hiding a short stream; -shortest is intentionally absent.
-    run(
+    muxed = run(
         body_mux_command(
             paths["picture"],
             outputs["premaster"],
             body_partial,
             norm,
             contract["runtimeSeconds"],
+            log_level="info",
         )
     )
+    second_pass = second_pass_record(parse_loudnorm(muxed.stderr), target_lra)
+    if second_pass["normalizationType"] == "dynamic":
+        if settings.get("refuseDynamicMastering") is True:
+            body_partial.unlink(missing_ok=True)
+            raise MixError(dynamic_mastering_message(second_pass))
+        print(f"warning: {dynamic_mastering_message(second_pass)}", file=sys.stderr, flush=True)
     run(["ffmpeg", "-v", "error", "-i", str(body_partial), "-f", "null", "-"])
     os.replace(body_partial, outputs["bodyMaster"])
     final_probe = probe_media(outputs["bodyMaster"])
@@ -831,10 +1073,17 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
         raise MixError("picture packets changed during audio mux")
     delivered = loudness(outputs["bodyMaster"], settings)
     if (
-        abs(finite(delivered.get("input_i"), "delivered integrated loudness") + 14.0) > 0.5
-        or finite(delivered.get("input_tp"), "delivered true peak") > -1.0
+        abs(finite(delivered.get("input_i"), "delivered integrated loudness")
+            - settings["targetIntegratedLufs"]) > 0.5
+        or finite(delivered.get("input_tp"), "delivered true peak") > settings["targetTruePeakDbtp"] + 0.5
     ):
         raise MixError("delivered loudness or true peak is outside the acceptance window")
+    wave_targets = None
+    if "musicWaveAudit" in evidence:
+        wave_path = episode_path(episode, evidence["musicWaveAudit"]["path"], "music wave audit")
+        verify_hash(wave_path, evidence["musicWaveAudit"].get("sha256"), "music wave audit")
+        wave_audit = read_json(wave_path, "music wave audit")
+        wave_targets = wave_audit.get("eventTargets") if isinstance(wave_audit, dict) else None
     bus_audit = {
         "schemaVersion": 1,
         "mixerVersion": MIXER_VERSION,
@@ -849,6 +1098,11 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
             "loudness": first_pass,
         },
         "intelligibility": intelligibility(paths["voice"], outputs["premaster"], plan["events"]),
+        "planFollowing": plan_following(
+            plan["events"],
+            {"voice": paths["voice"], "music": paths["music"], "sfx": paths["sfxStem"],
+             "premaster": outputs["premaster"], "master": outputs["bodyMaster"]},
+            plan.get("musicBreaths", []), wave_targets),
         "scoreNotchAutomationAppliedOnlyToMusicBus": contract["scoreNotchAutomation"],
         "creativeApprovalGranted": False,
     }
@@ -867,6 +1121,7 @@ def execute_mix(episode: Path, contract_path: Path, contract: dict[str, Any]) ->
         "contract": {"path": portable(contract_path, episode), "sha256": sha256_file(contract_path)},
         "busAudit": {"path": portable(outputs["busAudit"], episode), "sha256": sha256_file(outputs["busAudit"])},
         "deliveredLoudness": delivered,
+        "loudnormSecondPass": second_pass,
         "picturePacketsUnchanged": True,
         "picturePacketHashes": {
             "source": source_picture_packets,
@@ -888,6 +1143,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--picture", default="work/assembly-v1/picture-720p.mp4")
     parser.add_argument("--voice", default="work/assembly-v1/voice-hi-48k24.wav")
     parser.add_argument("--music", default="work/assembly-v1/music-wave-48k24.wav")
+    parser.add_argument(
+        "--settings", type=Path,
+        help="optional JSON with settingsVersion 2 and the values it changes: musicGainDb -6..6, "
+             "musicDuck/sfxDuck {threshold .005-.1, ratio 1-12, attackMs 1-100, releaseMs 100-1500}, "
+             "targetIntegratedLufs -27..-12, targetTruePeakDbtp -3..-1, targetLra 1..50 or "
+             '"measured", refuseDynamicMastering (default false: a dynamic loudnorm pass warns and '
+             "is recorded). Without it the reviewed v1 defaults apply.")
     parser.add_argument("--write-contract", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--contract", type=Path)
@@ -903,6 +1165,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.contract is not None:
                 raise MixError("--contract is accepted only with --execute")
+            settings = (read_json(episode_path(episode, args.settings, "mixer settings"), "mixer settings")
+                        if args.settings is not None else None)
             contract = build_mix_contract(
                 episode,
                 sfx_input_path=episode_path(episode, args.sfx_input, "SFX input"),
@@ -910,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
                 picture_path=episode_path(episode, args.picture, "picture"),
                 voice_path=episode_path(episode, args.voice, "voice"),
                 music_path=episode_path(episode, args.music, "music"),
+                settings=settings,
             )
             if args.write_contract is not None:
                 target = work_output(episode, args.write_contract, "mix contract output")

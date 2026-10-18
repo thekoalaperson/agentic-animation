@@ -14,6 +14,16 @@ class Ranges(unittest.TestCase):
         self.assertEqual(rows[2]['parentRunOffsetFrames'], 600)
         self.assertEqual(rows[1]['memberSegmentIds'], ['circle'])
 
+    def test_dissolve_run_of_two_sources_is_one_range(self):
+        dissolve = dict(id='p1-dissolve-p2', timelineStart=0, frames=48, role='dissolve-transition-run',
+                        memberSegmentIds=['p1', 'p2'], dissolves=[12],
+                        sources=[dict(frames=30, shownFrames=24), dict(frames=30, shownFrames=24)])
+        rows, total = make_ranges([dissolve, self.row('p3', 48, 10)])
+        self.assertEqual(total, 58)
+        self.assertEqual([(r['id'], r['startFrame'], r['frames']) for r in rows],
+                         [('p1-dissolve-p2', 0, 48), ('p3', 48, 10)])
+        self.assertEqual(rows[0]['memberSegmentIds'], ['p1', 'p2'])
+
     def test_bad_clocks_and_identity_rejected(self):
         for rows in ([], [self.row('p1', 1, 10)], [self.row('p1', 0, 0)],
                      [self.row('p1', 0, 10), self.row('p1', 10, 5)]):

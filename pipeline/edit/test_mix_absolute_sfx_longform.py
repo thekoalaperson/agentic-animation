@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -280,6 +282,226 @@ class MixerFixture(unittest.TestCase):
         with self.assertRaisesRegex(mixer.MixError, "dramaticWave"):
             self.build()
 
+    def rewrite_plan(self, **changes) -> None:
+        plan = {**self.plan, **changes}
+        write_json(self.plan_path, plan)
+        write_json(self.assembly / "music-conform.json", [
+            {"movement": row["movement"], "silence": True, "timelineDuration": row["timelineDuration"]}
+            if row.get("silence") else
+            {"movement": row["movement"], "take": row["take"],
+             "source": str((self.episode / row["track"]).resolve()),
+             "timelineDuration": row["timelineDuration"]}
+            for row in plan["scorePlacements"]])
+        wave = json.loads(self.wave_path.read_text())
+        wave["clockSha256"] = mixer.sha256_file(self.plan_path)
+        write_json(self.wave_path, wave)
+        sfx = copy.deepcopy(self.sfx_contract)
+        sfx["inputEvidence"]["editPlan"]["sha256"] = mixer.sha256_file(self.plan_path)
+        sfx["inputEvidence"]["dramaticWave"]["sha256"] = mixer.sha256_file(self.wave_path)
+        write_json(self.sfx_contract_path, sfx)
+
+    def test_gaps_between_placements_are_silence(self) -> None:
+        first, second = copy.deepcopy(self.plan["scorePlacements"])
+        first["timelineDuration"] = 1.5
+        second["timelineStart"], second["timelineDuration"] = 4.0, 1.0
+        self.rewrite_plan(scorePlacements=[first, second])
+        self.assertEqual(self.build()["runtimeSeconds"], self.runtime)
+        silence = {"movement": "hush", "silence": True, "timelineStart": 1.5,
+                   "timelineDuration": 2.5, "reason": "No one plays here."}
+        self.rewrite_plan(scorePlacements=[first, silence, second])
+        self.build()
+
+    def test_overlap_runtime_escape_and_named_silence_track_are_refused(self) -> None:
+        first, second = copy.deepcopy(self.plan["scorePlacements"])
+        cases = {
+            "overlap": [first, {**second, "timelineStart": 2.5}],
+            "runs past": [first, {**second, "timelineDuration": 3.5}],
+            "must not name": [first, {"movement": "hush", "silence": True, "timelineStart": 3.0,
+                                      "timelineDuration": 1.0, "track": second["track"]}],
+        }
+        for message, rows in cases.items():
+            with self.subTest(message):
+                self.rewrite_plan(scorePlacements=rows)
+                with self.assertRaisesRegex(mixer.MixError, message):
+                    self.build()
+
+    def test_an_empty_score_needs_an_unscored_declaration(self) -> None:
+        self.rewrite_plan(scorePlacements=[])
+        with self.assertRaisesRegex(mixer.MixError, "unscored: true"):
+            self.build()
+        self.rewrite_plan(scorePlacements=[], unscored=True)
+        self.build()
+        self.rewrite_plan(unscored=True)
+        with self.assertRaisesRegex(mixer.MixError, "only silence"):
+            self.build()
+
+    def test_v1_contract_is_unchanged_without_authored_settings(self) -> None:
+        contract = self.build()
+        self.assertEqual(contract["settings"], mixer.default_settings())
+        self.assertNotIn("settingsVersion", contract["settings"])
+        explicit = mixer.build_mix_contract(
+            self.episode, sfx_input_path=self.sfx_contract_path, edit_plan_path=self.plan_path,
+            picture_path=self.picture, voice_path=self.voice, music_path=self.music,
+            probe=self.probe, sfx_revalidator=self.accept_sfx, settings=mixer.default_settings())
+        self.assertEqual(json.dumps(contract, sort_keys=True), json.dumps(explicit, sort_keys=True))
+
+    def test_v2_settings_are_bounded_recorded_and_rebuilt(self) -> None:
+        authored = {"settingsVersion": 2, "musicGainDb": 3.0, "targetLra": "measured",
+                    "musicDuck": {"threshold": 0.05, "ratio": 2.5, "attackMs": 30, "releaseMs": 800},
+                    "targetIntegratedLufs": -20, "refuseDynamicMastering": True,
+                    "reason": "A quiet film that should stay quiet."}
+        contract = mixer.build_mix_contract(
+            self.episode, sfx_input_path=self.sfx_contract_path, edit_plan_path=self.plan_path,
+            picture_path=self.picture, voice_path=self.voice, music_path=self.music,
+            probe=self.probe, sfx_revalidator=self.accept_sfx, settings=authored)
+        settings = contract["settings"]
+        self.assertEqual(settings["musicDuck"]["ratio"], 2.5)
+        self.assertEqual(settings["sfxDuck"], mixer.default_settings()["sfxDuck"])
+        self.assertEqual(settings["targetTruePeakDbtp"], -1.5)
+        self.assertNotEqual(contract["contractFingerprint"], self.build()["contractFingerprint"])
+        saved = self.assembly / "absolute-mix-contract.json"
+        write_json(saved, contract)
+        self.assertEqual(mixer.verify_saved_contract(
+            self.episode, saved, probe=self.probe, sfx_revalidator=self.accept_sfx), contract)
+        self.assertIn("ratio=2.5", mixer.filter_graph(contract))
+        self.assertEqual(mixer.second_pass_lra(settings, {"input_lra": "17.40"}), 17.4)
+        self.assertEqual(mixer.second_pass_lra(settings, {"input_lra": "0.00"}), 1.0)
+        self.assertEqual(mixer.measurement_lra(settings), 11.0)
+
+    def test_v2_settings_may_name_one_sidechain_value_alone(self) -> None:
+        settings = mixer.validate_settings({"settingsVersion": 2, "musicDuck": {"ratio": 3}})
+        self.assertEqual(settings["musicDuck"], {**mixer.default_settings()["musicDuck"], "ratio": 3})
+        self.assertEqual(settings["sfxDuck"], mixer.default_settings()["sfxDuck"])
+        with self.assertRaisesRegex(mixer.MixError, "musicDuck"):
+            mixer.validate_settings({"settingsVersion": 2, "musicDuck": {"knee": 2}})
+
+    def test_v2_settings_out_of_bounds_or_unversioned_are_refused(self) -> None:
+        cases = {
+            "settingsVersion 2": {"musicGainDb": 3.0},
+            "-6..6": {"settingsVersion": 2, "musicGainDb": 9.0},
+            "ratio 1-12": {"settingsVersion": 2, "sfxDuck": {"threshold": 0.02, "ratio": 20,
+                                                             "attackMs": 8, "releaseMs": 360}},
+            "-27..-12": {"settingsVersion": 2, "targetIntegratedLufs": -8},
+            "-3..-1": {"settingsVersion": 2, "targetTruePeakDbtp": -0.5},
+            "measured": {"settingsVersion": 2, "targetLra": "wide"},
+            "boolean": {"settingsVersion": 2, "refuseDynamicMastering": "yes"},
+            "unknown": {"settingsVersion": 2, "limiter": True},
+        }
+        for message, settings in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(mixer.MixError, message):
+                mixer.validate_settings(settings)
+
+    def test_second_pass_type_is_recorded_and_dynamic_names_choices(self) -> None:
+        record = mixer.second_pass_record(
+            {"normalization_type": "dynamic", "input_lra": "18.20", "output_lra": "2.00",
+             "input_i": "-30.1", "output_i": "-14.2"}, 11.0)
+        self.assertEqual((record["normalizationType"], record["inputLra"], record["outputLra"]),
+                         ("dynamic", 18.2, 2.0))
+        message = mixer.dynamic_mastering_message(record)
+        for choice in ("measured", "fixedGainMaster", "refuseDynamicMastering off"):
+            self.assertIn(choice, message)
+        with self.assertRaisesRegex(mixer.MixError, "normalization type"):
+            mixer.second_pass_record({"input_lra": "1"}, 11.0)
+
+    def test_info_log_level_lets_loudnorm_report_a_dynamic_fallback(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is unavailable")
+        # Short loud bursts over a quiet bed: one gain cannot meet -14 LUFS at -1.5 dBTP.
+        source = self.work / "wide.wav"
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "aevalsrc='if(lt(mod(t,10),0.02),0.95,0.03)*sin(2*PI*440*t)':s=48000:d=40",
+                        "-ac", "2", str(source)], check=True)
+        settings = mixer.default_settings()
+        first = mixer.loudness(source, settings)
+        norm = (f"loudnorm=I=-14.0:TP=-1.5:LRA=11.0:measured_I={first['input_i']}:"
+                f"measured_TP={first['input_tp']}:measured_LRA={first['input_lra']}:"
+                f"measured_thresh={first['input_thresh']}:offset={first['target_offset']}:"
+                "linear=true:print_format=json")
+        result = subprocess.run([ffmpeg, "-nostats", "-v", "info", "-i", str(source), "-af", norm,
+                                 "-f", "null", "-"], capture_output=True, check=True)
+        record = mixer.second_pass_record(mixer.parse_loudnorm(result.stderr), 11.0)
+        self.assertEqual(record["normalizationType"], "dynamic")
+
+    def test_plan_following_flags_only_contradictions_of_the_plan(self) -> None:
+        events = [{"id": f"demo-s00{i}", "shot": i, "kind": "narration", "start": float(i - 1),
+                   "end": float(i)} for i in range(1, 5)]
+        levels = {"voice": [-20, -20, -20, -20], "music": [-30, -34, -28, -40],
+                  "premaster": [-19, -19, -19, -19], "master": [-14, -14, -11, -14]}
+
+        def measure(path: Path):
+            values = levels[path.name]
+            return [(round(t / 10 - 0.3, 6), round(t / 10 + 0.1, 6), values[min(3, int(t // 10))])
+                    for t in range(0, 40)]
+
+        buses = {name: Path(name) for name in levels}
+        result = mixer.plan_following(
+            events, buses, [{"shots": [4, 4], "level": 0, "reason": "a held breath"}],
+            [{"shot": i, "envelopeTarget": v} for i, v in enumerate((0.3, 0.6, 0.6, 0.2), 1)],
+            measure=measure)
+        self.assertEqual([row["musicLufs"] for row in result["events"]], [-30.0, -34.0, -28.0, -40.0])
+        kinds = {(flag["event"], flag["kind"]) for flag in result["flags"]}
+        self.assertEqual(kinds, {("demo-s002", "authored-rise-falls"), ("demo-s004", "zero-breath-sounds"),
+                                 ("demo-s003", "mastering-moved-event-level")})
+        self.assertIsNone(result["listeningVerdict"])
+
+    def test_momentary_loudness_reads_ffmpeg_and_hears_silence(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is unavailable")
+        path = self.work / "tone-then-silence.wav"
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "aevalsrc='if(lt(t,2),0.1*sin(2*PI*440*t),0)':s=48000:d=4",
+                        "-ac", "2", str(path)], check=True)
+        windows = mixer.momentary_loudness(path)
+        tone = mixer.event_loudness(windows, 0.0, 2.0)
+        self.assertTrue(-30 < tone < -15, tone)
+        self.assertLessEqual(mixer.event_loudness(windows, 2.0, 4.0), mixer.SILENT_LUFS)
+        self.assertIsNone(mixer.event_loudness(windows, 1.0, 1.2))
+
+    def real_media(self) -> dict:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or b"libx264" not in subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                                          capture_output=True).stdout:
+            self.skipTest("ffmpeg with libx264 is unavailable")
+        quiet = "-v", "error", "-y"
+        subprocess.run([ffmpeg, *quiet, "-f", "lavfi", "-i", "color=c=gray:s=1280x720:r=24",
+                        "-t", "6", "-c:v", "libx264", "-an", str(self.picture)], check=True)
+        for path, expression, codec in ((self.voice, "0.2*sin(2*PI*220*t)", "pcm_s24le"),
+                                        (self.music, "0.05*sin(2*PI*330*t)", "pcm_s24le"),
+                                        (self.sfx_stem, "0", "pcm_f32le")):
+            subprocess.run([ffmpeg, *quiet, "-f", "lavfi", "-i", f"aevalsrc='{expression}':s=48000:d=6",
+                            "-ac", "2", "-c:a", codec, str(path)], check=True)
+        self.sfx_contract["sfxStem"]["sha256"] = mixer.sha256_file(self.sfx_stem)
+        write_json(self.sfx_contract_path, self.sfx_contract)
+        return self.build()
+
+    def test_execute_records_the_second_pass_and_refuses_dynamic_only_when_asked(self) -> None:
+        contract = self.real_media()
+        contract_path = self.assembly / "absolute-mix-contract.json"
+        write_json(contract_path, contract)
+        warnings = io.StringIO()
+        with contextlib.redirect_stderr(warnings):
+            audit = mixer.execute_mix(self.episode, contract_path, contract)
+        second = audit["loudnormSecondPass"]
+        self.assertEqual("dynamic gain" in warnings.getvalue(), second["normalizationType"] == "dynamic")
+        self.assertIn(second["normalizationType"], ("linear", "dynamic"))
+        self.assertEqual(second["targetLra"], 11.0)
+        bus = json.loads((self.assembly / "absolute-mix-bus-audit.json").read_text())
+        self.assertEqual([row["event"] for row in bus["planFollowing"]["events"]],
+                         ["scene-1", "scene-2", "scene-3"])
+        self.assertIsNone(bus["planFollowing"]["listeningVerdict"])
+        # Steady tones measure no loudness range, so loudnorm cannot keep one gain;
+        # the refusal below must be exercised, not skipped.
+        self.assertEqual(second["normalizationType"], "dynamic")
+        master = self.episode / contract["outputs"]["bodyMaster"]
+        master.unlink()
+        refusing = copy.deepcopy(contract)
+        refusing["settings"] = mixer.validate_settings({"settingsVersion": 2, "refuseDynamicMastering": True})
+        with self.assertRaisesRegex(mixer.MixError, "dynamic gain"):
+            mixer.execute_mix(self.episode, contract_path, refusing)
+        self.assertFalse(master.exists())
+
     def test_render_run_must_preserve_semantic_segments_exactly_once(self) -> None:
         path = self.assembly / "picture-render-runs.json"
         runs = json.loads(path.read_text())
@@ -366,6 +588,11 @@ class MixerFixture(unittest.TestCase):
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertNotIn("-shortest", command)
         self.assertEqual(command[command.index("-t") + 1], "6.000000000")
+        self.assertEqual(command[:4], ["ffmpeg", "-y", "-v", "error"])
+        loud = mixer.body_mux_command(self.picture, self.work / "premaster.wav", self.work / "body.mp4",
+                                      "loudnorm=I=-14:TP=-1.5:LRA=11", self.runtime, log_level="info")
+        self.assertEqual([part for part in loud if part not in ("-nostats", "info")],
+                         [part for part in command if part != "error"])
 
     def test_output_guard_refuses_deliverables_and_external_paths(self) -> None:
         with self.assertRaisesRegex(mixer.MixError, "deliverables"):

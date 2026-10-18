@@ -311,6 +311,89 @@ class BilingualSubtitleExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.SubtitleExportError,'Unbound authored subtitle'):
             self.export()
 
+    def make_picture_event(self, index: int = 5) -> str:
+        """Turn one scene into wordless picture: no voice, no cue, no sync row."""
+        plan = read_json(self.plan_path)
+        event = plan["events"][index]
+        for key in ("subtitleAudioAt", "subtitleAudioDuration", "subtitleTextHi", "subtitleTextEn"):
+            event.pop(key)
+        event.update(kind="picture", audio=None, text="")
+        write_json(self.plan_path, plan)
+        for path in (self.hi_path, self.en_path):
+            timing = read_json(path)
+            timing["shots"] = [s for s in timing["shots"] if s["id"] != event["id"]]
+            write_json(path, timing)
+        sync = read_json(self.sync_path)
+        sync["results"] = [r for r in sync["results"] if r["event"] != event["id"]]
+        sync.update(events=len(sync["results"]), planSha256=exporter.sha256_file(self.plan_path))
+        write_json(self.sync_path, sync)
+        return event["id"]
+
+    def test_wordless_picture_event_produces_no_cue(self) -> None:
+        scene_id = self.make_picture_event()
+        audit = self.export()
+        self.assertEqual(audit["sceneCount"], 144)
+        self.assertEqual(audit["cueCount"], 143)
+        self.assertNotIn(scene_id, json.dumps(audit["coverage"]))
+
+    def test_picture_event_cannot_carry_words(self) -> None:
+        self.make_picture_event()
+        plan = read_json(self.plan_path)
+        plan["events"][5]["subtitleTextEn"] = "Words on a wordless shot."
+        write_json(self.plan_path, plan)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "no voice or subtitle text"):
+            self.export()
+
+    def link_passage(self, *, timing: bool = True, dialogue: bool = False) -> None:
+        plan = read_json(self.plan_path)
+        plan["events"][2]["passage"] = "demo-s002"
+        if dialogue:
+            for event in plan["events"][1:3]:
+                event["kind"] = "dialogue"
+        write_json(self.plan_path, plan)
+        for path in (self.hi_path, self.en_path):
+            doc = read_json(path)
+            if timing:
+                doc["shots"][2]["passage"] = "demo-s002"
+            if dialogue:
+                for shot in doc["shots"][1:3]:
+                    shot.update(dialogue=True, speaker="CHARACTER ONE")
+            write_json(path, doc)
+        sync = read_json(self.sync_path)
+        sync["planSha256"] = exporter.sha256_file(self.plan_path)
+        write_json(self.sync_path, sync)
+
+    def test_passage_halves_keep_their_own_cues_and_are_recorded(self) -> None:
+        self.link_passage()
+        audit = self.export()
+        rows = {row["id"]: row for row in audit["coverage"]}
+        self.assertEqual(rows["demo-s003"]["passage"], "demo-s002")
+        self.assertNotIn("passage", rows["demo-s002"])
+        self.assertEqual(audit["cueCount"], 144)
+        [english] = self.output.glob("*-en.srt")
+        cues = english.read_text().split("\n\n")
+        self.assertTrue(any("This is scene number 3." in cue for cue in cues))
+        self.assertFalse(any("number 2." in cue and "number 3." in cue for cue in cues))
+
+    def test_dialogue_passage_halves_keep_their_own_cues_and_are_recorded(self) -> None:
+        self.link_passage(dialogue=True)
+        audit = self.export()
+        rows = {row["id"]: row for row in audit["coverage"]}
+        self.assertEqual(rows["demo-s003"]["passage"], "demo-s002")
+        self.assertNotIn("passage", rows["demo-s002"])
+        for language, second, first in (("hi", "संख्या 3 ", "संख्या 2 "), ("en", "number 3.", "number 2.")):
+            [subtitles] = self.output.glob(f"*-{language}.srt")
+            cues = subtitles.read_text().split("\n\n")
+            # The second half's cues carry only its own words, never the first half's.
+            own = [cue for cue in cues if second in cue]
+            self.assertTrue(own, language)
+            self.assertFalse(any(first in cue for cue in own), language)
+
+    def test_timing_document_must_carry_the_plans_passage(self) -> None:
+        self.link_passage(timing=False)
+        with self.assertRaisesRegex(exporter.SubtitleExportError, "demo-s003.passage"):
+            self.export()
+
 
 if __name__ == "__main__":
     unittest.main()

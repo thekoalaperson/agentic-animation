@@ -12,6 +12,44 @@ import re
 import numpy as np
 
 SR = 48000
+# What a source batch declares it came from, and the route its receipt names.
+# A generated batch declares ``model`` (the qualified Small-SFX model when it
+# names none); a recorded or library batch declares ``route`` below instead.
+SFX_MODELS = {
+    'stabilityai/stable-audio-3-small-sfx': 'self-hosted-text-to-audio/StableAudio3-Small-SFX+deterministic-edits',
+}
+DEFAULT_SFX_MODEL = 'stabilityai/stable-audio-3-small-sfx'
+RECORDED_ROUTE = 'recorded-or-library'
+RECORDED_RECEIPT_ROUTE = 'recorded-or-library-sound+deterministic-edits'
+
+
+def source_route(brief):
+    """The declared origin of one batch: a known model, or recorded/library sound."""
+    if brief.get('route') == RECORDED_ROUTE:
+        if 'model' in brief:
+            raise RuntimeError('A recorded or library batch names no generation model')
+        for job in brief['jobs']:
+            terms = job.get('licence', job.get('terms'))
+            if (job.get('prompt') is not None or not str(job.get('origin') or '').strip()
+                    or not isinstance(terms, str) or not terms.strip()):
+                raise RuntimeError('A recorded or library source has prompt null, an origin and a licence or terms record: '
+                                   + str(job.get('id')))
+        return RECORDED_ROUTE
+    model = brief.get('model', DEFAULT_SFX_MODEL)
+    if model not in SFX_MODELS:
+        raise RuntimeError('This renderer has no qualified route for SFX model ' + str(model))
+    if any(job.get('prompt') is None for job in brief['jobs']):
+        raise RuntimeError('A generated SFX job keeps the prompt it was generated from')
+    return model
+
+
+def receipt_route(routes):
+    """One receipt route per kind of source, so a receipt says what it mixed."""
+    names = sorted({RECORDED_RECEIPT_ROUTE if route == RECORDED_ROUTE else SFX_MODELS[route]
+                    for route in routes.values()})
+    return ' + '.join(names) if names else SFX_MODELS[DEFAULT_SFX_MODEL]
+
+
 def sha(p):
     h=hashlib.sha256()
     with Path(p).open('rb') as f:
@@ -79,7 +117,7 @@ def load_contract(ep, m):
             raise RuntimeError('Picture duration does not match current clock')
     if plan.get('episode')!=m['episode'] or read(wave).get('clockSha256')!=m['clock']['sha256']:
         raise RuntimeError('SFX wave and episode must bind the exact current clock')
-    batches={}
+    batches={}; routes={}
     for key,spec in m['sourceBatches'].items():
         brief_path=bound_file(ep,spec['brief']); audit_path=bound_file(ep,spec['audit'])
         if brief_path.parent!=audit_path.parent:
@@ -87,8 +125,7 @@ def load_contract(ep, m):
         brief=read(brief_path); audit=read(audit_path)
         if not audit['technicalPass'] or audit['briefSha256']!=spec['brief']['sha256'] or brief['generationApiAllowed'] is not False:
             raise RuntimeError('Unverified self-hosted SFX batch')
-        if brief.get('model','stabilityai/stable-audio-3-small-sfx')!='stabilityai/stable-audio-3-small-sfx':
-            raise RuntimeError('This renderer contract supports the qualified Stable Audio SFX route only')
+        routes[key]=source_route(brief)
         ids=[j['id'] for j in brief['jobs']]; verified_ids=[r['id'] for r in audit['outputs']]
         if len(ids)!=len(set(ids)) or len(verified_ids)!=len(set(verified_ids)) or set(ids)!=set(verified_ids):
             raise RuntimeError('Duplicate or incomplete SFX batch identities')
@@ -118,7 +155,8 @@ def load_contract(ep, m):
             raise RuntimeError('A cross-scene SFX tail needs an editorial reason')
     return batches,plan,picture,read(wave),dict(clockSha256=sha(clock),dramaticWaveSha256=sha(wave),
         workingAudioOnly=working,finalApproved=False if working else m.get('finalApproved',False),
-        sourceBatches=m['sourceBatches'],picturePlanSha256=None if working else m['picture']['sha256'])
+        sourceBatches=m['sourceBatches'],picturePlanSha256=None if working else m['picture']['sha256'],
+        sourceRoutes=routes)
 
 def render(ep,root):
     if sys.platform!='linux' or not shutil.which('nvidia-smi'):
@@ -180,9 +218,10 @@ def render(ep,root):
         out=dest/(c['id']+'.wav');save(out,a)
         overlapping=[dict(id=p['id'],start=p['timelineStart'],end=p['timelineStart']+p['duration']) for p in picture if p['timelineStart']<c['at']+len(a)/SR and p['timelineStart']+p['duration']>c['at']]
         w=waves[c['shot']]
-        rows.append(dict(**c,source=str(src),sourceSha256=sha(src),sourcePrompt=job['prompt'],edited=str(out),sha256=sha(out),duration=len(a)/SR,
-                         filters=filters,tempoOutputLengthCorrectionSeconds=-length_error,gainDb=gain,peakSafetyGain=safety,
-                         emotion=emotion_values(w),picture=overlapping))
+        origin={k:job[k] for k in ('origin','licence','terms') if k in job}
+        rows.append({**c,'source':str(src),'sourceSha256':sha(src),'sourcePrompt':job['prompt'],**origin,'edited':str(out),'sha256':sha(out),'duration':len(a)/SR,
+                     'filters':filters,'tempoOutputLengthCorrectionSeconds':-length_error,'gainDb':gain,'peakSafetyGain':safety,
+                     'emotion':emotion_values(w),'picture':overlapping})
         print(c['id'],round(len(a)/SR,3),flush=True)
     assert np.max(np.abs(stem))<.95
     if sha(root/'design.json')!=design_digest:
@@ -190,7 +229,7 @@ def render(ep,root):
     # Revalidate the exact immutable contracts before publishing a success receipt.
     load_contract(ep,json.loads(original_design))
     out=root/'sfx-48kf32.wav';save(out,stem)
-    result=dict(route='self-hosted-text-to-audio/StableAudio3-Small-SFX+deterministic-edits',authority=m['authority'],
+    result=dict(route=receipt_route(contract.get('sourceRoutes',{})),authority=m['authority'],
                 designSha256=design_digest,rendererSha256=sha(__file__),computeHost=socket.gethostname(),**contract,
                 stem=str(out),sha256=sha(out),seconds=n/SR,placements=len(rows),cues=rows,
                 sampleRate=SR,channels=2,frames=n,codec='pcm_f32le',peakLinear=float(np.max(np.abs(stem))),

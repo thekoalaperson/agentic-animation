@@ -18,6 +18,12 @@ def write_test_wav(path, samples):
 
 
 class WorkingReviewTests(unittest.TestCase):
+    def test_take_sequence_names_an_authored_silence(self):
+        conform = [{"movement": "m1", "take": 2, "repriseJoins": []},
+                   {"movement": "hush", "silence": True, "repriseJoins": []},
+                   {"movement": "m2", "take": 1, "repriseJoins": []}]
+        self.assertEqual(working.take_sequence(conform), [2, "silence", 1])
+
     def test_local_protection_is_bounded_and_covers_edge_syllables(self):
         plan = {"runtimeSeconds": 20, "events": [{"id": "s1", "start": 2, "end": 10}]}
         def audit(level, kind="narration"):

@@ -148,6 +148,18 @@ def validate_edit_plan(plan: dict[str, Any], expected_scenes: int) -> tuple[list
     return events, fingerprint, runtime, fps
 
 
+def spoken_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Events that carry words; a wordless picture event produces no cue."""
+    result = []
+    for event in events:
+        if event.get("kind") == "picture":
+            if event.get("subtitleTextHi") or event.get("subtitleTextEn") or event.get("audio"):
+                raise SubtitleExportError(f"Picture event {event['id']} must carry no voice or subtitle text")
+            continue
+        result.append(event)
+    return result
+
+
 def _validate_timing_document(
     doc: dict[str, Any],
     language: str,
@@ -191,6 +203,8 @@ def _validate_timing_document(
                 raise SubtitleExportError(f"{language} timing changed {scene_id}.{key}")
         if shot.get("dialogue") is not (event.get("kind") == "dialogue"):
             raise SubtitleExportError(f"{language} timing changed {scene_id}.dialogue")
+        if shot.get("passage") != event.get("passage"):
+            raise SubtitleExportError(f"{language} timing changed {scene_id}.passage")
         expected_text = event.get("subtitleTextHi" if language == "hi" else "subtitleTextEn")
         text = shot.get("text")
         if not isinstance(text, str) or not text.strip() or text != expected_text:
@@ -419,6 +433,8 @@ def build_synchronized_cues(
                 "cueCount": count,
                 "partitionPolicy": 'authored-paired-clauses' if authored else 'balanced-word-partition',
                 "timingPolicy": 'proportional-within-complete-utterance; not forced alignment',
+                # One utterance split across two clips: each half's cues carry only its own words.
+                **({"passage": hi_shot["passage"]} if hi_shot.get("passage") else {}),
             }
         )
     validate_cues(result["hi"], "hi")
@@ -520,15 +536,16 @@ def export_subtitles(
     if expected_scenes <= 0:
         raise SubtitleExportError("The frozen edit plan must contain at least one scene")
     events, fingerprint, runtime, fps = validate_edit_plan(plan, expected_scenes)
-    hi_shots = _validate_timing_document(hi_doc, "hi", events, fingerprint, runtime)
-    en_shots = _validate_timing_document(en_doc, "en", events, fingerprint, runtime)
+    spoken = spoken_events(events)
+    hi_shots = _validate_timing_document(hi_doc, "hi", spoken, fingerprint, runtime)
+    en_shots = _validate_timing_document(en_doc, "en", spoken, fingerprint, runtime)
     validate_bilingual_geometry(hi_shots, en_shots)
     master_sha, master_duration = validate_master_evidence(
         master,
         clock,
         sync,
         plan_path,
-        events,
+        spoken,
         runtime,
         fps,
         max_master_tail_seconds,

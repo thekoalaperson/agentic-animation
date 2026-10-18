@@ -235,6 +235,8 @@ def main(argv=None):
                     help='Metadata/hash pass only; no media decode, processing or sheets')
     ap.add_argument('--overrides', type=Path,
                     help='Versioned episode-owned text/speaker corrections; originals survive')
+    ap.add_argument('--storyboard', type=Path, default=Path('story/storyboard_plan.json'),
+                    help='Storyboard inside the episode, for an alternate cut; default story/storyboard_plan.json')
     args=ap.parse_args(argv)
     if args.inventory_only and args.sheets:
         ap.error('--inventory-only cannot render sheets')
@@ -247,7 +249,10 @@ def main(argv=None):
     ep=args.episode.resolve()
     repo=args.source_root.resolve() if args.source_root else ep
     work=ep/args.work
-    board_path=ep/'story/storyboard_plan.json'
+    board_path=(ep/args.storyboard).resolve()
+    if not board_path.is_relative_to(ep):
+        ap.error('--storyboard must be inside the episode')
+    alternate_board=board_path!=(ep/'story/storyboard_plan.json').resolve()
     manifest_path=ep/'story/generation_manifest.json'
     board=json.loads(board_path.read_text())
     manifest=json.loads(manifest_path.read_text())
@@ -263,7 +268,7 @@ def main(argv=None):
     for row in board['stills']:
         key=row['still_id']
         change = overrides.get(key, {})
-        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason'}:
+        if set(change) - {'speaker', 'narration_hi', 'narration_en', 'reason', 'delivery', 'voice', 'passage'}:
             raise ValueError('Unsupported override fields: ' + key)
         row = {**row, **change}
         rec=records[key]
@@ -276,6 +281,15 @@ def main(argv=None):
         if not recorded_still or recorded_still != sha(still):
             raise ValueError('Still bytes do not match registered sidecar: ' + key)
         speaker=row.get('speaker') or ''
+        if row.get('delivery') == 'wordless':
+            if speaker:
+                raise ValueError('A wordless row cannot name a lip-sync speaker: ' + key)
+            # Picture only: no narration item and no dialogue job.
+            rows.append(dict(id=key, speaker='', delivery='wordless', still=str(still),
+                stillSha256=sha(still), stillSidecar=str(provenance), stillSidecarSha256=sha(provenance),
+                beat=row.get('beat'), historicalH3InputByteBinding='unavailable in original sidecar',
+                status='candidate; no human motion verdict found'))
+            continue
         display=row['narration_hi']
         text=display
         # The speaker column identifies the performer. The authored text is
@@ -289,8 +303,11 @@ def main(argv=None):
         if speaker:
             dialogues.append(r)
         else:
+            if row.get('voice'):
+                r['voice']=row['voice']
             narration.append(dict(id=key+'-hi',shotId=key,language='hi',
                 displayText=text,text=text,role='narration',
+                **({'speaker':row['voice']} if row.get('voice') else {}),
                 output=f'audio/narration-v1/{key}-hi.mp3'))
     sources=args.h3_sources.resolve() if args.h3_sources else None
     if sources is not None and not sources.is_dir():
@@ -327,9 +344,14 @@ def main(argv=None):
         _common.atomic_json(work / PREVIEW_SHEETS / 'sheet-audit.json', audit)
         print(json.dumps(dict(stills=len(rows), sheets=len(written), preview=True)))
         return
+    # The inventory counts rows, one job each, so both halves of a passage count here;
+    # the compiler's and the timeline's counts are utterances and count a passage once.
     save(work/'inventory.json',dict(episode=manifest['episode'],
+         **({'storyboard':str(board_path.relative_to(ep))} if alternate_board else {}),
          boardSha256=sha(board_path),manifestSha256=sha(manifest_path),
          count=len(rows),narrationCount=len(narration),dialogueCount=len(dialogues),
+         **({'wordlessCount':sum(r.get('delivery')=='wordless' for r in rows)}
+            if any(r.get('delivery')=='wordless' for r in rows) else {}),
          historicalH3Count=len(available),missingH3Count=len(rows)-len(available),
          inventoryOnly=args.inventory_only,
          overridesPath=str(args.overrides.resolve()) if args.overrides else None,

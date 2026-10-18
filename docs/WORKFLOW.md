@@ -12,10 +12,12 @@ sequences. Choose the amount of process that helps the work.
 | Generate hosted motion/dialogue | `kie_video.py`, `kie_dialogue_finite.py` |
 | Generate narration or score | `eleven_batch_finite.py`, `kie_music_finite.py` |
 | Run H3 jobs and ingest picture | `h3/stage_finite.py`, `h3/box/finite_client.py`, `h3/ingest_finite.py` |
+| Read a screenplay into source units | `edit/read_screenplay.py` |
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
 | Look and listen before paying, on any host with ffmpeg | `edit/render_timed_animatic.py --preview`, `edit/prepare_episode_production.py --sheets --preview`, `prepare_dialogue_review.py --preview`, `h3/review_finite.py --preview-sheets`, `--audition` on `music_candidate_ranker.py`, `edit/render_working_music.py` and `edit/build_working_audio.py` |
-| Assemble a measured timeline | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
-| Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
+| Admit reviewed takes to the timeline | `edit/admit_review_decisions.py` |
+| Assemble a measured timeline (its `--help` lists every rhythm control and its default) | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
+| Make, design and mix sound | `open_media/build_stable_audio_review_brief.py`, `open_media/run_stable_audio_probe.py`, `open_media/verify_stable_audio_review.py`, `edit/render_designed_sfx.py`, `edit/validate_absolute_sfx_mix_input.py`, `edit/mix_absolute_sfx_longform.py`, `edit/revise_master_sound.py` |
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
 | Reuse HD picture or change its audio | `open_media/build_hd_range_plan.py`, `open_media/hd_audio_remux.py` |
 | Package selected deliverables | `edit/package_hindi_delivery.py`, `edit/package_hindi_longform.py` |
@@ -33,6 +35,60 @@ preset supports Hindi performance and Hindi/English subtitles. That describes
 what has been implemented and exercised, not what every film should be.
 [Video models](VIDEO-MODELS.md) separates what each motion runner sends and
 enforces from what its provider publishes.
+
+A row of the film can be spoken on camera, heard over picture, or wordless, and
+the pipe script's optional fifth column, `delivery`, says which. `synced` (the
+default for a named speaker) routes the line to a lip-sync take. `unsynced`
+keeps the speaker's name as `voice` and sends the line through the narration
+lane, clocked by its measured file, with subtitles that name that voice;
+`Narrator` is shorthand for this. A `wordless` row is written with the speaker
+`-` and empty text and becomes a picture event with no voice, no breath and no
+subtitle cue. The storyboard row may carry the same `delivery` and `voice`; a
+row heard over picture has no `speaker` on the storyboard either, because the
+timeline routes any storyboard speaker to a lip-sync take. A
+picture row is clocked by its accepted take (`durationRule: take`, the default)
+or by an authored hold (`holdSeconds` or `holdFrames` on the storyboard row, a
+whole number of frames)
+that the timeline fills by trimming accepted, hash-bound segments; a shortfall
+is reported like any other coverage deficit. One cost to know before choosing:
+an `unsynced` line in the ElevenLabs lane is a second voice for that character
+and will not match the same character's on-camera Grok voice. The other way to
+put a character's voice over other picture is a Grok take of that speaker
+whose picture is covered, for part of the line or all of it, by a picture
+window: other accepted picture played under the take's own audio. It carries
+its own identity trade-offs.
+
+Where a cut falls is also authored in the timeline inputs, not fixed by row
+order. A dialogue scene may set its own handles, cover seconds of its picture
+with an accepted segment or with another admitted clip's picture outside that
+clip's measured speech, and let its own room sound run on before or after its
+kept window. A boundary may dissolve or dip through a colour instead of cutting,
+and a film may set a matte or a stepped cadence. When a picture window carries
+on the neighbouring picture's frames, the edit plan names the J or L cut. Each
+of these is bounded by frames and audio the reviewed media already holds; when
+none is authored the cut is what it always was.
+
+How the film sounds is authored the same way. The score may play under some
+events and not others: a gap between score placements is silence, a placement
+may name a silence, and a film may declare itself `unscored`. A line may keep
+its own level after the shared speech target (`voiceGains`). The score may
+follow the dramatic wave on a shape the film sets, or keep each take's own
+dynamics (`musicShaping`). The mixer's balance and loudness targets may be set
+within bounds (`mix_absolute_sfx_longform.py --settings`). Mastering records
+whether loudnorm reached its target with one gain or by riding the level;
+`refuseDynamicMastering` makes the second a refusal. An effects batch names its
+model, or is recorded or library sound with its origin and licence or terms
+written beside its hash; licence terms change, so note the date and verify
+current terms. When none of this is authored the mix is what it always was.
+
+The screenplay reader lists what the source contains and chooses no shots; how
+rows divide it is the director's call. A storyboard row may cite the units it
+draws on in `source_units`, and a row that continues the speech of the row
+before it may name that row in `passage`, each half keeping its own words. The
+compiler and timeline audits then count the pair as one utterance, while the
+production inventory still counts each row, since each half is its own job. The
+reader's `--units` report then shows reorderings, cuts, merges and changed
+lines as choices to see, not faults.
 
 Research, source grounding, animatics, auditions, and reviews are useful when
 they resolve a real uncertainty. They do not need to become rituals. Make an

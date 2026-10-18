@@ -111,8 +111,8 @@ def validate_picture_ownership(plan: dict, segments: list[dict]) -> None:
         if (not owner or not ids or len(set(ids))!=len(ids) or len(positions)!=len(ids)
                 or positions!=list(range(positions[0],positions[0]+len(ids)))
                 or [events[i]['id'] for i in positions]!=ids
-                or any(events[i]['kind']!='narration' for i in positions)):
-            raise RuntimeError('Picture ownership must cover ordered contiguous narration events')
+                or any(events[i]['kind'] not in ('narration','picture') for i in positions)):
+            raise RuntimeError('Picture ownership must cover ordered contiguous narration or picture events')
         start=round(events[positions[0]]['start']*FPS)
         end=round(events[positions[-1]]['end']*FPS)
         owned=[s for s in segments if s.get('sceneId')==owner]
@@ -135,7 +135,10 @@ def build_picture_segments(ep: Path, plan: dict) -> list[dict]:
             candidate = block["candidates"][0]
             if isinstance(candidate, str):
                 candidate = {"path": candidate}
-            candidates = [dict(candidate, role="dialogue-fixed-sync")]
+            # A picture window names its own source, hash and role; the native
+            # part keeps the fixed-sync role it always had.
+            role = candidate["role"] if candidate.get("pictureWindow") else "dialogue-fixed-sync"
+            candidates = [dict(candidate, role=role)]
         else:
             candidates = block["candidates"]
         for candidate in candidates:
@@ -210,6 +213,105 @@ def build_picture_segments(ep: Path, plan: dict) -> list[dict]:
     return result
 
 
+TRANSITION_OUT_KEYS = ("fadeOut", "dissolveOut")
+TRANSITION_IN_KEYS = ("fadeIn", "dissolveIn")
+DIP_COLOURS = {"dip-to-black": "black", "dip-to-white": "white"}
+
+
+def apply_transitions(segments: list[dict], transitions: list[dict]) -> None:
+    """Mark the two picture segments on each side of an authored transition.
+
+    A dip fades the outgoing segment's last frames to a colour and the incoming
+    segment's first frames up from it. A dissolve names how many unused frames
+    each side lends to the overlap; ``group_dissolve_runs`` renders the pair
+    as one run. Segments without a transition are left exactly as they were.
+    """
+    for transition in transitions:
+        boundary = transition.get("timelineFrame")
+        cut = next((k for k in range(len(segments) - 1)
+                    if round((segments[k]["timelineStart"] + segments[k]["duration"]) * FPS) == boundary
+                    and round(segments[k + 1]["timelineStart"] * FPS) == boundary), None)
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or cut is None:
+            raise RuntimeError(f"Transition after {transition.get('after')} has no picture cut to sit on")
+        outgoing, incoming = segments[cut], segments[cut + 1]
+        kind, frames = transition.get("kind"), transition.get("frames")
+        shown_out, shown_in = transition.get("outgoingFrames"), transition.get("incomingFrames")
+        tail, head = transition.get("outgoingUnusedTailFrames"), transition.get("incomingUnusedHeadFrames")
+        counts = (frames, shown_out, shown_in, tail, head)
+        if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in counts) or frames < 2
+                or shown_out > outgoing["frames"] or shown_in > incoming["frames"]):
+            raise RuntimeError(f"Transition after {transition.get('after')} has invalid frame counts")
+        if kind in DIP_COLOURS:
+            if (tail, head) != (0, 0) or shown_out + shown_in != frames or shown_out >= outgoing["frames"]:
+                raise RuntimeError("A dip uses only frames the cut already shows, ending on its colour")
+            if shown_out:
+                outgoing["fadeOut"] = {"frames": shown_out, "colour": DIP_COLOURS[kind]}
+            if shown_in:
+                incoming["fadeIn"] = {"frames": shown_in, "colour": DIP_COLOURS[kind]}
+        elif kind == "dissolve":
+            if tail + head != frames or (shown_out, shown_in) != (head, tail):
+                raise RuntimeError("A dissolve overlaps exactly the unused frames each side lends")
+            outgoing["dissolveOut"] = {"frames": frames, "unusedTailFrames": tail}
+            incoming["dissolveIn"] = {"frames": frames, "unusedHeadFrames": head}
+        else:
+            raise RuntimeError(f"Unknown transition kind {kind!r}")
+
+
+def group_dissolve_runs(runs: list[dict]) -> list[dict]:
+    """Render runs joined by dissolves as one run of two or more sources.
+
+    Each member keeps its own source window and gains only the unused frames
+    it lends to the overlap. The joined run covers exactly the members'
+    delivery frames, so the concat list and the frame-count guard are unchanged.
+    """
+    result: list[dict] = []
+    for run in runs:
+        if result and "dissolveIn" in run:
+            group = result[-1]
+            if "dissolveOut" not in (group["sources"][-1] if "sources" in group else group):
+                raise RuntimeError("Dissolve has no outgoing run beside it")
+            if "sources" not in group:
+                group = {"sources": [dict(group)], "dissolves": []}
+                result[-1] = group
+            group["sources"].append(dict(run))
+            group["dissolves"].append(int(run["dissolveIn"]["frames"]))
+            continue
+        result.append(run)
+    grouped = []
+    for item in result:
+        if "sources" not in item:
+            # An authored dissolve renders or refuses; it never falls back to a cut.
+            if any(key in item for key in ("dissolveIn", "dissolveOut")):
+                raise RuntimeError(f"Dissolve at {item['id']} has no run on its other side")
+            grouped.append(item)
+            continue
+        parts = []
+        for part in item["sources"]:
+            speed = float(part["speed"])
+            head = int(part.get("dissolveIn", {}).get("unusedHeadFrames", 0))
+            tail = int(part.get("dissolveOut", {}).get("unusedTailFrames", 0))
+            extended = dict(part, sourceStart=float(part["sourceStart"]) - head * speed / FPS,
+                            sourceDuration=float(part["sourceDuration"]) + (head + tail) * speed / FPS,
+                            frames=int(part["frames"]) + head + tail, shownFrames=int(part["frames"]))
+            if extended["sourceStart"] < -1e-9:
+                raise RuntimeError("Dissolve head reaches before its source")
+            parts.append(extended)
+        first, last = item["sources"][0], item["sources"][-1]
+        grouped.append({
+            "id": f"{first['id']}-dissolve-{last['id']}",
+            "role": "dissolve-transition-run",
+            "timelineStart": first["timelineStart"],
+            "duration": sum(float(p["duration"]) for p in item["sources"]),
+            "frames": sum(int(p["frames"]) for p in item["sources"]),
+            "sources": parts,
+            "dissolves": item["dissolves"],
+            "memberSegmentIds": [m for p in item["sources"] for m in p["memberSegmentIds"]],
+            "memberBlocks": [m for p in item["sources"] for m in p["memberBlocks"]],
+            "memberRoles": [m for p in item["sources"] for m in p["memberRoles"]],
+        })
+    return grouped
+
+
 def coalesce_render_segments(segments: list[dict]) -> list[dict]:
     """Merge exact adjacent windows for rendering while preserving the role ledger.
 
@@ -244,10 +346,16 @@ def coalesce_render_segments(segments: list[dict]) -> list[dict]:
             - float(current["timelineStart"])
         ) <= 1e-6
         same_speed = abs(float(prior["speed"]) - float(current["speed"])) <= 1e-9
+        # An authored transition is a boundary the picture must keep.
+        transition_between = any(key in prior for key in TRANSITION_OUT_KEYS) or any(
+            key in current for key in TRANSITION_IN_KEYS)
         if not (same_source and source_contiguous and timeline_contiguous and same_speed
-                and prior.get('crop') == current.get('crop')):
+                and prior.get('crop') == current.get('crop')) or transition_between:
             runs.append(current)
             continue
+        for key in TRANSITION_OUT_KEYS:
+            if key in current:
+                prior[key] = current[key]
         prior["id"] = f"{prior['memberSegmentIds'][0]}-{current['id']}"
         prior["sourceDuration"] = float(prior["sourceDuration"]) + float(
             current["sourceDuration"]
@@ -261,13 +369,46 @@ def coalesce_render_segments(segments: list[dict]) -> list[dict]:
     return runs
 
 
-def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
-    key = hashlib.sha256(json.dumps({
+def frame_filters(frame: dict | None, width: int, height: int) -> tuple[str, str]:
+    """Filters for an authored film-wide matte and stepped cadence.
+
+    ``aspectRatio`` crops the fitted picture to that shape and letterboxes or
+    pillarboxes it back into the unchanged delivery container. ``cadence``
+    holds each picture frame for that many delivery frames; the delivery clock
+    and frame count are unchanged.
+    """
+    if not frame:
+        return "", ""
+    matte = ""
+    ratio = frame.get("aspectRatio")
+    if ratio is not None:
+        if ratio > width / height:
+            inner = max(2, round(width / ratio / 2) * 2)
+            matte = f"crop={width}:{inner}:0:{(height - inner) // 2},pad={width}:{height}:0:{(height - inner) // 2}:black,"
+        elif ratio < width / height:
+            inner = max(2, round(height * ratio / 2) * 2)
+            matte = f"crop={inner}:{height}:{(width - inner) // 2}:0,pad={width}:{height}:{(width - inner) // 2}:0:black,"
+    cadence = frame.get("cadence")
+    stepped = f"fps={FPS}/{cadence}:eof_action=pass,fps={FPS}," if cadence else ""
+    return matte, stepped
+
+
+def render_segment(item: dict, cache: Path, width: int, height: int, frame: dict | None = None) -> Path:
+    if "sources" in item:
+        return render_dissolve_run(item, cache, width, height, frame)
+    identity = {
         "source": item["sourceSha256"], "start": item["sourceStart"],
         "sourceDuration": item["sourceDuration"], "speed": item["speed"],
         "frames": item["frames"], "width": width, "height": height,
         "crop": item.get("crop"),
-    }, sort_keys=True).encode()).hexdigest()[:20]
+    }
+    fades = {key: item[key] for key in ("fadeIn", "fadeOut") if key in item}
+    if fades:
+        identity["fades"] = fades  # absent for an ordinary cut, so its cache key is unchanged
+    if frame:
+        identity["frame"] = frame
+    matte, stepped = frame_filters(frame, width, height)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     output = cache / f"{item['id']}-{key}.mp4"
     if output.exists():
         return output
@@ -288,7 +429,14 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
         f"{crop_filter}"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-        f"fps={FPS},format=yuv420p"
+        f"{matte}fps={FPS},{stepped}"
+        + "".join(f"fade=t=in:s=0:n={fade['frames']}:c={fade['colour']}," for fade in [item.get("fadeIn")] if fade)
+        # ffmpeg reaches the colour one frame after a fade-out's last frame, so
+        # start one frame earlier: the segment's final frame is then the colour,
+        # as a fade-in's first frame is.
+        + "".join(f"fade=t=out:s={max(0, int(item['frames']) - fade['frames'] - 1)}:n={fade['frames']}:c={fade['colour']},"
+                  for fade in [item.get("fadeOut")] if fade)
+        + "format=yuv420p"
     )
     run([
         "ffmpeg", "-y", "-v", "error", "-ss", item["sourceStart"],
@@ -300,10 +448,44 @@ def render_segment(item: dict, cache: Path, width: int, height: int) -> Path:
     return output
 
 
+def render_dissolve_run(item: dict, cache: Path, width: int, height: int, frame: dict | None = None) -> Path:
+    """Render each source of a dissolve run, then overlap them with ``xfade``."""
+    parts = [render_segment(dict(part, id=f"{item['id']}-s{index}"), cache, width, height, frame)
+             for index, part in enumerate(item["sources"])]
+    key = hashlib.sha256(json.dumps({"parts": [path.name for path in parts], "dissolves": item["dissolves"],
+                                     "frames": item["frames"]}).encode()).hexdigest()[:20]
+    output = cache / f"{item['id']}-{key}.mp4"
+    if output.exists():
+        return output
+    graph, label, length = [], "[i0]", int(item["sources"][0]["frames"])
+    for index in range(len(parts)):
+        graph.append(f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={FPS}[i{index}]")
+    for index, frames in enumerate(item["dissolves"], 1):
+        offset = length - frames
+        graph.append(f"{label}[i{index}]xfade=transition=fade:duration={frames / FPS:.9f}:"
+                     f"offset={offset / FPS:.9f}[x{index}]")
+        label = f"[x{index}]"
+        length += int(item["sources"][index]["frames"]) - frames
+    if length != int(item["frames"]):
+        raise RuntimeError(f"Dissolve run {item['id']} does not cover its delivery frames")
+    partial = output.with_suffix(".partial.mp4")
+    inputs = [arg for path in parts for arg in ("-i", path)]
+    run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex",
+         ";".join(graph) + f";{label}format=yuv420p[out]", "-map", "[out]", "-an",
+         "-frames:v", item["frames"], "-c:v", "libx264", "-preset", "veryfast", "-crf", 18,
+         "-threads", 3, "-g", FPS * 2, "-pix_fmt", "yuv420p", partial])
+    partial.replace(output)
+    return output
+
+
 def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> Path:
     segments = build_picture_segments(ep, plan)
+    if plan.get("transitions"):
+        apply_transitions(segments, plan["transitions"])
     (work / "picture-segments.json").write_text(json.dumps(segments, indent=2) + "\n")
     render_runs = coalesce_render_segments(segments)
+    if plan.get("transitions"):
+        render_runs = group_dissolve_runs(render_runs)
     (work / "picture-render-runs.json").write_text(
         json.dumps(render_runs, indent=2) + "\n"
     )
@@ -311,7 +493,7 @@ def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> 
     cache.mkdir(exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         rendered = list(
-            pool.map(lambda x: render_segment(x, cache, width, height), render_runs)
+            pool.map(lambda x: render_segment(x, cache, width, height, plan.get("frame")), render_runs)
         )
     listing = work / f"concat-{height}p.txt"
     # MP4 format.duration rounds some24fps clips to milliseconds. Repeated
@@ -335,11 +517,57 @@ def build_picture(ep: Path, work: Path, plan: dict, width: int, height: int) -> 
     return output
 
 
+def place_audio_overlaps(stem: np.ndarray, source: Path, event: dict, source_start: float,
+                         gain: float) -> dict:
+    """Play an authored lead or tail of the event's own native audio across a cut.
+
+    The kept window is decoded, levelled and placed exactly as without an
+    overlap; each overlap is decoded on its own from the native audio beyond
+    that window, at the same gain, and ramped with the same sine curve as
+    ``fade`` so the bed enters or leaves smoothly. It never exceeds its
+    authored length, so the "voice exceeds event" bound still holds.
+    """
+    placed = {}
+    for key in ("audioLead", "audioTail"):
+        overlap = event.get(key)
+        if not overlap:
+            continue
+        seconds = float(overlap["seconds"])
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise RuntimeError(f"{key} of {event['id']} must be positive")
+        if key == "audioLead":
+            start, timeline_at = source_start - seconds, float(event["start"]) - seconds
+        else:
+            start = source_start + float(event["audioSourceDuration"])
+            timeline_at = float(event["start"]) + float(event["audioSourceDuration"])
+        if start < -1e-9 or timeline_at < -1e-9:
+            raise RuntimeError(f"{key} of {event['id']} reaches before its clip or the film")
+        piece = audio(source, f"atrim=start={max(start, 0):.9f}:duration={seconds:.9f},asetpts=PTS-STARTPTS")
+        room = round(seconds * SR)
+        if len(piece) > room + 1024:
+            raise RuntimeError(f"{key} of {event['id']} exceeds its authored length")
+        piece = piece[:room] * gain
+        n = len(piece)
+        if n:
+            curve = np.sin(np.linspace(0, math.pi / 2, n, dtype=np.float32))[:, None]
+            piece *= curve if key == "audioLead" else curve[::-1]
+        place(stem, piece, timeline_at)
+        placed[key + "Seconds"] = round(n / SR, 6)
+    return placed
+
+
 def build_voice(ep: Path, work: Path, plan: dict) -> Path:
     total = round(plan["runtimeSeconds"] * SR)
     stem = np.zeros((total, 2), np.float32)
     levels = []
     for event in plan["events"]:
+        if event.get("kind") == "picture":
+            # Wordless picture carries no voice. Keep its row so the level audit
+            # still lists every event in clock order; the stem stays silent here.
+            if event.get("audio") is not None:
+                raise RuntimeError(f"picture event {event['id']} must not carry voice audio")
+            levels.append({"event": event["id"], "kind": "picture", "voice": None})
+            continue
         source = bound_path(ep, event["audio"], f"voice source {event['id']}")
         verify_sha(source, event.get("audioSha256", ""), f"voice source {event['id']}")
         admission = event.get("admission")
@@ -381,33 +609,123 @@ def build_voice(ep: Path, work: Path, plan: dict) -> Path:
         rms = float(np.sqrt(np.mean(samples * samples)))
         # A shared speech target retains native dynamics while removing clip jumps.
         gain = min(10 ** ((-20 - 20 * math.log10(max(rms, 1e-7))) / 20), 0.92 / max(peak, 1e-7), 3.0)
+        authored = {}
+        if "voiceGainDb" in event:
+            # An authored level after the shared target: a whisper may stay
+            # quiet and a shout loud. The same peak ceiling still applies.
+            authored_db = voice_gain_db(event["voiceGainDb"], f"voiceGainDb of {event['id']}")
+            wanted = gain * 10 ** (authored_db / 20)
+            gain = min(wanted, 0.92 / max(peak, 1e-7))
+            authored = {"authoredGainDb": authored_db, "authoredGainLimitedByPeak": gain < wanted}
         samples *= gain
         place(stem, samples, event["start"])
-        levels.append({"event": event["id"], "rms": rms, "peak": peak, "gain": gain})
+        level = {"event": event["id"], "rms": rms, "peak": peak, "gain": gain, **authored}
+        level.update(place_audio_overlaps(stem, source, event, source_start, gain))
+        levels.append(level)
     output = work / "voice-hi-48k24.wav"
     write_audio(output, stem)
     (work / "voice-levels.json").write_text(json.dumps(levels, indent=2) + "\n")
     return output
 
 
-def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict]:
+VOICE_GAIN_DB = (-12.0, 6.0)
+MUSIC_SHAPING_DEFAULTS = {"floor": 0.14, "range": 0.82, "exponent": 1.55,
+                          "dialogueScale": 0.78, "smoothingSeconds": 0.3}
+MUSIC_SHAPING_BOUNDS = {"floor": (0.0, 1.0), "range": (0.0, 1.0), "exponent": (0.25, 4.0),
+                        "dialogueScale": (0.0, 1.0), "smoothingSeconds": (0.0, 2.0)}
+MUSIC_SHAPING_MODES = ("wave", "take-dynamics")
+
+
+def _bounded(value, label: str, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not low <= value <= high:
+        raise ValueError(f"{label} must be a number within {low:g}..{high:g}")
+    return float(value)
+
+
+def voice_gain_db(value, label: str) -> float:
+    """An authored voice gain, applied after the shared speech target."""
+    return _bounded(value, label, *VOICE_GAIN_DB)
+
+
+def resolve_music_shaping(shaping, event_ids) -> dict:
+    """Validate an authored ``musicShaping`` and fill today's constants as defaults.
+
+    ``mode`` ``wave`` (default) shapes the score by the dramatic wave with
+    ``floor + range * energy ** exponent``, scaled by ``dialogueScale`` under
+    dialogue and smoothed over ``smoothingSeconds``. ``take-dynamics`` keeps
+    each take's own dynamics: only authored section gain, fades and breaths
+    apply, and no wave is read. ``events`` holds per-event overrides of the
+    shape values, each with a reason.
+    """
+    if not isinstance(shaping, dict):
+        raise ValueError("musicShaping must be an object")
+    unknown = set(shaping) - set(MUSIC_SHAPING_DEFAULTS) - {"mode", "events", "reason"}
+    if unknown:
+        raise ValueError(f"unknown musicShaping keys: {', '.join(sorted(unknown))}")
+    mode = shaping.get("mode", "wave")
+    if mode not in MUSIC_SHAPING_MODES:
+        raise ValueError("musicShaping mode is wave or take-dynamics")
+    result = {"mode": mode}
+    for key, default in MUSIC_SHAPING_DEFAULTS.items():
+        result[key] = _bounded(shaping.get(key, default), f"musicShaping {key}", *MUSIC_SHAPING_BOUNDS[key])
+    if result["floor"] + result["range"] > 1.0 + 1e-9:
+        raise ValueError("musicShaping floor plus range may not exceed 1.0; louder score is a gain, not a shape")
+    overrides = shaping.get("events", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("musicShaping events must map event IDs to overrides")
+    resolved_events = {}
+    known = set(event_ids)
+    for event_id, override in overrides.items():
+        if event_id not in known or not isinstance(override, dict):
+            raise ValueError(f"musicShaping override names no event: {event_id}")
+        reason = override.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"musicShaping override for {event_id} needs a reason")
+        fields = set(override) - {"reason"}
+        if not fields or not fields <= set(MUSIC_SHAPING_DEFAULTS) - {"smoothingSeconds"}:
+            raise ValueError(f"musicShaping override for {event_id} may set floor, range, exponent or dialogueScale")
+        row = {key: _bounded(override[key], f"{event_id} {key}", *MUSIC_SHAPING_BOUNDS[key]) for key in fields}
+        if row.get("floor", result["floor"]) + row.get("range", result["range"]) > 1.0 + 1e-9:
+            raise ValueError(f"musicShaping override for {event_id}: floor plus range may not exceed 1.0")
+        resolved_events[event_id] = {**row, "reason": reason}
+    if resolved_events:
+        result["events"] = resolved_events
+    if "reason" in shaping:
+        result["reason"] = shaping["reason"]
+    return result
+
+
+def wave_envelope(plan: dict, wave: dict | None, length: int) -> tuple[np.ndarray, dict]:
+    shaping = (resolve_music_shaping(plan["musicShaping"], [event["id"] for event in plan["events"]])
+               if "musicShaping" in plan else None)
+    shape = shaping or {"mode": "wave", **MUSIC_SHAPING_DEFAULTS}
+    take_dynamics = shape["mode"] == "take-dynamics"
     env = np.zeros(length, np.float32)
-    by_shot = {row["shot"]: row for row in wave["shots"]}
-    source_energy = [float(row["music_energy"]) for row in wave["shots"]]
-    lo, hi = min(source_energy), max(source_energy)
+    if take_dynamics:
+        by_shot, lo, hi = {}, None, None
+    else:
+        by_shot = {row["shot"]: row for row in wave["shots"]}
+        source_energy = [float(row["music_energy"]) for row in wave["shots"]]
+        lo, hi = min(source_energy), max(source_energy)
     breaths = []
     rendered_points = []
     for event in plan["events"]:
-        row = by_shot[event["shot"]]
+        row = by_shot.get(event["shot"]) if take_dynamics else by_shot[event["shot"]]
         start = round(event["start"] * SR)
         end = min(length, round(event["end"] * SR))
-        # Expand the authored wave rather than compressing the entire episode
-        # into a five-decibel continuous bed.  The floor here is audible but
-        # restrained; explicit editorial breaths below can reach near-silence.
-        normalized = (float(row["music_energy"]) - lo) / max(hi - lo, 1e-6)
-        energy = 0.14 + 0.82 * normalized ** 1.55
-        if event["kind"] == "dialogue":
-            energy *= 0.78
+        local = {**shape, **shape.get("events", {}).get(event["id"], {})}
+        if take_dynamics:
+            # The take plays at its own level; only authored breaths shape it here.
+            energy = 1.0
+        else:
+            # Expand the authored wave rather than compressing the entire episode
+            # into a five-decibel continuous bed.  The floor here is audible but
+            # restrained; explicit editorial breaths below can reach near-silence.
+            normalized = (float(row["music_energy"]) - lo) / max(hi - lo, 1e-6)
+            energy = local["floor"] + local["range"] * normalized ** local["exponent"]
+            if event["kind"] == "dialogue":
+                energy *= local["dialogueScale"]
         for breath in plan.get("musicBreaths", []):
             first, last = breath["shots"]
             if first <= event["shot"] <= last:
@@ -420,12 +738,12 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
                 break
         env[start:end] = energy
         rendered_points.append({
-            "shot": event["shot"], "sourceMusicEnergy": float(row["music_energy"]),
+            "shot": event["shot"], "sourceMusicEnergy": None if take_dynamics else float(row["music_energy"]),
             "envelopeTarget": float(energy), "kind": event["kind"],
         })
     # Smooth shot boundaries over 300 ms in linear time. A full-film convolution
     # with a 14,400-sample kernel needlessly multiplies the render workload.
-    n = round(0.3 * SR)
+    n = round(shape["smoothingSeconds"] * SR)
     if n > 1:
         padded = np.pad(env, (n // 2, (n - 1) // 2))
         cumulative = np.concatenate(([0.0], np.cumsum(padded, dtype=np.float64)))
@@ -434,6 +752,15 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
     for breath in breaths:
         if breath['level'] == 0:
             env[round(breath['start'] * SR):round(breath['end'] * SR)] = 0
+    if take_dynamics:
+        audit = {
+            "method": "take dynamics: authored section gain, fades and breath masks only; no dramatic wave",
+            "renderedRange": [float(env.min()), float(env.max())],
+            "authoredBreaths": breaths,
+            "eventTargets": rendered_points,
+            "musicShaping": shaping,
+        }
+        return env, audit
     point_source = np.array([x["sourceMusicEnergy"] for x in rendered_points])
     point_rendered = np.array([x["envelopeTarget"] for x in rendered_points])
     unmasked = np.array([x["shot"] not in {b["shot"] for b in breaths} for x in rendered_points])
@@ -451,6 +778,8 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
         "authoredBreaths": breaths,
         "eventTargets": rendered_points,
     }
+    if shaping is not None:
+        audit["musicShaping"] = shaping
     return env, audit
 
 
@@ -561,6 +890,17 @@ def build_music(ep: Path, work: Path, plan: dict, wave: dict) -> Path:
     stem = np.zeros((total, 2), np.float32)
     decisions = []
     for movement in plan["scorePlacements"]:
+        if movement.get("silence") is True:
+            # An authored stretch with no score: nothing is decoded or placed,
+            # and the conform audit keeps one row per placement in order.
+            decisions.append({
+                "movement": movement["movement"], "silence": True,
+                "timelineStart": movement["timelineStart"],
+                "timelineDuration": movement["timelineDuration"],
+                **({"reason": movement["reason"]} if "reason" in movement else {}),
+                "repriseJoins": [],
+            })
+            continue
         source_path = bound_path(ep, movement["track"], f"score {movement['movement']}")
         verify_sha(
             source_path, movement.get("trackSha256", ""),
@@ -626,6 +966,9 @@ def build_music(ep: Path, work: Path, plan: dict, wave: dict) -> Path:
             "repriseJoins": joins,
             "normalization": level_audit,
         })
+    shaping = plan.get("musicShaping")
+    if wave is None and not (isinstance(shaping, dict) and shaping.get("mode") == "take-dynamics"):
+        raise RuntimeError("A wave-shaped score needs its dramatic wave; take-dynamics needs none")
     env, envelope_audit = wave_envelope(plan, wave, total)
     stem *= env[:, None]
     envelope_audit['verifiedPcmPeak'] = validate_score_bus(stem)
@@ -656,7 +999,8 @@ def main() -> None:
     plan = json.loads((ep / args.plan).read_text())
     if plan.get('renderable') is not True:
         raise RuntimeError('A complete source-admitted renderable plan is required')
-    wave = json.loads((ep / args.wave).read_text()) if args.stage in ('all','audio') else None
+    take_dynamics = isinstance(plan.get('musicShaping'), dict) and plan['musicShaping'].get('mode') == 'take-dynamics'
+    wave = json.loads((ep / args.wave).read_text()) if args.stage in ('all','audio') and not take_dynamics else None
     width = round(args.height * 16 / 9 / 2) * 2
     outputs = {}
     if args.stage in ("all", "picture"):
@@ -667,6 +1011,7 @@ def main() -> None:
     audit = {
         "episode": plan["episode"], "runtimeSeconds": plan["runtimeSeconds"],
         "resolution": f"{width}x{args.height}", "outputs": outputs,
+        **({"frame": plan["frame"]} if plan.get("frame") else {}),
     }
     (work / f"assembly-components-{args.height}p.json").write_text(json.dumps(audit, indent=2) + "\n")
     print(json.dumps(audit, indent=2))

@@ -26,9 +26,12 @@ def main():
     assert set(timing)=={'hi','en'}
     original=json.loads(source.read_text());out=copy.deepcopy(original)
     assert out['renderable'] is True and out['finalApproved'] is False
-    assert len(m['items'])==len(out['events'])>0
+    # Wordless picture events carry no words, so they have no manuscript item
+    # and no timing shot; every spoken event keeps its own.
+    spoken=[e for e in out['events'] if e.get('kind')!='picture']
+    assert len(m['items'])==len(spoken)>0
     changed=[]
-    for i,(event,item) in enumerate(zip(out['events'],m['items'])):
+    for i,(event,item) in enumerate(zip(spoken,m['items'])):
         assert event['id']==item['id'] and item['hi'] and len(item['hi'])==len(item['en'])
         hi=' '.join(item['hi']);en=' '.join(item['en'])
         assert hi==event['subtitleTextHi'],'Never rewrite performed Hindi'
@@ -75,7 +78,7 @@ def main():
     receipt=dict(kind='subtitle-only-derivation-audit',sourcePlanSha256=sha(source),
         manuscriptSha256=sha(manuscript),recipeSha256=sha(recipe_path),toolSha256=sha(Path(__file__)),
         outputs={p.name:sha(p) for p in dest.iterdir() if p.suffix=='.json'},
-        sceneCount=len(out['events']),cueCount=len(hi_cues),englishTextEdits=changed,
+        sceneCount=len(spoken),cueCount=len(hi_cues),englishTextEdits=changed,
         pictureAndSpeechUnchanged=True,clockUnchanged=True,timelineFingerprint=fingerprint,
         minimumCueSeconds=min(c.end-c.start for c in hi_cues),coverage=coverage)
     write('derivation-audit.json',receipt)
