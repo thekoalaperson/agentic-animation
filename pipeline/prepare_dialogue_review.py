@@ -22,9 +22,9 @@ import re
 import subprocess
 
 if __package__:
-    from ._common import atomic_json, attempt_records, write_attempt_json
+    from ._common import adopt_legacy_record, atomic_json, attempt_records, write_attempt_json
 else:
-    from _common import atomic_json, attempt_records, write_attempt_json
+    from _common import adopt_legacy_record, atomic_json, attempt_records, write_attempt_json
 
 
 def sha(path):
@@ -162,6 +162,8 @@ def measure_speech_windows(manifest, root, jobs, *, noise_db, minimum_silence, h
                       "is never narrower than a supplied transcript span and falls back to the "
                       "full clip when no speech is found. Admission copies a chosen window."),
            "admission": "not implied", "items": items}
+    # A single speech-windows.json from before the attempt files is kept as one.
+    adopt_legacy_record(here, "speech-windows")
     attempts = attempt_records(here, "speech-windows")
     if attempts and attempts[-1]["record"] == doc:
         target = here / attempts[-1]["path"]

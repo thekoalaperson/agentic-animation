@@ -79,18 +79,25 @@ class SpeechWindowTest(unittest.TestCase):
     def test_a_second_measurement_adds_an_attempt_and_keeps_the_first(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, manifest, _ = demo_project(Path(tmp))
+            # A measurement written before the attempt files becomes attempt 001.
+            legacy = manifest.parent / "speech-windows.json"
+            legacy.write_text(json.dumps({"kind": "dialogue-speech-windows", "items": []}))
             self.assertEqual(measure_windows(manifest, project).returncode, 0)
-            first = manifest.parent / "speech-windows-attempt-001.json"
+            adopted = json.loads((manifest.parent / "speech-windows-attempt-001.json").read_text())
+            self.assertEqual(adopted["legacyRecord"], "speech-windows.json")
+            self.assertEqual(adopted["record"]["items"], [])
+            first = manifest.parent / "speech-windows-attempt-002.json"
             before = first.read_bytes()
             # The same measurement again adds nothing.
             self.assertEqual(measure_windows(manifest, project).returncode, 0)
-            self.assertFalse((manifest.parent / "speech-windows-attempt-002.json").exists())
+            self.assertFalse((manifest.parent / "speech-windows-attempt-003.json").exists())
             # Other thresholds were refused as an immutable change; now they are a new attempt.
             done = measure_windows(manifest, project, "--minimum-handle", "0.5")
             self.assertEqual(done.returncode, 0, done.stderr)
             index, doc = latest_windows(manifest)
             self.assertEqual([row["path"] for row in index["attempts"]],
-                             ["speech-windows-attempt-001.json", "speech-windows-attempt-002.json"])
+                             ["speech-windows-attempt-001.json", "speech-windows-attempt-002.json",
+                              "speech-windows-attempt-003.json"])
             self.assertEqual(doc["thresholds"]["minimumHandleSeconds"], 0.5)
             self.assertEqual(first.read_bytes(), before)
 
