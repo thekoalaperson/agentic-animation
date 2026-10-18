@@ -10,8 +10,14 @@ finding is a listening cue. Whether a second voice speaks is not checked here.
 
 The transcript spans feed prepare_dialogue_review.py --measure-speech-windows
 --transcript-evidence, so an energy-based window never cuts heard speech.
-Runs on a qualified Linux worker with faster-whisper or openai-whisper; the
-thresholds are this tool's own, not the effects screen's.
+Runs on a qualified Linux worker with faster-whisper or openai-whisper.
+Unexercised: only the comparison and the measurement core, with the Whisper
+call replaced, are tested; there is no recorded worker run, so qualify it on
+one clip before reading its findings. The thresholds are Whisper's library
+defaults (no-speech 0.6, log-prob -1.0, compression ratio 2.4), beam 5 as in
+faster-whisper (openai-whisper's library call defaults to greedy), and
+conditioning on previous text turned off. They are not tuned on any clips
+and are not the effects screen's stricter values.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ if __package__:
 else:
     from audit_sfx_speech import SimpleSegment, atomic_json, sha256
 
+# Whisper library defaults, except conditioning on previous text is off.
 THRESHOLDS = {"noSpeechThreshold": 0.6, "logProbThreshold": -1.0,
               "compressionRatioThreshold": 2.4, "conditionOnPreviousText": False,
               "beamSize": 5}

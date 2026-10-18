@@ -15,13 +15,15 @@ watched, and approved mean different things. An optional review record describes
 what was actually reviewed; its absence need not block making an audition.
 
 Media made by hand or brought in (a recorded take, a composed cue, filmed or
-painted picture) is registered with `register_supplied_media.py`, which writes
+painted picture) can be registered with `register_supplied_media.py`, which writes
 `<file>.supplied.json`: the file's hash and probe facts, who made or supplied
 it, the rights basis, and `rights.providerUpload`. That sidecar is a
 declaration. Its maker and rights fields make a false claim a recorded false
 statement; they are not proof and not a bypass of any measured or review check.
 `providerUpload: forbidden` makes the shared uploader refuse the file, which
-guards against an accidental upload and is not DRM.
+guards against an accidental upload and is not DRM. It checks only the exact
+path handed to the uploader: an extracted frame, a conformed or stripped copy,
+or any other file derived from it carries no sidecar and is not refused.
 
 ## Jobs and spending
 
