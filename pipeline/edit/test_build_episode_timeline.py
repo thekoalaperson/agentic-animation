@@ -1862,6 +1862,31 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertTrue(any(e["type"] == "picture-window" for e in self.readiness()["errors"]),
                         self.readiness()["errors"])
 
+    def test_voice_gains_and_music_shaping_reach_the_plan_and_bad_values_are_refused(self):
+        pristine = json.loads(self.config.read_text())
+        self.write_json(self.config, {**pristine,
+                                      "voiceGains": {"demo-s003": {"gainDb": 3, "reason": "A shout across the yard."}},
+                                      "musicShaping": {"floor": 0.05, "events": {
+                                          "demo-s003": {"dialogueScale": 1.0, "reason": "The score holds under this line."}}}})
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        event = next(e for e in plan["events"] if e["id"] == "demo-s003")
+        self.assertEqual((event["voiceGainDb"], event["voiceGainReason"]), (3.0, "A shout across the yard."))
+        self.assertEqual(plan["musicShaping"]["floor"], 0.05)
+        self.assertEqual(plan["musicShaping"]["range"], 0.82)
+        self.assertEqual(plan["musicShaping"]["events"]["demo-s003"]["dialogueScale"], 1.0)
+        cases = {
+            "no spoken scene": {"voiceGains": {"demo-s099": {"gainDb": 1, "reason": "x"}}},
+            "needs a reason": {"voiceGains": {"demo-s003": {"gainDb": 1}}},
+            "-12..6": {"voiceGains": {"demo-s003": {"gainDb": -20, "reason": "x"}}},
+            "floor plus range": {"musicShaping": {"floor": 0.5}},
+        }
+        for message, changes in cases.items():
+            with self.subTest(message):
+                self.write_json(self.config, {**pristine, **changes})
+                with self.assertRaisesRegex(timeline.TimelineIncomplete, message):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+
     def test_removing_each_editing_field_restores_the_plan_bytes(self):
         timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
         plan_path = self.ep / "work/assembly-v1/edit-plan.json"
@@ -1873,7 +1898,9 @@ class TimelineBuilderTest(unittest.TestCase):
                  "audioTail": {"seconds": 0.5, "reason": "Let the breath ring under the next shot."}}
         film = {"transitions": [{"after": "demo-s003", "kind": "dip-to-black", "frames": 12,
                                  "reason": "A breath of dark before the last image."}],
-                "frameAspect": "2.39:1", "cadence": 2, "unscored": True}
+                "frameAspect": "2.39:1", "cadence": 2, "unscored": True,
+                "voiceGains": {"demo-s003": {"gainDb": -6, "reason": "Said under the breath."}},
+                "musicShaping": {"mode": "take-dynamics"}}
         for key, value in list(scene.items()) + list(film.items()):
             with self.subTest(key):
                 config = json.loads(pristine)
@@ -2277,7 +2304,8 @@ class TimelineBuilderTest(unittest.TestCase):
                         "pictureCrop", "pictureCropFrom", "pictureCropReason", "pictureWindows",
                         "audioLead", "audioTail", "minimumPictureSegmentSeconds", "microCutRoleWords",
                         "narrationBreathing", "narrationBreathOverrides", "holdSeconds", "allowCausalBorrowing",
-                        "musicBreaths", "transitions", "frameAspect", "cadence"):
+                        "musicBreaths", "musicShaping", "voiceGains", "unscored",
+                        "transitions", "frameAspect", "cadence"):
             self.assertIn(control, out.getvalue())
         # The matte's cost to subtitle placement is stated, not hidden.
         self.assertIn("subtitles are still placed against the whole", out.getvalue())

@@ -609,9 +609,17 @@ def build_voice(ep: Path, work: Path, plan: dict) -> Path:
         rms = float(np.sqrt(np.mean(samples * samples)))
         # A shared speech target retains native dynamics while removing clip jumps.
         gain = min(10 ** ((-20 - 20 * math.log10(max(rms, 1e-7))) / 20), 0.92 / max(peak, 1e-7), 3.0)
+        authored = {}
+        if "voiceGainDb" in event:
+            # An authored level after the shared target: a whisper may stay
+            # quiet and a shout loud. The same peak ceiling still applies.
+            authored_db = voice_gain_db(event["voiceGainDb"], f"voiceGainDb of {event['id']}")
+            wanted = gain * 10 ** (authored_db / 20)
+            gain = min(wanted, 0.92 / max(peak, 1e-7))
+            authored = {"authoredGainDb": authored_db, "authoredGainLimitedByPeak": gain < wanted}
         samples *= gain
         place(stem, samples, event["start"])
-        level = {"event": event["id"], "rms": rms, "peak": peak, "gain": gain}
+        level = {"event": event["id"], "rms": rms, "peak": peak, "gain": gain, **authored}
         level.update(place_audio_overlaps(stem, source, event, source_start, gain))
         levels.append(level)
     output = work / "voice-hi-48k24.wav"
@@ -620,24 +628,104 @@ def build_voice(ep: Path, work: Path, plan: dict) -> Path:
     return output
 
 
-def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict]:
+VOICE_GAIN_DB = (-12.0, 6.0)
+MUSIC_SHAPING_DEFAULTS = {"floor": 0.14, "range": 0.82, "exponent": 1.55,
+                          "dialogueScale": 0.78, "smoothingSeconds": 0.3}
+MUSIC_SHAPING_BOUNDS = {"floor": (0.0, 1.0), "range": (0.0, 1.0), "exponent": (0.25, 4.0),
+                        "dialogueScale": (0.0, 1.0), "smoothingSeconds": (0.0, 2.0)}
+MUSIC_SHAPING_MODES = ("wave", "take-dynamics")
+
+
+def _bounded(value, label: str, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not low <= value <= high:
+        raise ValueError(f"{label} must be a number within {low:g}..{high:g}")
+    return float(value)
+
+
+def voice_gain_db(value, label: str) -> float:
+    """An authored voice gain, applied after the shared speech target."""
+    return _bounded(value, label, *VOICE_GAIN_DB)
+
+
+def resolve_music_shaping(shaping, event_ids) -> dict:
+    """Validate an authored ``musicShaping`` and fill today's constants as defaults.
+
+    ``mode`` ``wave`` (default) shapes the score by the dramatic wave with
+    ``floor + range * energy ** exponent``, scaled by ``dialogueScale`` under
+    dialogue and smoothed over ``smoothingSeconds``. ``take-dynamics`` keeps
+    each take's own dynamics: only authored section gain, fades and breaths
+    apply, and no wave is read. ``events`` holds per-event overrides of the
+    shape values, each with a reason.
+    """
+    if not isinstance(shaping, dict):
+        raise ValueError("musicShaping must be an object")
+    unknown = set(shaping) - set(MUSIC_SHAPING_DEFAULTS) - {"mode", "events", "reason"}
+    if unknown:
+        raise ValueError(f"unknown musicShaping keys: {', '.join(sorted(unknown))}")
+    mode = shaping.get("mode", "wave")
+    if mode not in MUSIC_SHAPING_MODES:
+        raise ValueError("musicShaping mode is wave or take-dynamics")
+    result = {"mode": mode}
+    for key, default in MUSIC_SHAPING_DEFAULTS.items():
+        result[key] = _bounded(shaping.get(key, default), f"musicShaping {key}", *MUSIC_SHAPING_BOUNDS[key])
+    if result["floor"] + result["range"] > 1.0 + 1e-9:
+        raise ValueError("musicShaping floor plus range may not exceed 1.0; louder score is a gain, not a shape")
+    overrides = shaping.get("events", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("musicShaping events must map event IDs to overrides")
+    resolved_events = {}
+    known = set(event_ids)
+    for event_id, override in overrides.items():
+        if event_id not in known or not isinstance(override, dict):
+            raise ValueError(f"musicShaping override names no event: {event_id}")
+        reason = override.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"musicShaping override for {event_id} needs a reason")
+        fields = set(override) - {"reason"}
+        if not fields or not fields <= set(MUSIC_SHAPING_DEFAULTS) - {"smoothingSeconds"}:
+            raise ValueError(f"musicShaping override for {event_id} may set floor, range, exponent or dialogueScale")
+        row = {key: _bounded(override[key], f"{event_id} {key}", *MUSIC_SHAPING_BOUNDS[key]) for key in fields}
+        if row.get("floor", result["floor"]) + row.get("range", result["range"]) > 1.0 + 1e-9:
+            raise ValueError(f"musicShaping override for {event_id}: floor plus range may not exceed 1.0")
+        resolved_events[event_id] = {**row, "reason": reason}
+    if resolved_events:
+        result["events"] = resolved_events
+    if "reason" in shaping:
+        result["reason"] = shaping["reason"]
+    return result
+
+
+def wave_envelope(plan: dict, wave: dict | None, length: int) -> tuple[np.ndarray, dict]:
+    shaping = (resolve_music_shaping(plan["musicShaping"], [event["id"] for event in plan["events"]])
+               if "musicShaping" in plan else None)
+    shape = shaping or {"mode": "wave", **MUSIC_SHAPING_DEFAULTS}
+    take_dynamics = shape["mode"] == "take-dynamics"
     env = np.zeros(length, np.float32)
-    by_shot = {row["shot"]: row for row in wave["shots"]}
-    source_energy = [float(row["music_energy"]) for row in wave["shots"]]
-    lo, hi = min(source_energy), max(source_energy)
+    if take_dynamics:
+        by_shot, lo, hi = {}, None, None
+    else:
+        by_shot = {row["shot"]: row for row in wave["shots"]}
+        source_energy = [float(row["music_energy"]) for row in wave["shots"]]
+        lo, hi = min(source_energy), max(source_energy)
     breaths = []
     rendered_points = []
     for event in plan["events"]:
-        row = by_shot[event["shot"]]
+        row = by_shot.get(event["shot"]) if take_dynamics else by_shot[event["shot"]]
         start = round(event["start"] * SR)
         end = min(length, round(event["end"] * SR))
-        # Expand the authored wave rather than compressing the entire episode
-        # into a five-decibel continuous bed.  The floor here is audible but
-        # restrained; explicit editorial breaths below can reach near-silence.
-        normalized = (float(row["music_energy"]) - lo) / max(hi - lo, 1e-6)
-        energy = 0.14 + 0.82 * normalized ** 1.55
-        if event["kind"] == "dialogue":
-            energy *= 0.78
+        local = {**shape, **shape.get("events", {}).get(event["id"], {})}
+        if take_dynamics:
+            # The take plays at its own level; only authored breaths shape it here.
+            energy = 1.0
+        else:
+            # Expand the authored wave rather than compressing the entire episode
+            # into a five-decibel continuous bed.  The floor here is audible but
+            # restrained; explicit editorial breaths below can reach near-silence.
+            normalized = (float(row["music_energy"]) - lo) / max(hi - lo, 1e-6)
+            energy = local["floor"] + local["range"] * normalized ** local["exponent"]
+            if event["kind"] == "dialogue":
+                energy *= local["dialogueScale"]
         for breath in plan.get("musicBreaths", []):
             first, last = breath["shots"]
             if first <= event["shot"] <= last:
@@ -650,12 +738,12 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
                 break
         env[start:end] = energy
         rendered_points.append({
-            "shot": event["shot"], "sourceMusicEnergy": float(row["music_energy"]),
+            "shot": event["shot"], "sourceMusicEnergy": None if take_dynamics else float(row["music_energy"]),
             "envelopeTarget": float(energy), "kind": event["kind"],
         })
     # Smooth shot boundaries over 300 ms in linear time. A full-film convolution
     # with a 14,400-sample kernel needlessly multiplies the render workload.
-    n = round(0.3 * SR)
+    n = round(shape["smoothingSeconds"] * SR)
     if n > 1:
         padded = np.pad(env, (n // 2, (n - 1) // 2))
         cumulative = np.concatenate(([0.0], np.cumsum(padded, dtype=np.float64)))
@@ -664,6 +752,15 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
     for breath in breaths:
         if breath['level'] == 0:
             env[round(breath['start'] * SR):round(breath['end'] * SR)] = 0
+    if take_dynamics:
+        audit = {
+            "method": "take dynamics: authored section gain, fades and breath masks only; no dramatic wave",
+            "renderedRange": [float(env.min()), float(env.max())],
+            "authoredBreaths": breaths,
+            "eventTargets": rendered_points,
+            "musicShaping": shaping,
+        }
+        return env, audit
     point_source = np.array([x["sourceMusicEnergy"] for x in rendered_points])
     point_rendered = np.array([x["envelopeTarget"] for x in rendered_points])
     unmasked = np.array([x["shot"] not in {b["shot"] for b in breaths} for x in rendered_points])
@@ -681,6 +778,8 @@ def wave_envelope(plan: dict, wave: dict, length: int) -> tuple[np.ndarray, dict
         "authoredBreaths": breaths,
         "eventTargets": rendered_points,
     }
+    if shaping is not None:
+        audit["musicShaping"] = shaping
     return env, audit
 
 
@@ -867,6 +966,9 @@ def build_music(ep: Path, work: Path, plan: dict, wave: dict) -> Path:
             "repriseJoins": joins,
             "normalization": level_audit,
         })
+    shaping = plan.get("musicShaping")
+    if wave is None and not (isinstance(shaping, dict) and shaping.get("mode") == "take-dynamics"):
+        raise RuntimeError("A wave-shaped score needs its dramatic wave; take-dynamics needs none")
     env, envelope_audit = wave_envelope(plan, wave, total)
     stem *= env[:, None]
     envelope_audit['verifiedPcmPeak'] = validate_score_bus(stem)
@@ -897,7 +999,8 @@ def main() -> None:
     plan = json.loads((ep / args.plan).read_text())
     if plan.get('renderable') is not True:
         raise RuntimeError('A complete source-admitted renderable plan is required')
-    wave = json.loads((ep / args.wave).read_text()) if args.stage in ('all','audio') else None
+    take_dynamics = isinstance(plan.get('musicShaping'), dict) and plan['musicShaping'].get('mode') == 'take-dynamics'
+    wave = json.loads((ep / args.wave).read_text()) if args.stage in ('all','audio') and not take_dynamics else None
     width = round(args.height * 16 / 9 / 2) * 2
     outputs = {}
     if args.stage in ("all", "picture"):

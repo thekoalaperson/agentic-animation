@@ -37,6 +37,7 @@ from _common import is_below as _is_below, sha256_file as _sha256
 from dialogue_provenance import canonical_sha as _canonical_sha, validate_dialogue_request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from subtitle_manuscript import apply_manuscript
+from assemble_longform import resolve_music_shaping, voice_gain_db
 
 
 DELIVERY_FPS = 24
@@ -695,6 +696,25 @@ def _frame_settings(config: dict[str, Any]) -> dict[str, Any] | None:
         if cadence != 1:
             result["cadence"] = cadence
     return result or None
+
+
+def _voice_gains(config: dict[str, Any], row_kind: dict[str, str]) -> dict[str, tuple[float, str]]:
+    """Read ``voiceGains``: a scene's voice level after the shared speech target, with a reason."""
+    raw = config.get("voiceGains", {})
+    if not isinstance(raw, dict):
+        raise TimelineIncomplete("voiceGains must map scene IDs to {gainDb, reason}")
+    result = {}
+    for scene_id, row in raw.items():
+        if row_kind.get(scene_id) not in ("narration", "dialogue") or not isinstance(row, dict):
+            raise TimelineIncomplete(f"voiceGains names no spoken scene: {scene_id}")
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise TimelineIncomplete(f"voiceGains for {scene_id} needs a reason")
+        try:
+            result[scene_id] = (voice_gain_db(row.get("gainDb"), f"voiceGains gainDb of {scene_id}"), reason)
+        except ValueError as exc:
+            raise TimelineIncomplete(str(exc)) from exc
+    return result
 
 
 TRANSITION_KINDS = {"dissolve", "dip-to-black", "dip-to-white"}
@@ -2121,6 +2141,12 @@ def build_timeline(
     if type(preserve_dialogue) is not bool:
         raise TimelineIncomplete("preserveCompleteDialogueClips must be a boolean")
     frame = _frame_settings(config)
+    voice_gains = _voice_gains(config, row_kind)
+    try:
+        music_shaping = (resolve_music_shaping(config["musicShaping"], list(row_kind))
+                         if "musicShaping" in config else None)
+    except ValueError as exc:
+        raise TimelineIncomplete(str(exc)) from exc
 
     events: list[dict[str, Any]] = []
     cursor_frames = 0
@@ -2521,6 +2547,9 @@ def build_timeline(
 
     _record_split_edits(blocks, events)
     for event in events:
+        if event["id"] in voice_gains:
+            event["voiceGainDb"], event["voiceGainReason"] = voice_gains[event["id"]]
+    for event in events:
         tail = event.get("audioTail", {}).get("seconds", 0)
         if tail and event["end"] + tail > cursor_frames / DELIVERY_FPS + 1e-6:
             raise TimelineIncomplete(f"Audio tail runs past the end of the film: {event['id']}")
@@ -2657,6 +2686,8 @@ def build_timeline(
     }
     if unscored:
         edit_plan["unscored"] = True
+    if music_shaping is not None:
+        edit_plan["musicShaping"] = music_shaping
     if transitions:
         edit_plan["transitions"] = transitions
     if frame:
@@ -2785,6 +2816,14 @@ the colon; nothing here is required):
                                    accepted picture borrows its nearest
                                    neighbour's surplus: true
   musicBreaths                     [{shots, level, reason}] score dips: none
+  musicShaping                     how the score follows the dramatic wave:
+                                   mode wave, floor 0.14, range 0.82, exponent
+                                   1.55, dialogueScale 0.78, smoothingSeconds
+                                   0.3, and events {scene: {..., reason}}; mode
+                                   take-dynamics keeps each take's own level
+                                   (gain, fades, breaths only, no wave): none
+  voiceGains                       {scene: {gainDb -12..6, reason}} a line's
+                                   level after the shared speech target: none
   scorePlacements gaps, {movement, silence: true, timelineStart,
   timelineDuration, reason}        stretches with no score; a gap between
                                    placements is silence: none

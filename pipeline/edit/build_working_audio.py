@@ -131,7 +131,8 @@ def main():
     if not output.is_relative_to(ep / "work") or output.name == "assembly-v1":
         raise RuntimeError("Working audio must stay in a separate work directory")
     output.mkdir(parents=True, exist_ok=True)
-    plan = clock if voice_only else dict(clock, **{k: score[k] for k in ("scorePlacements", "musicBreaths", "musicNormalization")})
+    plan = clock if voice_only else dict(clock, **{k: score[k] for k in ("scorePlacements", "musicBreaths", "musicNormalization")},
+                                         **{k: score[k] for k in ("musicShaping",) if k in score})
     voice = assembly.build_voice(ep, output, plan)
     outputs = {"voice": voice}
     if not voice_only:
