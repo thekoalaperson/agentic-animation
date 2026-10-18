@@ -12,7 +12,7 @@ lightweight validation. Model runtimes remain separate:
 | H3 | Compatible Linux CUDA worker, qualified SGLang/H3 server, model files, `requests` for finite client |
 | HD | CUDA PyTorch, NumPy, Spandrel, selected licensed upscaler weights, ffmpeg/ffprobe |
 | SFX | Qualified Stable Audio runtime, Torch, SoundFile, NumPy, appropriate model access |
-| Audio diagnostics | Selected Whisper/Transformers/CLAP or AudioSet runtime; optional, separately qualified |
+| Audio diagnostics | Selected Whisper/Transformers/CLAP or AudioSet runtime; optional, separately qualified. `measure_dialogue_speech.py` uses the Whisper runtime with its own thresholds for speech, not the effects screen's |
 | Text/finishing | ffmpeg with complex libass/HarfBuzz shaping, explicit licensed fonts, GPU worker |
 
 The finite H3 shell launchers require `AGENTIC_H3_ROOT`, whose qualified runtime
