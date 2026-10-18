@@ -16,7 +16,7 @@ sequences. Choose the amount of process that helps the work.
 | Compile paired text or inventory a project | `edit/compile_production_script.py`, `edit/prepare_episode_production.py` |
 | Admit reviewed takes to the timeline | `edit/admit_review_decisions.py` |
 | Assemble a measured timeline (its `--help` lists every rhythm control and its default) | `edit/build_episode_timeline.py`, `edit/assemble_longform.py` |
-| Design and revise sound | `edit/render_designed_sfx.py`, `edit/revise_master_sound.py` |
+| Make, design and mix sound | `open_media/build_stable_audio_review_brief.py`, `open_media/run_stable_audio_probe.py`, `open_media/verify_stable_audio_review.py`, `edit/render_designed_sfx.py`, `edit/validate_absolute_sfx_mix_input.py`, `edit/mix_absolute_sfx_longform.py`, `edit/revise_master_sound.py` |
 | Prepare subtitles | `edit/prepare_subtitle_manuscript.py`, `edit/export_bilingual_subtitles.py` |
 | Reuse HD picture or change its audio | `open_media/build_hd_range_plan.py`, `open_media/hd_audio_remux.py` |
 | Package selected deliverables | `edit/package_hindi_delivery.py`, `edit/package_hindi_longform.py` |
@@ -62,6 +62,19 @@ and a film may set a matte or a stepped cadence. When a picture window carries
 on the neighbouring picture's frames, the edit plan names the J or L cut. Each
 of these is bounded by frames and audio the reviewed media already holds; when
 none is authored the cut is what it always was.
+
+How the film sounds is authored the same way. The score may play under some
+events and not others: a gap between score placements is silence, a placement
+may name a silence, and a film may declare itself `unscored`. A line may keep
+its own level after the shared speech target (`voiceGains`). The score may
+follow the dramatic wave on a shape the film sets, or keep each take's own
+dynamics (`musicShaping`). The mixer's balance and loudness targets may be set
+within bounds (`mix_absolute_sfx_longform.py --settings`). Mastering records
+whether loudnorm reached its target with one gain or by riding the level;
+`refuseDynamicMastering` makes the second a refusal. An effects batch names its
+model, or is recorded or library sound with its origin and licence or terms
+written beside its hash; licence terms change, so note the date and verify
+current terms. When none of this is authored the mix is what it always was.
 
 The screenplay reader lists what the source contains and chooses no shots; how
 rows divide it is the director's call. A storyboard row may cite the units it
