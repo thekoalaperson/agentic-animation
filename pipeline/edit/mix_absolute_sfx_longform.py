@@ -291,22 +291,50 @@ def validate_events(plan: dict[str, Any], runtime: float) -> None:
         raise MixError("edit-plan events do not end at runtime")
 
 
+def silent_placement(row: Any) -> bool:
+    """An authored stretch of no score: it names no track and binds no media."""
+    return isinstance(row, dict) and row.get("silence") is True
+
+
 def validate_score_placements(episode: Path, plan: dict[str, Any], runtime: float) -> None:
+    """Placements are ordered, never overlap and stay inside the measured clock.
+
+    A gap between placements is silence, so a film may score only some of its
+    events. An empty list is accepted only from a plan that declares itself
+    unscored, so a forgotten score is still caught. Every placement that names
+    a track keeps its full hash binding.
+    """
     rows = plan.get("scorePlacements")
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list):
         raise MixError("the source-bound score placement list is required")
+    unscored = plan.get("unscored", False)
+    if type(unscored) is not bool:
+        raise MixError("unscored must be a boolean")
+    if not rows and not unscored:
+        raise MixError("the source-bound score placement list is required; "
+                       "a film with no score declares unscored: true")
+    if unscored and any(not silent_placement(row) for row in rows):
+        raise MixError("an unscored film may carry only silence placements")
     cursor = 0.0
     seen: set[str] = set()
     for row in rows:
+        if not isinstance(row, dict):
+            raise MixError("score placements must be objects")
         movement = str(row.get("movement", ""))
         if not movement or movement in seen:
             raise MixError("score movement names are missing or duplicated")
         seen.add(movement)
         start = finite(row.get("timelineStart"), f"{movement} timelineStart")
         duration = finite(row.get("timelineDuration"), f"{movement} timelineDuration")
-        if abs(start - cursor) > 1e-5 or duration <= 0:
-            raise MixError("score placements must cover the measured clock contiguously")
+        if start < cursor - 1e-5 or duration <= 0:
+            raise MixError(f"score placements must be ordered and must not overlap: {movement}")
         cursor = start + duration
+        if cursor > runtime + 1e-5:
+            raise MixError(f"score placement {movement} runs past the measured runtime")
+        if silent_placement(row):
+            if any(key in row for key in ("track", "trackSha256", "sidecar", "sidecarSha256")):
+                raise MixError(f"silence placement {movement} must not name a score track")
+            continue
         for path_key, sha_key in (
             ("track", "trackSha256"),
             ("sidecar", "sidecarSha256"),
@@ -317,8 +345,6 @@ def validate_score_placements(episode: Path, plan: dict[str, Any], runtime: floa
                 continue
             path = episode_path(episode, row.get(path_key, ""), f"{movement} {path_key}")
             verify_hash(path, row.get(sha_key), f"{movement} {path_key}")
-    if abs(cursor - runtime) > 1e-5:
-        raise MixError("score placements do not end at measured runtime")
 
 
 def validate_render_runs(
@@ -372,6 +398,12 @@ def validate_assembly_evidence(
     if not isinstance(conform, list) or len(conform) != len(placements):
         raise MixError("music-conform audit does not cover all score movements")
     for decision, placement in zip(conform, placements):
+        if silent_placement(placement):
+            if (decision.get("movement") != placement["movement"] or decision.get("silence") is not True
+                    or abs(finite(decision.get("timelineDuration"), "conform timelineDuration")
+                           - finite(placement.get("timelineDuration"), "placement timelineDuration")) > 1e-5):
+                raise MixError("music-conform audit differs from the authored silence placements")
+            continue
         source = episode_path(episode, placement["track"], "score track")
         if (
             decision.get("movement") != placement["movement"]

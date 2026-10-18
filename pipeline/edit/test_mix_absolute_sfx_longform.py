@@ -280,6 +280,59 @@ class MixerFixture(unittest.TestCase):
         with self.assertRaisesRegex(mixer.MixError, "dramaticWave"):
             self.build()
 
+    def rewrite_plan(self, **changes) -> None:
+        plan = {**self.plan, **changes}
+        write_json(self.plan_path, plan)
+        write_json(self.assembly / "music-conform.json", [
+            {"movement": row["movement"], "silence": True, "timelineDuration": row["timelineDuration"]}
+            if row.get("silence") else
+            {"movement": row["movement"], "take": row["take"],
+             "source": str((self.episode / row["track"]).resolve()),
+             "timelineDuration": row["timelineDuration"]}
+            for row in plan["scorePlacements"]])
+        wave = json.loads(self.wave_path.read_text())
+        wave["clockSha256"] = mixer.sha256_file(self.plan_path)
+        write_json(self.wave_path, wave)
+        sfx = copy.deepcopy(self.sfx_contract)
+        sfx["inputEvidence"]["editPlan"]["sha256"] = mixer.sha256_file(self.plan_path)
+        sfx["inputEvidence"]["dramaticWave"]["sha256"] = mixer.sha256_file(self.wave_path)
+        write_json(self.sfx_contract_path, sfx)
+
+    def test_gaps_between_placements_are_silence(self) -> None:
+        first, second = copy.deepcopy(self.plan["scorePlacements"])
+        first["timelineDuration"] = 1.5
+        second["timelineStart"], second["timelineDuration"] = 4.0, 1.0
+        self.rewrite_plan(scorePlacements=[first, second])
+        self.assertEqual(self.build()["runtimeSeconds"], self.runtime)
+        silence = {"movement": "hush", "silence": True, "timelineStart": 1.5,
+                   "timelineDuration": 2.5, "reason": "No one plays here."}
+        self.rewrite_plan(scorePlacements=[first, silence, second])
+        self.build()
+
+    def test_overlap_runtime_escape_and_named_silence_track_are_refused(self) -> None:
+        first, second = copy.deepcopy(self.plan["scorePlacements"])
+        cases = {
+            "overlap": [first, {**second, "timelineStart": 2.5}],
+            "runs past": [first, {**second, "timelineDuration": 3.5}],
+            "must not name": [first, {"movement": "hush", "silence": True, "timelineStart": 3.0,
+                                      "timelineDuration": 1.0, "track": second["track"]}],
+        }
+        for message, rows in cases.items():
+            with self.subTest(message):
+                self.rewrite_plan(scorePlacements=rows)
+                with self.assertRaisesRegex(mixer.MixError, message):
+                    self.build()
+
+    def test_an_empty_score_needs_an_unscored_declaration(self) -> None:
+        self.rewrite_plan(scorePlacements=[])
+        with self.assertRaisesRegex(mixer.MixError, "unscored: true"):
+            self.build()
+        self.rewrite_plan(scorePlacements=[], unscored=True)
+        self.build()
+        self.rewrite_plan(unscored=True)
+        with self.assertRaisesRegex(mixer.MixError, "only silence"):
+            self.build()
+
     def test_render_run_must_preserve_semantic_segments_exactly_once(self) -> None:
         path = self.assembly / "picture-render-runs.json"
         runs = json.loads(path.read_text())

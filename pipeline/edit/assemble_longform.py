@@ -791,6 +791,17 @@ def build_music(ep: Path, work: Path, plan: dict, wave: dict) -> Path:
     stem = np.zeros((total, 2), np.float32)
     decisions = []
     for movement in plan["scorePlacements"]:
+        if movement.get("silence") is True:
+            # An authored stretch with no score: nothing is decoded or placed,
+            # and the conform audit keeps one row per placement in order.
+            decisions.append({
+                "movement": movement["movement"], "silence": True,
+                "timelineStart": movement["timelineStart"],
+                "timelineDuration": movement["timelineDuration"],
+                **({"reason": movement["reason"]} if "reason" in movement else {}),
+                "repriseJoins": [],
+            })
+            continue
         source_path = bound_path(ep, movement["track"], f"score {movement['movement']}")
         verify_sha(
             source_path, movement.get("trackSha256", ""),

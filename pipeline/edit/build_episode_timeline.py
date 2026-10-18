@@ -309,6 +309,31 @@ PICTURE_ROUTES = {"h3", "picture"}  # "h3" is the historical name of the silent 
 ORIGIN_KINDS = {"h3-ingest", "kie-video", "derivative", "supplied"}
 
 
+def _is_silence_placement(row: Any) -> bool:
+    return isinstance(row, dict) and row.get("silence") is True
+
+
+def _silence_placement(row: dict[str, Any]) -> dict[str, Any]:
+    """An authored stretch with no score. It binds no media, so it needs no review.
+
+    Gaps between placements are already silence; this marker only names one.
+    """
+    movement = row.get("movement")
+    start, duration = row.get("timelineStart"), row.get("timelineDuration")
+    if not isinstance(movement, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", movement):
+        raise ValueError("a silence placement needs a movement name")
+    if (isinstance(start, bool) or not isinstance(start, (int, float)) or not math.isfinite(start)
+            or start < 0 or isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration <= 0):
+        raise ValueError(f"{movement}: silence timelineStart/duration are invalid")
+    if any(key in row for key in ("track", "trackSha256", "sidecar", "sidecarSha256", "take")):
+        raise ValueError(f"{movement}: a silence placement names no score take")
+    if "reason" in row and (not isinstance(row["reason"], str) or not row["reason"].strip()):
+        raise ValueError(f"{movement}: a silence reason must be text")
+    return {"movement": movement, "silence": True, "timelineStart": start, "timelineDuration": duration,
+            **({"reason": row["reason"]} if "reason" in row else {})}
+
+
 def _beat_identity(row: dict[str, Any] | None) -> Any:
     """A beat may be authored as an object with a number or as a bare scalar."""
     beat = row.get("beat") if isinstance(row, dict) else None
@@ -1340,7 +1365,7 @@ def build_timeline(
     if not isinstance(score_placements_raw, list):
         errors.append({"type": "config", "error": "scorePlacements must be an array"})
         score_placements_raw = []
-    if config.get('requireApprovedScore') and not score_placements_raw:
+    if config.get('requireApprovedScore') and all(_is_silence_placement(row) for row in score_placements_raw):
         missing.append({'type':'score-admission', 'reason':'This episode requires a reviewed score; no score placements are admitted.'})
 
     production_path = docs.get("productionOverrides", (None, {}))[0]
@@ -1880,7 +1905,20 @@ def build_timeline(
 
     validated_score_placements: list[dict[str, Any]] = []
     score_documents: dict[str, dict[str, Any]] = {}
-    if score_placements_raw:
+    unscored = config.get("unscored", False)
+    if type(unscored) is not bool:
+        errors.append({"type": "config", "error": "unscored must be a boolean"})
+        unscored = False
+    scored_placements = [row for row in score_placements_raw if not _is_silence_placement(row)]
+    if unscored and (scored_placements or config.get("requireApprovedScore")):
+        errors.append({"type": "score-admission",
+                       "error": "an unscored film may carry only silence placements and cannot require a score"})
+    if score_placements_raw and not scored_placements:
+        try:
+            validated_score_placements = [_silence_placement(row) for row in score_placements_raw]
+        except ValueError as exc:
+            errors.append({"type": "score-admission", "error": str(exc)})
+    elif score_placements_raw:
         score_manifest_path = _resolve_path(
             episode, repo, config_path,
             config.get("scoreManifest", "work/music-score-v1/execution-manifest.json"),
@@ -1909,6 +1947,14 @@ def build_timeline(
             cues = {str(row.get("id")): row for row in score_doc.get("cues", [])}
             seen_score_placements: set[str] = set()
             for pos, placement in enumerate(score_placements_raw):
+                if _is_silence_placement(placement):
+                    # Authored order is kept: a silence sits between admitted takes.
+                    silence = _silence_placement(placement)
+                    if silence["movement"] in seen_score_placements:
+                        raise ValueError(f"score placement {pos} duplicates {silence['movement']}")
+                    seen_score_placements.add(silence["movement"])
+                    validated_score_placements.append(silence)
+                    continue
                 if not isinstance(placement, dict):
                     raise ValueError(f"score placement {pos} must be an object")
                 movement = str(placement.get("movement") or "")
@@ -2609,6 +2655,8 @@ def build_timeline(
         "musicBreaths": config.get("musicBreaths", []),
         "sfxManifest": config.get("sfxManifest"),
     }
+    if unscored:
+        edit_plan["unscored"] = True
     if transitions:
         edit_plan["transitions"] = transitions
     if frame:
@@ -2737,6 +2785,11 @@ the colon; nothing here is required):
                                    accepted picture borrows its nearest
                                    neighbour's surplus: true
   musicBreaths                     [{shots, level, reason}] score dips: none
+  scorePlacements gaps, {movement, silence: true, timelineStart,
+  timelineDuration, reason}        stretches with no score; a gap between
+                                   placements is silence: none
+  unscored                         the film has no score, so an empty
+                                   scorePlacements list is intended: false
   transitions                      [{after, kind, frames, reason}], kind dissolve,
                                    dip-to-black or dip-to-white: every boundary
                                    is a cut

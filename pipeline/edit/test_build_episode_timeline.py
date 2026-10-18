@@ -543,6 +543,34 @@ class TimelineBuilderTest(unittest.TestCase):
         ready=json.loads((self.ep/'work/assembly-v1/timeline-readiness.json').read_text())
         self.assertTrue(any(r['type']=='score-admission' for r in ready['missing']))
 
+    def test_an_unscored_film_may_name_silences_without_a_score_manifest(self):
+        config = json.loads(self.config.read_text())
+        hush = {"movement": "hush", "silence": True, "timelineStart": 0.0, "timelineDuration": 3.0}
+        config.update(unscored=True, scorePlacements=[hush])
+        self.write_json(self.config, config)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.assertIs(plan["unscored"], True)
+        self.assertEqual(plan["scorePlacements"], [hush])
+
+    def test_unscored_contradictions_and_bad_silences_are_refused(self):
+        pristine = json.loads(self.config.read_text())
+        cases = {
+            "require": dict(unscored=True, requireApprovedScore=True, scorePlacements=[]),
+            "type": dict(unscored="yes", scorePlacements=[]),
+            "take": dict(scorePlacements=[{"movement": "hush", "silence": True, "take": 1,
+                                           "timelineStart": 0, "timelineDuration": 1}]),
+            "duration": dict(scorePlacements=[{"movement": "hush", "silence": True,
+                                               "timelineStart": 0, "timelineDuration": 0}]),
+        }
+        for label, changes in cases.items():
+            with self.subTest(label):
+                self.write_json(self.config, {**pristine, **changes})
+                with self.assertRaises(timeline.TimelineIncomplete):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                ready = json.loads((self.ep / "work/assembly-v1/timeline-readiness.json").read_text())
+                self.assertTrue(ready["errors"], ready)
+
     def test_pending_score_measurement_never_creates_renderable_plan(self):
         config=json.loads(self.config.read_text())
         config.update(requireApprovedScore=True, scorePlacements=[])
@@ -1077,10 +1105,15 @@ class TimelineBuilderTest(unittest.TestCase):
             "reviewExportSha256": self.sha(review), "reviewFingerprint": fingerprint,
             "timelineStart": 0.0, "timelineDuration": 10.0,
         }]
+        hush = {"movement": "hush-after-m1", "silence": True, "timelineStart": 10.0,
+                "timelineDuration": 2.0, "reason": "The last image plays with no score."}
+        config["scorePlacements"].append(hush)
         self.write_json(self.config, config)
         ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
         self.assertTrue(ready["ready"])
         self.assertEqual(plan["scorePlacements"][0]["trackSha256"], track_sha)
+        # An authored silence keeps its place after the admitted take and binds nothing.
+        self.assertEqual(plan["scorePlacements"][1], hush)
         # A review row that names no reviewer or method adds nothing to the plan.
         self.assertEqual(set(plan["scorePlacements"][0]) - set(config["scorePlacements"][0]),
                          {"executionManifest", "executionManifestSha256", "reviewedAt"})
@@ -1840,7 +1873,7 @@ class TimelineBuilderTest(unittest.TestCase):
                  "audioTail": {"seconds": 0.5, "reason": "Let the breath ring under the next shot."}}
         film = {"transitions": [{"after": "demo-s003", "kind": "dip-to-black", "frames": 12,
                                  "reason": "A breath of dark before the last image."}],
-                "frameAspect": "2.39:1", "cadence": 2}
+                "frameAspect": "2.39:1", "cadence": 2, "unscored": True}
         for key, value in list(scene.items()) + list(film.items()):
             with self.subTest(key):
                 config = json.loads(pristine)
