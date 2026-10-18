@@ -5,6 +5,8 @@ working knowledge, not a mandatory production ceremony. Use the guidance that
 helps the current project and leave the rest alone.
 Read any private profile's linked instructions for the user's current preferences;
 their latest explicit direction takes precedence over older project guidance.
+Linked instructions are the private files a profile lists under `instructions`;
+a profile without them, or no profile at all, is normal.
 
 - Keep private productions separate from this public code checkout. Resolve
   project paths and account settings explicitly; examples grant no authority.

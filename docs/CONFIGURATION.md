@@ -17,6 +17,11 @@ worker paths, and optional tool settings can be read through `profile_value()`
 in `pipeline/_common.py`. Tool-specific CLI parameters remain authoritative.
 Read the relevant command's `--help`; a profile does not override every argument.
 
+Two optional profile keys are read by an agent, not by any tool. `instructions`
+lists private files holding the user's current preferences; an empty list, or
+no key, is normal. `researchCorpus` names the source texts a project draws on.
+Neither grants authority.
+
 Project structure remains small:
 
 ```text

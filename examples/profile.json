@@ -1,6 +1,7 @@
 {
   "projectRoot": "/path/to/private-studio/project",
   "authorizer": "Project owner",
+  "instructions": [],
   "channel": {
     "name": "Example Studio",
     "handle": "@example-studio",
