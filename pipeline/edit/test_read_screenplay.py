@@ -118,6 +118,17 @@ class ReadScreenplayTest(unittest.TestCase):
             self.assertFalse({'still_id', 'shot', 'durationSeconds', 'holdSeconds'} & set(unit))
         self.assertTrue((self.project / 'story/source-units-v1.md').is_file())
 
+    def test_a_byte_order_mark_does_not_hide_the_title_page(self):
+        self.screenplay.write_bytes(b'\xef\xbb\xbfTitle: Demo\r\n\r\nINT. DEMO ROOM - DAY\r\n\r\nA lamp.\r\n')
+        self.read()
+        doc = self.units()
+        self.assertEqual(doc['titlePage'], {'Title': 'Demo'})
+        self.assertEqual([(u['kind'], u['text']) for u in doc['units']],
+                         [('heading', 'INT. DEMO ROOM - DAY'), ('action', 'A lamp.')])
+        # The recorded hash is still over the file's own bytes, mark included.
+        self.assertEqual(doc['sourceSha256'], reader.sha256_bytes(self.screenplay.read_bytes()))
+        self.assertEqual(reader.read_units('\ufeffTitle: Demo\n\nA lamp.\n')[0], {'Title': 'Demo'})
+
     def test_rereading_the_same_file_writes_nothing_new(self):
         self.read()
         before = sorted(p.name for p in (self.project / 'story').iterdir())

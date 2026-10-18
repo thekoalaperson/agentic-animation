@@ -308,7 +308,8 @@ def _block_elements(block, elements, uncertain):
 
 def read_units(raw_text):
     """Parse Fountain text; return (title page, units, flags)."""
-    text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
+    # A byte-order mark from a Windows editor is not part of the first line.
+    text = raw_text.removeprefix('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
     lines = list(enumerate(text.split('\n'), 1))
     elements = []
     lines = _strip_spans(lines, BONEYARD, 'boneyard', elements)
@@ -441,7 +442,7 @@ def render_markdown(doc):
 
 def read_mode(project, screenplay, output):
     raw = screenplay.read_bytes()
-    title, units, flags = read_units(raw.decode('utf-8'))
+    title, units, flags = read_units(raw.decode('utf-8-sig'))
     directory = project / 'story'
     versions = _versions(directory)
     previous = versions[-1][1] if versions else None

@@ -101,7 +101,7 @@ def parse_row(index, line, still_id):
 
 def source_text(path):
     """Return the comparable text of a source: units file, Fountain or plain text."""
-    raw = path.read_text(encoding='utf-8')
+    raw = path.read_text(encoding='utf-8-sig')
     if path.suffix == '.json':
         doc = json.loads(raw)
         if doc.get('kind') != 'screenplay-source-units':

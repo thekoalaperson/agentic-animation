@@ -123,6 +123,14 @@ class CompileProductionScriptTest(unittest.TestCase):
         self.assertEqual(beyond['rows'], [{'id': 'demo-s003', 'text': 'रात गहरी है।'}])
         self.assertEqual([k for k in audit if k != 'authoredBeyondSource'], list(plain))
 
+    def test_source_script_ignores_a_byte_order_mark(self):
+        for name in ('demo.fountain', 'demo.txt'):
+            path = self.ep / 'story' / name
+            path.write_bytes('\ufeffINT. DEMO ROOM - DAY\n\nA lamp on a table.\n'.encode('utf-8'))
+            text = compiler.source_text(path)
+            self.assertFalse(text.startswith('\ufeff'), name)
+            self.assertIn('INT. DEMO ROOM - DAY', text)
+
     def test_speech_density_counts_without_a_rate_and_estimates_with_one(self):
         lines = ['1 | DEMO ONE | मैं यहाँ हूँ। | I am here.', '2 | Narrator | दीपक जलता है। | The lamp burns.',
                  '3 | - | | | wordless']
