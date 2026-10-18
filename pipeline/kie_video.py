@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """Source-bound Kie video generation and durable request recovery.
-Usage: kie_video.py <geminiomni|grok|grok15|kling3omni|kling3omniref|pixverse6|pixverse6transition|pixverse6ref|pixverse6extend|seedance|seedance2mini|seedance25|veo3fast|model-id> <out_stem> <prompt.txt>
-       <first_frame_or_reference.png> [--res 720p] [--dur N]
-       [--ref extra.png ...] [--ar 16:9] [--reference-only] [--audio]
-       [--multi-clip] [--video source.mp4] [--ref-name semantic_name ...]
-Grok family: --ref images join image_urls in order (first_frame=@image1,
-refs=@image2..N, ≤7 total); aspect_ratio auto-forced 16:9 on multi-ref
-(KIE.md law), override with --ar. Persists <stem>.pending.json before the
-generation POST (orphan law), then records the returned taskId; sidecar
-.vid.json binds the request and landed bytes. Audio note: Grok embeds audio —
-assembly strips it."""
-import hashlib, json, os, pathlib, re, sys, time
+
+One invocation makes at most one generation POST. Before that POST it writes
+<stem>.pending.json, then records the returned taskId; a later invocation with
+the same inputs polls that task instead of posting again. The landed .mp4 and
+its .vid.json sidecar bind the request, the inputs and the output bytes.
+
+The finite dialogue runner calls this tool with the four positionals plus
+--res, --dur, --ar, --job-id, --manifest-sha256, --source-sha256 and
+--execution-request-sha256. Grok routes add each --ref after the first frame in
+image_urls (the first frame is @image1, references @image2 onward) and send
+aspect_ratio 16:9 on a multi-reference call unless --ar says otherwise. Grok
+clips carry embedded audio.
+
+--print-request shows the provider body with placeholder URLs and never
+uploads, reads a credential or wallet, or touches a recovery record.
+--resume-only polls an already-recorded task and refuses to create one. It
+never uploads or reads a wallet, so a landed task without a provider receipt
+records credits and creditsSource as null.
+
+Every upload is appended to AGENTIC_UPLOAD_LOG, or, when that is unset, to
+upload-log.jsonl beside the output stem."""
+import argparse, hashlib, json, os, pathlib, re, sys, time
 import urllib.parse
 import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from _common import kie, upload_ref, env_key, canonical_sha256, sha256_file as file_sha256
+from _common import (kie, upload_ref, env_key, canonical_sha256, sha256_file as file_sha256,
+                     usd_per_credit)
 
 MODELS = {'grok': 'grok-imagine/image-to-video',
           'grok15': 'grok-imagine-video-1-5-preview',
@@ -34,6 +46,15 @@ MODELS = {'grok': 'grok-imagine/image-to-video',
 
 SHA256 = re.compile(r'[0-9a-f]{64}\Z')
 PENDING_VERSION = 2
+# A request that sends --ref images is recorded as version 3, so a reader that
+# knows only the single-still contract refuses it; without references the
+# records stay version 2 byte for byte. Both versions resume.
+PENDING_VERSION_WITH_REFS = 3
+RECORD_VERSIONS = {PENDING_VERSION, PENDING_VERSION_WITH_REFS}
+
+
+def record_version(refs):
+    return PENDING_VERSION_WITH_REFS if refs else PENDING_VERSION
 
 
 def download_public_media(url):
@@ -169,8 +190,9 @@ def validate_landed_pair(video, sidecar, pending, expected_local,
     if not video.exists():
         return False
     meta = read_json(sidecar, 'video sidecar')
+    if meta.get('provenanceVersion') not in RECORD_VERSIONS:
+        sys.exit(f'landed sidecar mismatch for provenanceVersion: {sidecar}')
     required = {
-        'provenanceVersion': PENDING_VERSION,
         'model': expected_local['model'],
         'jobId': expected_local['jobId'],
         'executionManifestSha256': expected_local['executionManifestSha256'],
@@ -208,52 +230,238 @@ def validate_landed_pair(video, sidecar, pending, expected_local,
         pending.unlink()
     return True
 
-def main(argv=None):
+def build_input(model, prompt, url, upload, *, res, dur, last, refs, videos,
+                ref_names, ar, reference_only, generate_audio, multi_clip):
+    """Return one provider input; ``upload`` resolves every extra file to a URL."""
     # Seedance 2 schema (docs.kie.ai, verified 2026-07-22): first frame goes
     # in first_frame_url (SINGULAR STRING — image_urls is invalid and was a
     # rejected API request); last_frame_url enables keyframe choreography;
     # duration 4-15s; fast tier caps at 720p; no seed field; audio defaults
     # ON so we force it off (assembly strips audio anyway).
-    argv = list(sys.argv[1:] if argv is None else argv)
-    args, res, dur, last, refs, videos, ref_names, ar = [], '720p', None, None, [], [], [], None
-    manifest_sha256 = source_sha256_arg = execution_request_sha256 = job_id = None
-    reference_only, generate_audio, multi_clip = False, False, False
-    i = 0
-    while i < len(argv):
-        if argv[i] == '--res':
-            res = argv[i + 1]; i += 2
-        elif argv[i] == '--dur':
-            dur = argv[i + 1]; i += 2
-        elif argv[i] == '--last':
-            last = argv[i + 1]; i += 2
-        elif argv[i] == '--ref':
-            refs.append(argv[i + 1]); i += 2
-        elif argv[i] == '--video':
-            videos.append(argv[i + 1]); i += 2
-        elif argv[i] == '--ref-name':
-            ref_names.append(argv[i + 1]); i += 2
-        elif argv[i] == '--ar':
-            ar = argv[i + 1]; i += 2
-        elif argv[i] == '--reference-only':
-            reference_only = True; i += 1
-        elif argv[i] == '--audio':
-            generate_audio = True; i += 1
-        elif argv[i] == '--multi-clip':
-            multi_clip = True; i += 1
-        elif argv[i] == '--manifest-sha256':
-            manifest_sha256 = argv[i + 1]; i += 2
-        elif argv[i] == '--source-sha256':
-            source_sha256_arg = argv[i + 1]; i += 2
-        elif argv[i] == '--execution-request-sha256':
-            execution_request_sha256 = argv[i + 1]; i += 2
-        elif argv[i] == '--job-id':
-            job_id = argv[i + 1]; i += 2
+    if model == 'google/gemini-omni-flash-1-1':
+        if refs or videos:
+            sys.exit('Gemini Omni Flash 1.1 frame mode accepts its first and '
+                     'last frame here; free references are a separate payload')
+        inp = {'first_frame_url': url,
+               'prompt': prompt,
+               'duration': str(dur or 8),
+               'audio_ids': [],
+               'aspect_ratio': ar or '16:9',
+               'character_ids': [],
+               'resolution': res,
+               'seed': 0}
+        if last:
+            inp['last_frame_url'] = upload(last)
+    elif model.startswith('bytedance/seedance'):
+        # Seedance 2.5 has two deliberately exclusive visual modes on KIE:
+        # first/last-frame choreography OR free reference-to-video.  Do not
+        # smuggle identity refs beside a first frame; the live schema hides
+        # all reference fields when first_frame_url is populated.
+        if reference_only:
+            if last:
+                sys.exit('--last cannot be combined with --reference-only')
+            inp = {'prompt': prompt,
+                   'reference_image_urls': [url] + [upload(r) for r in refs],
+                   'reference_video_urls': [upload(v) for v in videos],
+                   'generate_audio': generate_audio, 'resolution': res,
+                   'aspect_ratio': ar or '16:9', 'output_format': 'mp4',
+                   'web_search': False, 'nsfw_checker': True}
         else:
-            args.append(argv[i]); i += 1
-    if len(args) != 4:
-        sys.exit(__doc__)
-    model = MODELS.get(args[0], args[0])
-    name, prompt_file, frame = args[1], args[2], args[3]
+            if videos:
+                sys.exit('Seedance video references require --reference-only; '
+                         'first-frame and multimodal-reference modes are exclusive')
+            if refs:
+                sys.exit('Seedance first-frame mode cannot accept --ref; '
+                         'use --reference-only or remove the extra refs')
+            # Seedance 2.5's first-frame and first/last-frame modes require
+            # adaptive aspect handling. The supplied frame geometry remains
+            # authoritative; an explicit 16:9 value is rejected by KIE.
+            seedance_aspect = ('adaptive' if model == 'bytedance/seedance-2-5'
+                               else (ar or '16:9'))
+            inp = {'prompt': prompt, 'first_frame_url': url,
+                   'generate_audio': generate_audio, 'resolution': res,
+                   'aspect_ratio': seedance_aspect, 'output_format': 'mp4',
+                   'web_search': False, 'nsfw_checker': True}
+            if last:
+                inp['last_frame_url'] = upload(last)
+    elif model == 'gemini-omni-video':
+        omni_urls = [url] + [upload(r) for r in refs]
+        if len(videos) > 1:
+            sys.exit('Gemini Omni accepts at most one video input')
+        if len(omni_urls) + 2 * len(videos) > 7:
+            sys.exit('Gemini Omni input quota exceeded: each image is one '
+                     'unit, one video is two units, total must be <= 7')
+        inp = {'prompt': prompt, 'image_urls': omni_urls,
+               'aspect_ratio': ar or '16:9', 'resolution': res, 'seed': 0}
+        if videos:
+            # Official KIE contract: one video in video_list, two quota units.
+            # With video input, Gemini determines output length; duration is
+            # intentionally omitted rather than pretending it controls edit
+            # length. `ends` is the selected source interval, not output time.
+            source_end = int(dur) if dur else 10
+            inp['video_list'] = [{'url': upload(videos[0]),
+                                  'start': 0, 'ends': source_end}]
+    elif model == 'kling-3.0-omni/image-to-video':
+        if last:
+            sys.exit('Kling 3.0 Omni start/end work requires a dedicated '
+                     'two-frame request; --last is not yet exposed here')
+        inp = {'image_urls': [url] + [upload(r) for r in refs],
+               'prefer_multi_shots': False,
+               'customize_multi_shots': False,
+               'prompt': prompt, 'elements': [], 'audio': generate_audio,
+               'resolution': res, 'aspect_ratio': ar or 'auto'}
+    elif model == 'kling-3.0-omni/reference-to-video':
+        if last:
+            sys.exit('Kling 3.0 Omni reference-to-video does not use --last')
+        kling_urls = [url] + [upload(r) for r in refs]
+        if len(kling_urls) > 4:
+            sys.exit('Kling 3.0 Omni reference-to-video accepts at most four images')
+        if len(videos) > 1:
+            sys.exit('Kling 3.0 Omni reference-to-video accepts at most one video')
+        if ref_names and len(ref_names) != len(kling_urls):
+            sys.exit('Kling 3.0 Omni reference-to-video requires one '
+                     '--ref-name for every image')
+        names = ref_names or [f'ref_{n + 1}' for n in range(len(kling_urls))]
+        # The first image remains the scene authority. Every additional image
+        # is also exposed as a named Kling element so plain-English prompts can
+        # assign identity/object ownership without positional @image syntax.
+        inp = {'image_urls': kling_urls,
+               'video_urls': [upload(v) for v in videos],
+               'customize_multi_shots': False,
+               'prompt': prompt,
+               'kling_elements': [
+                   {'name': names[n], 'description': names[n].replace('_', ' '),
+                    'element_input_urls': [u]}
+                   for n, u in enumerate(kling_urls[1:], start=1)
+               ],
+               'resolution': res, 'aspect_ratio': ar or '16:9',
+               'audio': generate_audio}
+    elif model == 'pixverse-v6/image-to-video':
+        # PixVerse V6 image-to-video treats image_urls as source frames rather
+        # than free identity references. Keep this lane deliberately narrow:
+        # animate one approved scene plate (or at most the two files accepted
+        # by KIE), and describe motion rather than repainting the frame.
+        if last:
+            sys.exit('PixVerse V6 first/last-frame work uses its transition '
+                     'endpoint, not image-to-video --last')
+        pixverse_urls = [url] + [upload(r) for r in refs]
+        if len(pixverse_urls) > 2:
+            sys.exit('PixVerse V6 image-to-video accepts at most two images')
+        inp = {'prompt': prompt, 'image_urls': pixverse_urls,
+               'quality': res, 'generate_audio_switch': generate_audio,
+               'seed': 0, 'generate_multi_clip_switch': multi_clip}
+        if dur:
+            inp['duration'] = int(dur)
+    elif model == 'pixverse-v6/transition':
+        if not last:
+            sys.exit('PixVerse V6 transition requires --last')
+        if refs or videos:
+            sys.exit('PixVerse V6 transition accepts only its first and last frames')
+        inp = {'prompt': prompt,
+               'duration': int(dur or 10),
+               'first_frame_image_url': url,
+               'last_frame_image_url': upload(last),
+               'quality': res,
+               'generate_audio_switch': generate_audio,
+               'seed': 0}
+    elif model == 'pixverse-v6/reference-to-video':
+        if last:
+            sys.exit('PixVerse Fusion does not use --last')
+        pixverse_urls = [url] + [upload(r) for r in refs]
+        if len(pixverse_urls) > 7:
+            sys.exit('PixVerse V6 Fusion accepts at most seven references')
+        if ref_names and len(ref_names) != len(pixverse_urls):
+            sys.exit('PixVerse Fusion requires one --ref-name for every '
+                     'image (the primary frame plus every --ref)')
+        names = ref_names or ['assembled', 'mechanism', 'motion_map']
+        inp = {'prompt': prompt,
+               'image_references': [
+                   {'image_url': u, 'type': 'subject',
+                    'ref_name': names[n] if n < len(names) else f'ref_{n + 1}'}
+                   for n, u in enumerate(pixverse_urls)],
+               'aspect_ratio': ar or '16:9', 'quality': res,
+               'generate_audio_switch': generate_audio, 'seed': 0}
+    elif model == 'pixverse-v6/extend':
+        if last or refs or videos:
+            sys.exit('PixVerse V6 Extend accepts one parent video only; '
+                     'pass it as the primary input without --last/--ref/--video')
+        inp = {'video_url': url, 'prompt': prompt,
+               'quality': res, 'generate_audio_switch': generate_audio,
+               'seed': 0}
+    elif model == 'veo3_fast':
+        if last:
+            sys.exit('Veo reference-to-video does not use --last')
+        veo_urls = [url] + [upload(r) for r in refs]
+        if len(veo_urls) > 3:
+            sys.exit('Veo 3.1 Fast reference-to-video accepts at most three references')
+        inp = {'prompt': prompt, 'imageUrls': veo_urls, 'model': 'veo3_fast',
+               'aspect_ratio': ar or '16:9', 'resolution': res,
+               'generationType': 'REFERENCE_2_VIDEO',
+               'enableFallback': False, 'enableTranslation': True}
+    else:
+        # Grok family: extra --ref images join image_urls in order (@image2..N
+        # in the prompt; first_frame is @image1). aspect_ratio is MANDATORY on
+        # multi-ref calls (KIE.md: omitting it births portrait clips).
+        inp = {'prompt': prompt,
+               'image_urls': [url] + [upload(r) for r in refs],
+               'resolution': res}
+        if ar:
+            inp['aspect_ratio'] = ar
+        elif refs:
+            inp['aspect_ratio'] = '16:9'
+    if dur and model not in {'veo3_fast', 'google/gemini-omni-flash-1-1'} and not (model == 'gemini-omni-video' and videos):
+        inp['duration'] = str(dur) if model == 'gemini-omni-video' else int(dur)
+    return inp
+
+
+PLACEHOLDER_URL = 'https://placeholder.invalid/not-uploaded/'
+
+
+def parse_arguments(argv):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Routes: ' + ', '.join(f'{k}={v}' for k, v in sorted(MODELS.items()))
+               + '. Any other value is sent as a literal Kie model id.')
+    parser.add_argument('route', help='route alias or literal Kie model id')
+    parser.add_argument('out_stem', help='output stem; writes .mp4, .vid.json and .pending.json')
+    parser.add_argument('prompt_file', help='prompt text file (its bytes are hash-bound)')
+    parser.add_argument('frame', help='first frame, primary reference or parent video')
+    parser.add_argument('--res', default='720p', help='provider resolution (default 720p)')
+    parser.add_argument('--dur', help='requested seconds, sent in the provider\'s own type')
+    parser.add_argument('--ar', help='aspect ratio; Grok multi-reference calls default to 16:9')
+    parser.add_argument('--last', help='last-frame image where the route accepts one')
+    parser.add_argument('--ref', action='append', help='extra reference image, in order')
+    parser.add_argument('--video', action='append', help='reference or source video')
+    parser.add_argument('--ref-name', action='append', help='semantic name for each image')
+    parser.add_argument('--reference-only', action='store_true',
+                        help='Seedance reference mode instead of first-frame mode')
+    parser.add_argument('--audio', action='store_true', help='request generated audio')
+    parser.add_argument('--multi-clip', action='store_true', help='PixVerse multi-clip switch')
+    parser.add_argument('--job-id', help='frozen job id (dialogue runner)')
+    parser.add_argument('--manifest-sha256', help='frozen execution manifest SHA-256')
+    parser.add_argument('--source-sha256', help='expected primary input SHA-256')
+    parser.add_argument('--execution-request-sha256',
+                        help='canonical execution request SHA-256 from the runner')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--print-request', action='store_true',
+                       help='print the provider request with placeholder URLs; no upload, '
+                            'credential, wallet or recovery-record access')
+    modes.add_argument('--resume-only', action='store_true',
+                       help='poll an already-recorded taskId; refuse rather than POST')
+    return parser.parse_intermixed_args(argv)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    options = parse_arguments(argv)
+    res, dur, last, ar = options.res, options.dur, options.last, options.ar
+    refs, videos, ref_names = options.ref or [], options.video or [], options.ref_name or []
+    manifest_sha256, source_sha256_arg = options.manifest_sha256, options.source_sha256
+    execution_request_sha256, job_id = options.execution_request_sha256, options.job_id
+    reference_only, generate_audio = options.reference_only, options.audio
+    multi_clip, resume_only = options.multi_clip, options.resume_only
+    model = MODELS.get(options.route, options.route)
+    name, prompt_file, frame = options.out_stem, options.prompt_file, options.frame
     embedded_audio = generate_audio or model in {
         'grok-imagine/image-to-video', 'grok-imagine-video-1-5-preview',
         'gemini-omni-video', 'google/gemini-omni-flash-1-1'}
@@ -282,6 +490,22 @@ def main(argv=None):
         videos=videos, ref_names=ref_names, reference_only=reference_only,
         generate_audio=embedded_audio, multi_clip=multi_clip)
     local_request_sha256 = canonical_sha256(local_request)
+    input_options = dict(res=res, dur=dur, last=last, refs=refs, videos=videos,
+                         ref_names=ref_names, ar=ar, reference_only=reference_only,
+                         generate_audio=generate_audio, multi_clip=multi_clip)
+    if options.print_request:
+        def placeholder(path):
+            return PLACEHOLDER_URL + pathlib.Path(path).name
+        inp = build_input(model, prompt, placeholder(frame), placeholder, **input_options)
+        endpoint = 'veo/generate' if model == 'veo3_fast' else 'jobs/createTask'
+        body = inp if model == 'veo3_fast' else {'model': model, 'input': inp}
+        print(json.dumps({
+            'mode': 'PRINT_REQUEST', 'networkCalls': 0,
+            'note': 'URLs are placeholders for files a submission would upload',
+            'endpoint': endpoint, 'body': body, 'localRequest': local_request,
+            'localRequestSha256': local_request_sha256,
+        }, ensure_ascii=False, sort_keys=True, indent=2))
+        return
     if validate_landed_pair(landed, landed_meta, landed_pending,
                             local_request, local_request_sha256):
         print(f'{landed} exists with a validated sidecar — skip')
@@ -290,7 +514,7 @@ def main(argv=None):
     # querying a wallet. Only an already-recorded taskId is safe to poll.
     if landed_pending.exists():
         early_orphan = read_json(landed_pending, 'pending recovery record')
-        if early_orphan.get('provenanceVersion') != PENDING_VERSION:
+        if early_orphan.get('provenanceVersion') not in RECORD_VERSIONS:
             sys.exit(f'legacy pending record requires manual reconciliation: '
                      f'{landed_pending}')
         if early_orphan.get('localRequestSha256') != local_request_sha256:
@@ -302,182 +526,33 @@ def main(argv=None):
                 or not early_orphan['taskId']):
             sys.exit(f'pending task state {early_orphan.get("status")!r} requires '
                      f'manual reconciliation: {landed_pending}')
+    if resume_only and not landed_pending.exists():
+        sys.exit(f'no recorded paid task to resume at {landed_pending}; '
+                 'resume-only never creates a generation request')
+    # Read before any paid call so a malformed profile cannot fail after one.
+    # Recovery of an already-paid task must not be blocked by it.
+    try:
+        usd_rate = usd_per_credit()
+    except ValueError as exc:
+        if not resume_only:
+            sys.exit(str(exc))
+        print(f'{exc}; recovering without a USD figure', file=sys.stderr)
+        usd_rate = None
     t0 = time.time()
-    url = upload_ref(frame)
-    wallet_before = kie('chat/credit')
-    if model == 'google/gemini-omni-flash-1-1':
-        if refs or videos:
-            sys.exit('Gemini Omni Flash 1.1 frame mode accepts its first and '
-                     'last frame here; free references are a separate payload')
-        inp = {'first_frame_url': url,
-               'prompt': prompt,
-               'duration': str(dur or 8),
-               'audio_ids': [],
-               'aspect_ratio': ar or '16:9',
-               'character_ids': [],
-               'resolution': res,
-               'seed': 0}
-        if last:
-            inp['last_frame_url'] = upload_ref(last)
-    elif model.startswith('bytedance/seedance'):
-        # Seedance 2.5 has two deliberately exclusive visual modes on KIE:
-        # first/last-frame choreography OR free reference-to-video.  Do not
-        # smuggle identity refs beside a first frame; the live schema hides
-        # all reference fields when first_frame_url is populated.
-        if reference_only:
-            if last:
-                sys.exit('--last cannot be combined with --reference-only')
-            inp = {'prompt': prompt,
-                   'reference_image_urls': [url] + [upload_ref(r) for r in refs],
-                   'reference_video_urls': [upload_ref(v) for v in videos],
-                   'generate_audio': generate_audio, 'resolution': res,
-                   'aspect_ratio': ar or '16:9', 'output_format': 'mp4',
-                   'web_search': False, 'nsfw_checker': True}
-        else:
-            if videos:
-                sys.exit('Seedance video references require --reference-only; '
-                         'first-frame and multimodal-reference modes are exclusive')
-            if refs:
-                sys.exit('Seedance first-frame mode cannot accept --ref; '
-                         'use --reference-only or remove the extra refs')
-            # Seedance 2.5's first-frame and first/last-frame modes require
-            # adaptive aspect handling. The supplied frame geometry remains
-            # authoritative; an explicit 16:9 value is rejected by KIE.
-            seedance_aspect = ('adaptive' if model == 'bytedance/seedance-2-5'
-                               else (ar or '16:9'))
-            inp = {'prompt': prompt, 'first_frame_url': url,
-                   'generate_audio': generate_audio, 'resolution': res,
-                   'aspect_ratio': seedance_aspect, 'output_format': 'mp4',
-                   'web_search': False, 'nsfw_checker': True}
-            if last:
-                inp['last_frame_url'] = upload_ref(last)
-    elif model == 'gemini-omni-video':
-        omni_urls = [url] + [upload_ref(r) for r in refs]
-        if len(videos) > 1:
-            sys.exit('Gemini Omni accepts at most one video input')
-        if len(omni_urls) + 2 * len(videos) > 7:
-            sys.exit('Gemini Omni input quota exceeded: each image is one '
-                     'unit, one video is two units, total must be <= 7')
-        inp = {'prompt': prompt, 'image_urls': omni_urls,
-               'aspect_ratio': ar or '16:9', 'resolution': res, 'seed': 0}
-        if videos:
-            # Official KIE contract: one video in video_list, two quota units.
-            # With video input, Gemini determines output length; duration is
-            # intentionally omitted rather than pretending it controls edit
-            # length. `ends` is the selected source interval, not output time.
-            source_end = int(dur) if dur else 10
-            inp['video_list'] = [{'url': upload_ref(videos[0]),
-                                  'start': 0, 'ends': source_end}]
-    elif model == 'kling-3.0-omni/image-to-video':
-        if last:
-            sys.exit('Kling 3.0 Omni start/end work requires a dedicated '
-                     'two-frame request; --last is not yet exposed here')
-        inp = {'image_urls': [url] + [upload_ref(r) for r in refs],
-               'prefer_multi_shots': False,
-               'customize_multi_shots': False,
-               'prompt': prompt, 'elements': [], 'audio': generate_audio,
-               'resolution': res, 'aspect_ratio': ar or 'auto'}
-    elif model == 'kling-3.0-omni/reference-to-video':
-        if last:
-            sys.exit('Kling 3.0 Omni reference-to-video does not use --last')
-        kling_urls = [url] + [upload_ref(r) for r in refs]
-        if len(kling_urls) > 4:
-            sys.exit('Kling 3.0 Omni reference-to-video accepts at most four images')
-        if len(videos) > 1:
-            sys.exit('Kling 3.0 Omni reference-to-video accepts at most one video')
-        if ref_names and len(ref_names) != len(kling_urls):
-            sys.exit('Kling 3.0 Omni reference-to-video requires one '
-                     '--ref-name for every image')
-        names = ref_names or [f'ref_{n + 1}' for n in range(len(kling_urls))]
-        # The first image remains the scene authority. Every additional image
-        # is also exposed as a named Kling element so plain-English prompts can
-        # assign identity/object ownership without positional @image syntax.
-        inp = {'image_urls': kling_urls,
-               'video_urls': [upload_ref(v) for v in videos],
-               'customize_multi_shots': False,
-               'prompt': prompt,
-               'kling_elements': [
-                   {'name': names[n], 'description': names[n].replace('_', ' '),
-                    'element_input_urls': [u]}
-                   for n, u in enumerate(kling_urls[1:], start=1)
-               ],
-               'resolution': res, 'aspect_ratio': ar or '16:9',
-               'audio': generate_audio}
-    elif model == 'pixverse-v6/image-to-video':
-        # PixVerse V6 image-to-video treats image_urls as source frames rather
-        # than free identity references. Keep this lane deliberately narrow:
-        # animate one approved scene plate (or at most the two files accepted
-        # by KIE), and describe motion rather than repainting the frame.
-        if last:
-            sys.exit('PixVerse V6 first/last-frame work uses its transition '
-                     'endpoint, not image-to-video --last')
-        pixverse_urls = [url] + [upload_ref(r) for r in refs]
-        if len(pixverse_urls) > 2:
-            sys.exit('PixVerse V6 image-to-video accepts at most two images')
-        inp = {'prompt': prompt, 'image_urls': pixverse_urls,
-               'quality': res, 'generate_audio_switch': generate_audio,
-               'seed': 0, 'generate_multi_clip_switch': multi_clip}
-        if dur:
-            inp['duration'] = int(dur)
-    elif model == 'pixverse-v6/transition':
-        if not last:
-            sys.exit('PixVerse V6 transition requires --last')
-        if refs or videos:
-            sys.exit('PixVerse V6 transition accepts only its first and last frames')
-        inp = {'prompt': prompt,
-               'duration': int(dur or 10),
-               'first_frame_image_url': url,
-               'last_frame_image_url': upload_ref(last),
-               'quality': res,
-               'generate_audio_switch': generate_audio,
-               'seed': 0}
-    elif model == 'pixverse-v6/reference-to-video':
-        if last:
-            sys.exit('PixVerse Fusion does not use --last')
-        pixverse_urls = [url] + [upload_ref(r) for r in refs]
-        if len(pixverse_urls) > 7:
-            sys.exit('PixVerse V6 Fusion accepts at most seven references')
-        if ref_names and len(ref_names) != len(pixverse_urls):
-            sys.exit('PixVerse Fusion requires one --ref-name for every '
-                     'image (the primary frame plus every --ref)')
-        names = ref_names or ['assembled', 'mechanism', 'motion_map']
-        inp = {'prompt': prompt,
-               'image_references': [
-                   {'image_url': u, 'type': 'subject',
-                    'ref_name': names[n] if n < len(names) else f'ref_{n + 1}'}
-                   for n, u in enumerate(pixverse_urls)],
-               'aspect_ratio': ar or '16:9', 'quality': res,
-               'generate_audio_switch': generate_audio, 'seed': 0}
-    elif model == 'pixverse-v6/extend':
-        if last or refs or videos:
-            sys.exit('PixVerse V6 Extend accepts one parent video only; '
-                     'pass it as the primary input without --last/--ref/--video')
-        inp = {'video_url': url, 'prompt': prompt,
-               'quality': res, 'generate_audio_switch': generate_audio,
-               'seed': 0}
-    elif model == 'veo3_fast':
-        if last:
-            sys.exit('Veo reference-to-video does not use --last')
-        veo_urls = [url] + [upload_ref(r) for r in refs]
-        if len(veo_urls) > 3:
-            sys.exit('Veo 3.1 Fast reference-to-video accepts at most three references')
-        inp = {'prompt': prompt, 'imageUrls': veo_urls, 'model': 'veo3_fast',
-               'aspect_ratio': ar or '16:9', 'resolution': res,
-               'generationType': 'REFERENCE_2_VIDEO',
-               'enableFallback': False, 'enableTranslation': True}
+    if resume_only:
+        # Recovery polls a recorded taskId; it never uploads or reads a wallet.
+        inp = wallet_before = None
     else:
-        # Grok family: extra --ref images join image_urls in order (@image2..N
-        # in the prompt; first_frame is @image1). aspect_ratio is MANDATORY on
-        # multi-ref calls (KIE.md: omitting it births portrait clips).
-        inp = {'prompt': prompt,
-               'image_urls': [url] + [upload_ref(r) for r in refs],
-               'resolution': res}
-        if ar:
-            inp['aspect_ratio'] = ar
-        elif refs:
-            inp['aspect_ratio'] = '16:9'
-    if dur and model not in {'veo3_fast', 'google/gemini-omni-flash-1-1'} and not (model == 'gemini-omni-video' and videos):
-        inp['duration'] = str(dur) if model == 'gemini-omni-video' else int(dur)
+        # The log records which bytes left the machine and where they went.
+        upload_log = (os.environ.get('AGENTIC_UPLOAD_LOG')
+                      or str(landed.resolve().parent / 'upload-log.jsonl'))
+
+        def upload(path):
+            return upload_ref(path, upload_log)
+
+        url = upload(frame)
+        wallet_before = kie('chat/credit')
+        inp = build_input(model, prompt, url, upload, **input_options)
     # Persist uncertainty *before* the paid POST.  A crash in the small interval
     # between provider acceptance and receiving a taskId must block, never turn
     # into a second automatic generation.
@@ -485,7 +560,7 @@ def main(argv=None):
     pending.parent.mkdir(parents=True, exist_ok=True)
     if pending.exists():
         orphan = read_json(pending, 'pending recovery record')
-        if orphan.get('provenanceVersion') != PENDING_VERSION:
+        if orphan.get('provenanceVersion') not in RECORD_VERSIONS:
             sys.exit(f'legacy pending record requires manual reconciliation: {pending}')
         if orphan.get('localRequestSha256') != local_request_sha256:
             sys.exit(f'pending task payload mismatch at {pending} — resolve it '
@@ -517,7 +592,7 @@ def main(argv=None):
         }
         request_fingerprint = canonical_sha256(request)
         orphan = {
-            'provenanceVersion': PENDING_VERSION,
+            'provenanceVersion': record_version(refs),
             'status': 'POSTING_UNCERTAIN',
             'taskId': None,
             'jobId': job_id,
@@ -561,8 +636,13 @@ def main(argv=None):
         if state in ('success', 'fail'):
             break
     if state == 'fail':
+        # A definite provider failure: the runner skips it and never re-POSTs.
+        # The refusal facts are lifted beside the raw response; credits keeps
+        # the sidecar's name.
+        facts = rec if isinstance(rec, dict) else {}
         orphan.update(status='GENERATION_FAILED', lastProviderResponse=rec,
-                      providerFinishedAt=time.time())
+                      providerFinishedAt=time.time(), failCode=facts.get('failCode'),
+                      failMsg=facts.get('failMsg'), credits=facts.get('creditsConsumed'))
         atomic_json(pending, orphan, replace=True)
     elif state != 'success':
         orphan.update(status='PENDING', lastProviderResponse=rec,
@@ -580,12 +660,17 @@ def main(argv=None):
         sys.exit('no resultUrls: ' + json.dumps(rec)[:500])
     mp4 = download_public_media(urls[0])
     output_sha256 = hashlib.sha256(mp4).hexdigest()
+    # A provider receipt is per-task evidence; a wallet delta can include
+    # other tasks running at the same time, so it is labelled as such.
     credits = rec.get('creditsConsumed')
-    if credits is None:
+    credits_source = 'receipt' if credits is not None else None
+    if credits is None and not resume_only:
         saved = read_json(pending, 'pending recovery record')
-        credits = max(0, float(saved.get('walletBefore', wallet_before))
-                      - float(kie('chat/credit')))
-    meta = {'provenanceVersion': PENDING_VERSION,
+        before = saved.get('walletBefore', wallet_before)
+        if before is not None:
+            credits = max(0, float(before) - float(kie('chat/credit')))
+            credits_source = 'wallet-delta'
+    meta = {'provenanceVersion': orphan['provenanceVersion'],
             'provider': 'kie.ai', 'model': model, 'taskId': task,
             'jobId': job_id,
             'executionManifestSha256': manifest_sha256,
@@ -605,7 +690,8 @@ def main(argv=None):
             'audio': embedded_audio,
             'input': request['input'],
             'credits': credits,
-            'cost_usd': round(credits * 0.005, 4) if credits else None,
+            'creditsSource': credits_source,
+            'cost_usd': round(credits * usd_rate, 4) if credits and usd_rate else None,
             'res': res, 'dur': dur, 'first_frame': frame,
             'last_frame': last,
             'refs': [frame] + refs, 'aspect_ratio': inp.get('aspect_ratio'),
@@ -626,7 +712,9 @@ def main(argv=None):
                   sidecarSha256=file_sha256(landed_meta), landedAt=time.time())
     atomic_json(pending, orphan, replace=True)
     pending.unlink()
-    print(f'{landed}  ${meta["cost_usd"]}  {meta["secs"]}s  {model} {res}')
+    cost = (f'${meta["cost_usd"]}' if meta['cost_usd'] is not None
+            else f'{credits} credits' if credits is not None else 'credits not reported')
+    print(f'{landed}  {cost}  {meta["secs"]}s  {model} {res}')
 
 if __name__ == '__main__':
     main()

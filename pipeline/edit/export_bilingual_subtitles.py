@@ -29,8 +29,12 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 import textwrap
 from typing import Any, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _common import load_relocation_map, relocated_path_matches
 
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -104,9 +108,10 @@ def safe_output_directory(episode: Path, value: Path) -> Path:
     return output
 
 
-def validate_edit_plan(plan: dict[str, Any], expected_scenes: int) -> tuple[list[dict[str, Any]], str, float, float]:
-    if plan.get("schemaVersion") != 2 or plan.get("language") != "hi":
-        raise SubtitleExportError("Final edit plan must be schema 2 on the Hindi master clock")
+def validate_edit_plan(plan: dict[str, Any], expected_scenes: int,
+                       master: str = "hi") -> tuple[list[dict[str, Any]], str, float, float]:
+    if plan.get("schemaVersion") != 2 or plan.get("language") != master:
+        raise SubtitleExportError(f"Final edit plan must be schema 2 on the {master} master clock")
     fingerprint = plan.get("timelineFingerprint")
     if not isinstance(fingerprint, str) or not SHA256_RE.fullmatch(fingerprint):
         raise SubtitleExportError("Edit plan has no valid final timeline fingerprint")
@@ -166,12 +171,13 @@ def _validate_timing_document(
     events: list[dict[str, Any]],
     fingerprint: str,
     runtime: float,
+    master: str = "hi",
 ) -> list[dict[str, Any]]:
     if (
         doc.get("schemaVersion") != 1
         or doc.get("kind") != "hindi-master-subtitle-timing-input"
         or doc.get("language") != language
-        or doc.get("masterLanguage") != "hi"
+        or doc.get("masterLanguage", "hi") != master
     ):
         raise SubtitleExportError(f"Invalid final {language} subtitle timing contract")
     if doc.get("timelineFingerprint") != fingerprint:
@@ -205,7 +211,8 @@ def _validate_timing_document(
             raise SubtitleExportError(f"{language} timing changed {scene_id}.dialogue")
         if shot.get("passage") != event.get("passage"):
             raise SubtitleExportError(f"{language} timing changed {scene_id}.passage")
-        expected_text = event.get("subtitleTextHi" if language == "hi" else "subtitleTextEn")
+        # subtitleTextHi is the edit plan's master-language text field.
+        expected_text = event.get("subtitleTextHi" if language == master else "subtitleTextEn")
         text = shot.get("text")
         if not isinstance(text, str) or not text.strip() or text != expected_text:
             raise SubtitleExportError(f"{language} timing text differs from final plan at {scene_id}")
@@ -215,7 +222,7 @@ def _validate_timing_document(
                 raise SubtitleExportError(f'Authored subtitle clauses differ from final plan at {scene_id}')
         elif 'cueParts' in shot or 'cueWeights' in shot:
             raise SubtitleExportError(f'Unbound authored subtitle clauses at {scene_id}')
-        if language == "hi" and not DEVANAGARI_RE.search(text):
+        if language == master == "hi" and not DEVANAGARI_RE.search(text):
             raise SubtitleExportError(f"Hindi subtitle has no Devanagari at {scene_id}")
         if language == "en" and DEVANAGARI_RE.search(text):
             raise SubtitleExportError(f"English subtitle contains Devanagari at {scene_id}")
@@ -257,6 +264,21 @@ def _evidence_master_path(evidence: dict[str, Any], key: str) -> Path:
     return Path(value).resolve()
 
 
+def _names_master(evidence: dict[str, Any], master: Path, episode: Path | None,
+                  relocation: dict[str, Any] | None) -> bool:
+    """The audit names this master, here or in the project before a move.
+
+    A moved master matches through the episode-relative path new audits record
+    beside the absolute one, or through an explicit relocation map. The master
+    hash comparison that follows is unchanged in every case.
+    """
+    recorded = _evidence_master_path(evidence, "master")
+    if recorded == master or episode is None:
+        return recorded == master
+    return relocated_path_matches(evidence["master"], master, episode, relocation,
+                                  evidence.get("masterEpisodeRelative"))
+
+
 def validate_master_evidence(
     master: Path,
     clock: dict[str, Any],
@@ -266,6 +288,8 @@ def validate_master_evidence(
     runtime: float,
     fps: float,
     max_master_tail_seconds: float,
+    episode: Path | None = None,
+    relocation: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     if not master.is_file() or master.stat().st_size <= 0:
         raise SubtitleExportError(f"Missing or empty final master: {master}")
@@ -275,7 +299,7 @@ def validate_master_evidence(
 
     if clock.get("passed") is not True or clock.get("decodeTimestampsStrictlyIncreasing") is not True:
         raise SubtitleExportError("Final master packet-clock audit has not passed")
-    if _evidence_master_path(clock, "master") != master:
+    if not _names_master(clock, master, episode, relocation):
         raise SubtitleExportError("Packet-clock audit names a different final master")
     if clock.get("sha256") != master_sha:
         raise SubtitleExportError("Final master hash differs from packet-clock evidence")
@@ -294,7 +318,7 @@ def validate_master_evidence(
 
     if sync.get("passed") is not True or sync.get("timingPassed") is not True or sync.get("voicePresencePassed") is not True:
         raise SubtitleExportError("Final master voice-sync evidence has not passed")
-    if _evidence_master_path(sync, "master") != master:
+    if not _names_master(sync, master, episode, relocation):
         raise SubtitleExportError("Voice-sync audit names a different final master")
     if sync.get("masterSha256") != master_sha:
         raise SubtitleExportError("Final master hash differs from voice-sync evidence")
@@ -366,9 +390,28 @@ def minimum_partition_count(text: str, width: int) -> int:
     raise SubtitleExportError("Subtitle contains a word wider than the two-line reading contract")
 
 
+def line_widths(master_doc: dict[str, Any], en_doc: dict[str, Any]) -> dict[str, int]:
+    """Characters per line for the master slot ("hi") and English, from the timing docs.
+
+    A timing document may declare maximumCharactersPerLine for its own language;
+    otherwise today's table applies, and a language with no entry must declare one.
+    """
+    widths = {}
+    for slot, doc in (("hi", master_doc), ("en", en_doc)):
+        language = doc.get("language")
+        width = doc.get("maximumCharactersPerLine", LANGUAGE_WIDTH.get(language))
+        if isinstance(width, bool) or not isinstance(width, int) or not 8 <= width <= 80:
+            raise SubtitleExportError(
+                f"{language} timing needs maximumCharactersPerLine as an integer from 8 to 80")
+        widths[slot] = width
+    return widths
+
+
 def build_synchronized_cues(
-    hi: list[dict[str, Any]], en: list[dict[str, Any]]
+    hi: list[dict[str, Any]], en: list[dict[str, Any]], widths: dict[str, int] | None = None
 ) -> tuple[list[Cue], list[Cue], list[dict[str, Any]]]:
+    """Paired cues; "hi" is the master-language slot, whatever that language is."""
+    widths = widths or LANGUAGE_WIDTH
     result = {"hi": [], "en": []}
     coverage: list[dict[str, Any]] = []
     for hi_shot, en_shot in zip(hi, en):
@@ -392,12 +435,12 @@ def build_synchronized_cues(
                 raise SubtitleExportError(f'Invalid paired clause weights at {scene_id}')
         else:
             minimums = {
-                language: minimum_partition_count(texts[language], LANGUAGE_WIDTH[language])
+                language: minimum_partition_count(texts[language], widths[language])
                 for language in ("hi", "en")
             }
             count = max(minimums.values())
             parts = {
-                language: _partition(texts[language], count, LANGUAGE_WIDTH[language])
+                language: _partition(texts[language], count, widths[language])
                 for language in ("hi", "en")
             }
             weights=[1]*count
@@ -422,7 +465,7 @@ def build_synchronized_cues(
             cue_end = end if index == count - 1 else start + (end - start) * cumulative / total_weight
             for language in ("hi", "en"):
                 assert parts[language] is not None
-                wrapped = "\n".join(_wrapped_lines(parts[language][index], LANGUAGE_WIDTH[language]))
+                wrapped = "\n".join(_wrapped_lines(parts[language][index], widths[language]))
                 result[language].append(Cue(cue_start, cue_end, wrapped, scene_id))
         coverage.append(
             {
@@ -437,8 +480,8 @@ def build_synchronized_cues(
                 **({"passage": hi_shot["passage"]} if hi_shot.get("passage") else {}),
             }
         )
-    validate_cues(result["hi"], "hi")
-    validate_cues(result["en"], "en")
+    validate_cues(result["hi"], "hi", widths["hi"])
+    validate_cues(result["en"], "en", widths["en"])
     if [(row.start, row.end) for row in result["hi"]] != [
         (row.start, row.end) for row in result["en"]
     ]:
@@ -446,7 +489,8 @@ def build_synchronized_cues(
     return result["hi"], result["en"], coverage
 
 
-def validate_cues(cues: Iterable[Cue], language: str) -> None:
+def validate_cues(cues: Iterable[Cue], language: str, width: int | None = None) -> None:
+    width = LANGUAGE_WIDTH[language] if width is None else width
     previous_end = 0.0
     previous_end_ms = 0
     seen = False
@@ -462,7 +506,7 @@ def validate_cues(cues: Iterable[Cue], language: str) -> None:
                 f"at {cue.scene_id}"
             )
         lines = cue.text.splitlines()
-        if len(lines) > 2 or any(len(line) > LANGUAGE_WIDTH[language] for line in lines):
+        if len(lines) > 2 or any(len(line) > width for line in lines):
             raise SubtitleExportError(f"{language} cue exceeds reading width at {cue.scene_id}")
         if language == "en" and DEVANAGARI_RE.search(cue.text):
             raise SubtitleExportError(f"English cue contains Devanagari at {cue.scene_id}")
@@ -510,6 +554,7 @@ def export_subtitles(
     expected_scenes: int | None = None,
     max_master_tail_seconds: float = 30.0,
     basename: str | None = None,
+    relocation_map: Path | None = None,
 ) -> dict[str, Any]:
     episode = episode.resolve()
     if not episode.is_dir():
@@ -535,10 +580,15 @@ def export_subtitles(
         expected_scenes = len(plan.get("events", []))
     if expected_scenes <= 0:
         raise SubtitleExportError("The frozen edit plan must contain at least one scene")
-    events, fingerprint, runtime, fps = validate_edit_plan(plan, expected_scenes)
+    # The master language is read from the timing document; Hindi when absent.
+    language = hi_doc.get("masterLanguage", "hi")
+    if not isinstance(language, str) or not re.fullmatch(r"[a-z]{2,3}", language) or language == "en":
+        raise SubtitleExportError(f"Invalid master language in the timing document: {language!r}")
+    events, fingerprint, runtime, fps = validate_edit_plan(plan, expected_scenes, language)
     spoken = spoken_events(events)
-    hi_shots = _validate_timing_document(hi_doc, "hi", spoken, fingerprint, runtime)
-    en_shots = _validate_timing_document(en_doc, "en", spoken, fingerprint, runtime)
+    hi_shots = _validate_timing_document(hi_doc, language, spoken, fingerprint, runtime, language)
+    en_shots = _validate_timing_document(en_doc, "en", spoken, fingerprint, runtime, language)
+    widths = line_widths(hi_doc, en_doc)
     validate_bilingual_geometry(hi_shots, en_shots)
     master_sha, master_duration = validate_master_evidence(
         master,
@@ -549,8 +599,10 @@ def export_subtitles(
         runtime,
         fps,
         max_master_tail_seconds,
+        episode=episode,
+        relocation=load_relocation_map(relocation_map),
     )
-    hi_cues, en_cues, coverage = build_synchronized_cues(hi_shots, en_shots)
+    hi_cues, en_cues, coverage = build_synchronized_cues(hi_shots, en_shots, widths)
     if hi_cues[-1].end > master_duration + 1.01 / fps:
         raise SubtitleExportError("Final subtitle cue extends beyond the final master")
 
@@ -561,7 +613,7 @@ def export_subtitles(
         raise SubtitleExportError("Subtitle basename must be one safe filename component")
 
     output.mkdir(parents=True, exist_ok=True)
-    hi_output = output / f"{basename}-hi.srt"
+    hi_output = output / f"{basename}-{language}.srt"
     en_output = output / f"{basename}-en.srt"
     hi_text = render_srt(hi_cues)
     en_text = render_srt(en_cues)
@@ -572,7 +624,7 @@ def export_subtitles(
         "schemaVersion": 1,
         "kind": "bilingual-work-subtitle-export",
         "episode": plan.get("episode", episode.name),
-        "masterLanguage": "hi",
+        "masterLanguage": language,
         "timelineFingerprint": fingerprint,
         "sceneCount": len(events),
         "cueCount": len(hi_cues),
@@ -597,7 +649,7 @@ def export_subtitles(
             },
         },
         "outputs": {
-            "hi": {"path": str(hi_output), "sha256": sha256_file(hi_output)},
+            language: {"path": str(hi_output), "sha256": sha256_file(hi_output)},
             "en": {"path": str(en_output), "sha256": sha256_file(en_output)},
         },
         "validation": {
@@ -609,7 +661,7 @@ def export_subtitles(
             "voiceSyncBoundToEditPlan": True,
             "outputRestrictedToEpisodeWork": True,
             "maximumLinesPerCue": 2,
-            "maximumCharactersPerLine": LANGUAGE_WIDTH,
+            "maximumCharactersPerLine": {language: widths["hi"], "en": widths["en"]},
         },
         "coverage": coverage,
         "humanReview": (
@@ -641,6 +693,8 @@ def main() -> None:
     parser.add_argument("--expected-scenes", type=int, help="Optional explicit scene-count cross-check")
     parser.add_argument("--max-master-tail-seconds", type=float, default=30.0)
     parser.add_argument("--basename")
+    parser.add_argument("--relocation-map", type=Path,
+                        help="explicit map for a moved project: originalEpisodeRoot and/or paths")
     args = parser.parse_args()
     audit = export_subtitles(
         args.episode,
@@ -654,6 +708,7 @@ def main() -> None:
         expected_scenes=args.expected_scenes,
         max_master_tail_seconds=args.max_master_tail_seconds,
         basename=args.basename,
+        relocation_map=args.relocation_map,
     )
     print(
         json.dumps(

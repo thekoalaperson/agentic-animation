@@ -58,6 +58,8 @@ def main():
                     help='Use the measured full speech-file window, excluding authored post-speech musical breath')
     ap.add_argument('--analysis-sample-rate', type=int, choices=(8000, 48000), default=8000,
                     help='Use native 48kHz to resolve fractional-8kHz-sample AAC offsets without correlation quantization loss')
+    ap.add_argument("--episode", type=Path,
+                    help="Project root; also records the master's project-relative path so the audit survives a move")
     args = ap.parse_args()
     SR = args.analysis_sample_rate
     plan = json.loads(args.plan.read_text())
@@ -105,6 +107,8 @@ def main():
               "passed": all(x["pass"] for x in rows), "results": rows}
     if skipped:
         result["pictureEventsWithoutVoice"] = skipped
+    if args.episode is not None:
+        result["masterEpisodeRelative"] = args.master.resolve().relative_to(args.episode.resolve()).as_posix()
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k:v for k,v in result.items() if k != "results"}, indent=2))
     if not result["passed"]:

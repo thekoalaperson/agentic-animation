@@ -25,6 +25,9 @@ ROOT_FIELDS = {
     "topUpAuthorized", "automaticRetryAuthorized", "manifests", "projectRoot",
 }
 MANIFEST_FIELDS = {"lane", "manifestPath", "manifestSha256", "finiteExecution"}
+# Version 3 is version 2 plus a retry grant: automaticRetryAuthorized true and a
+# retryBudget a person set. Everything else is checked by the version 2 rules.
+RETRY_BUDGET_FIELDS = {"jobs", "credits"}
 
 
 class PaidApprovalError(ValueError):
@@ -57,18 +60,51 @@ def validate_paid_approval(
     manifest_path: Path,
     manifest_sha256: str,
     finite_execution: dict[str, Any],
+    allow_retry_budget: bool = False,
 ) -> dict[str, Any] | None:
     """Return normalized authorization evidence, or ``None`` when not supplied.
 
     Version 2 binds a relocatable private project and explicit finite limits.
     Profiles do not authorize spending. Historical grants and their original
     runners remain immutable; this function never upgrades a legacy grant.
+
+    Version 3 adds a person's retry grant and is accepted only by a runner that
+    passes ``allow_retry_budget``; its other fields pass the version 2 checks.
     """
     if admission_path is None:
         return None
     admission_path = admission_path.resolve()
-    manifest_path = manifest_path.resolve()
     doc = _read_object(admission_path)
+    if doc.get("schemaVersion") == 3:
+        if not allow_retry_budget:
+            raise PaidApprovalError(f"the {lane} lane does not retry; use a version 2 record")
+        budget = doc.get("retryBudget")
+        if doc.get("automaticRetryAuthorized") is not True:
+            raise PaidApprovalError("a version 3 record exists to grant retries: "
+                                    "automaticRetryAuthorized must be true")
+        if (not isinstance(budget, dict) or set(budget) != RETRY_BUDGET_FIELDS
+                or isinstance(budget["jobs"], bool) or not isinstance(budget["jobs"], int)
+                or budget["jobs"] <= 0 or isinstance(budget["credits"], bool)
+                or not isinstance(budget["credits"], (int, float))
+                or not math.isfinite(budget["credits"]) or budget["credits"] <= 0):
+            raise PaidApprovalError("retryBudget must be {jobs, credits}, explicit positive limits")
+        view = {key: value for key, value in doc.items() if key != "retryBudget"}
+        view.update(schemaVersion=2, automaticRetryAuthorized=False)
+        evidence = _validate_document(view, admission_path, episode=episode, lane=lane,
+                                      manifest_path=manifest_path, manifest_sha256=manifest_sha256,
+                                      finite_execution=finite_execution)
+        return {**evidence, "schemaVersion": 3, "automaticRetryAuthorized": True,
+                "retryBudget": dict(budget)}
+    return _validate_document(doc, admission_path, episode=episode, lane=lane,
+                              manifest_path=manifest_path, manifest_sha256=manifest_sha256,
+                              finite_execution=finite_execution)
+
+
+def _validate_document(doc: dict[str, Any], admission_path: Path, *, episode: str, lane: str,
+                       manifest_path: Path, manifest_sha256: str,
+                       finite_execution: dict[str, Any]) -> dict[str, Any]:
+    """The version 2 checks, applied to the record as read."""
+    manifest_path = manifest_path.resolve()
     if set(doc) != ROOT_FIELDS:
         raise PaidApprovalError("paid authorization root schema mismatch")
     expected = {
@@ -159,3 +195,200 @@ def validate_paid_approval(
         "manifestSha256": manifest_sha256,
         "finiteExecution": finite_execution,
     }
+
+
+# ---------------------------------------------------------------------------
+# Command line: describe the lanes, draft an unsigned record, check a record.
+
+LANES = {
+    "grok-dialogue": {
+        "runner": "kie_dialogue_finite.py",
+        "finiteExecution": {
+            "jobs": "number of frozen jobs",
+            "generatedSeconds": "sum of frozen durationSeconds",
+            "credits": "the manifest's maximumCredits",
+        },
+    },
+    "elevenlabs-narration": {
+        "runner": "eleven_batch_finite.py",
+        "finiteExecution": {
+            "items": "number of frozen items",
+            "characters": "the manifest's aggregateCharacters",
+        },
+    },
+    "suno-score": {
+        "runner": "kie_music_finite.py",
+        "finiteExecution": {
+            "requests": "number of frozen cues",
+            "credits": "each cue's price: creditsPerRequest, or creditsPerExtendRequest for an extend",
+            "sourceSeconds": "sum of each cue's requested duration; an extend requests none",
+        },
+    },
+    "media-observation": {
+        "runner": "observe_media_finite.py",
+        "finiteExecution": {
+            "jobs": "number of review jobs",
+            "credits": "the plan's maxCredits",
+        },
+    },
+}
+
+GRANT_FIELDS = ("authorizedBy", "authorizedAtUtc", "authorizationText", "authorizationId")
+CLI_EPILOG = """\
+A draft leaves authorizedBy, authorizedAtUtc, authorizationText and
+authorizationId empty and its status DRAFT, which every runner refuses. Those
+fields record a person's actual grant: fill them from that person's own words
+at the time they give it, then set status to APPROVED. An agent never fills
+them from its own judgement, and a profile or a manifest's financialApproval
+is never a grant. Draft the record after the final freeze: any later edit to
+the manifest changes the hash the record binds."""
+
+
+def _lane_plan(lane: str, manifest: Path, project: Path | None) -> tuple[str, dict[str, Any], Path]:
+    """Return (episode, finiteExecution, projectRoot) exactly as the runner computes them."""
+    import importlib
+    import sys
+
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    manifest = manifest.resolve()
+    doc = _read_object(manifest)
+    common = importlib.import_module("_common")
+    if lane == "grok-dialogue":
+        runner = importlib.import_module("kie_dialogue_finite")
+        root = common.project_root(project)
+        try:
+            runner.configure(manifest, root, root / str(doc.get("productionOverrides")),
+                             None, root / str(doc.get("authority")))
+            plan = runner.load_plan(manifest, doc.get("maximumGeneratedSeconds"))
+        except runner.PlanError as exc:
+            raise PaidApprovalError(f"manifest is not runnable: {exc}") from exc
+        return runner.EPISODE_CODE, runner.approval_scope(plan), root
+    if lane == "elevenlabs-narration":
+        runner = importlib.import_module("eleven_batch_finite")
+        try:
+            plan = runner.load_plan(manifest, doc.get("aggregateCharacters") or 0)
+        except runner.PlanError as exc:
+            raise PaidApprovalError(f"manifest is not runnable: {exc}") from exc
+        return doc.get("episode"), runner.approval_scope(plan), common.project_root(project)
+    if lane == "suno-score":
+        runner = importlib.import_module("kie_music_finite")
+        try:
+            plan = runner.load_plan(manifest, doc.get("maxRequests") or 0, doc.get("maxCredits") or 0)
+        except runner.PlanError as exc:
+            raise PaidApprovalError(f"manifest is not runnable: {exc}") from exc
+        return doc.get("episode"), runner.approval_scope(plan), common.project_root(project)
+    if lane == "media-observation":
+        runner = importlib.import_module("observe_media_finite")
+        try:
+            scope = runner.approval_scope(doc)
+        except ValueError as exc:
+            raise PaidApprovalError(str(exc)) from exc
+        return doc.get("episode"), scope, common.project_root(project)
+    raise PaidApprovalError(f"unknown lane {lane!r}; known lanes: {', '.join(LANES)}")
+
+
+def draft_record(lane: str, manifest: Path, record: Path, project: Path | None = None) -> dict[str, Any]:
+    """Write an unsigned version-2 record that the validator refuses until a person grants it."""
+    import os
+
+    episode, scope, root = _lane_plan(lane, manifest, project)
+    manifest = manifest.resolve()
+    record = record.resolve()
+    try:
+        relative = manifest.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise PaidApprovalError("manifest is outside the project root") from exc
+    if not record.is_relative_to(root):
+        raise PaidApprovalError("keep the approval record inside the project it authorizes")
+    document = {
+        "schemaVersion": 2, "kind": "paid-generation-authorization",
+        "episode": episode, "status": "DRAFT",
+        "authorizationId": "", "authorizedBy": "", "authorizedAtUtc": "",
+        "authorizationText": [],
+        "budgetPolicy": "explicit-finite-limits",
+        "topUpAuthorized": False, "automaticRetryAuthorized": False,
+        "projectRoot": os.path.relpath(root, record.parent),
+        "manifests": [{"lane": lane, "manifestPath": relative,
+                       "manifestSha256": sha256_file(manifest), "finiteExecution": scope}],
+    }
+    raw = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with record.open("xb") as target:
+            target.write(raw)
+    except FileExistsError as exc:
+        raise PaidApprovalError(f"refusing to overwrite an existing record: {record}") from exc
+    return document
+
+
+def check_record(record: Path, manifest: Path, lane: str, project: Path | None = None) -> dict[str, Any]:
+    """Validate a record against the manifest as its runner would; name what is stale."""
+    episode, scope, _ = _lane_plan(lane, manifest, project)
+    try:
+        return validate_paid_approval(record, episode=episode, lane=lane,
+                                      manifest_path=manifest, manifest_sha256=sha256_file(manifest),
+                                      finite_execution=scope,
+                                      allow_retry_budget=lane == "grok-dialogue")
+    except PaidApprovalError as exc:
+        detail = [str(exc)]
+        try:
+            rows = [row for row in _read_object(record.resolve()).get("manifests", [])
+                    if isinstance(row, dict) and row.get("lane") == lane]
+        except PaidApprovalError:
+            rows = []
+        if len(rows) == 1 and isinstance(rows[0].get("finiteExecution"), dict):
+            recorded = rows[0]["finiteExecution"]
+            for key in sorted(set(recorded) | set(scope)):
+                if recorded.get(key) != scope.get(key):
+                    detail.append(f"finiteExecution.{key}: record {recorded.get(key)!r}, "
+                                  f"manifest {scope.get(key)!r}")
+        raise PaidApprovalError("; ".join(detail)) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description=__doc__, epilog=CLI_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("describe", help="print every lane and its exact finiteExecution keys")
+    draft = commands.add_parser("draft", help="write an unsigned DRAFT record for one manifest",
+                                epilog=CLI_EPILOG,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    draft.add_argument("lane", choices=sorted(LANES))
+    draft.add_argument("manifest", type=Path)
+    draft.add_argument("--out", type=Path, required=True, help="new record path inside the project")
+    draft.add_argument("--project", type=Path, help="project root (or AGENTIC_PROJECT_ROOT)")
+    check = commands.add_parser("check", help="validate a record against a manifest and lane")
+    check.add_argument("record", type=Path)
+    check.add_argument("manifest", type=Path)
+    check.add_argument("lane", choices=sorted(LANES))
+    check.add_argument("--project", type=Path, help="project root (or AGENTIC_PROJECT_ROOT)")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "describe":
+            result: Any = {"schemaVersion": 2, "lanes": LANES,
+                           "grantFields": list(GRANT_FIELDS), "note": CLI_EPILOG,
+                           "version3": "version 2 plus automaticRetryAuthorized true and "
+                                       "retryBudget {jobs, credits}, set by the person granting "
+                                       "retries; accepted only by the grok-dialogue lane, where it also "
+                                       "authorizes plain --submit and only --retry-failed "
+                                       "spends the retry budget"}
+        elif args.command == "draft":
+            result = draft_record(args.lane, args.manifest, args.out, args.project)
+        else:
+            result = {"status": "VALID", **check_record(args.record, args.manifest,
+                                                         args.lane, args.project)}
+    except (PaidApprovalError, ValueError) as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

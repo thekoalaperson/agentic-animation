@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -435,6 +437,168 @@ class BindingAndExecutionTests(unittest.TestCase):
                 stream.write(b"tamper")
             with self.assertRaisesRegex(ranker.AnalysisError, "media hash mismatch"):
                 ranker.execute(fixture.manifest_path)
+
+
+def author_dimensions(fixture: ManifestFixture, names: list[str], **manifest_extra) -> None:
+    """Rewrite the fixture's anchors with the operator's own axes and rebind the hash."""
+    fixture.anchors["dimensions"] = names
+    for number, row in enumerate(fixture.anchors["anchors"]):
+        row["values"] = {name: 20 + 30 * number + 5 * position
+                         for position, name in enumerate(names)}
+    write_json(fixture.anchors_path, fixture.anchors)
+    fixture.manifest["semanticAnchorsSha256"] = ranker.sha_file(fixture.anchors_path)
+    fixture.manifest.update(manifest_extra)
+    write_json(fixture.manifest_path, fixture.manifest)
+
+
+def full_curves(profile: dict) -> dict:
+    return {**profile, "promptBlend": 1,
+            "curves": {name: [[0.0, 0.3], [1.0, 0.6]] for name in ranker.TRAJECTORY_FEATURES}}
+
+
+class OpenDimensionTests(unittest.TestCase):
+    def test_default_table_is_the_default_reading(self) -> None:
+        rng = np.random.default_rng(7)
+        semantics = {name: rng.uniform(0, 1, 32) for name in ranker.SEMANTIC_DIMENSIONS}
+        tabled = ranker.table_proxies(ranker.DEFAULT_PROXY_WEIGHTS, semantics, 32)
+        for name, values in ranker.default_proxies(semantics).items():
+            np.testing.assert_allclose(tabled[name], values, rtol=0, atol=1e-12)
+
+    def test_default_eight_record_their_mapping_in_a_version_two_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            audio = pulse_track(seconds=12.0)
+            fixture.add_candidate(1, audio)
+            fixture.add_candidate(2, audio.copy())
+            with patch.object(ranker, "decode_audio", return_value=audio):
+                ranker.execute(fixture.manifest_path, do_analyze=True)
+            report = json.loads((fixture.root / "analysis/report.json").read_text())
+            self.assertEqual(report["version"], 2)
+            self.assertEqual(report["expectedCandidatesPerMovement"], 2)
+            mapping = report["dimensionMapping"]
+            self.assertEqual(mapping["source"], "default-eight-axis")
+            self.assertEqual(mapping["sha256"], ranker.sha_bytes(
+                ranker.canonical_bytes(ranker.DEFAULT_PROXY_WEIGHTS)))
+            self.assertEqual(set(mapping["defaulted"]), set(ranker.SEMANTIC_DIMENSIONS))
+            self.assertEqual(mapping["ignored"], [])
+
+    def test_other_axes_need_authored_weights_or_the_movements_own_curves(self) -> None:
+        names = ["demo-tension", "demo-distance"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            author_dimensions(fixture, names)
+            with self.assertRaisesRegex(ranker.AnalysisError, "proxyWeights.*promptBlend 1"):
+                ranker.execute(fixture.manifest_path)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            profile = full_curves(fixture.manifest["movementProfiles"]["m1-synthetic"])
+            author_dimensions(fixture, names, movementProfiles={"m1-synthetic": profile})
+            plan = ranker.load_plan(fixture.manifest_path)
+            self.assertEqual(plan["dimensionMapping"]["source"], "movement-curves-only")
+            self.assertEqual(plan["dimensionMapping"]["ignored"], names)
+            target = ranker.semantic_target(plan, plan["cues"][0])
+            np.testing.assert_allclose(target["proxies"]["lowFrequency"], np.linspace(0.3, 0.6, 12))
+
+    def test_authored_weights_drive_the_targets_and_are_recorded(self) -> None:
+        names = ["demo-tension", "demo-distance", "demo-unused"]
+        weights = {feature: {"intercept": 0.1, "weights": {"demo-tension": 0.5,
+                                                          "demo-distance": -0.2}}
+                   for feature in ranker.TRAJECTORY_FEATURES}
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            author_dimensions(fixture, names, proxyWeights=weights)
+            plan = ranker.load_plan(fixture.manifest_path)
+            mapping = plan["dimensionMapping"]
+            self.assertEqual((mapping["source"], mapping["mapped"], mapping["ignored"]),
+                             ("authored-proxyWeights", ["demo-distance", "demo-tension"],
+                              ["demo-unused"]))
+            target = ranker.semantic_target(plan, plan["cues"][0])
+            semantics = target["semantics"]
+            expected = np.clip(0.1 + 0.5 * semantics["demo-tension"]
+                               - 0.2 * semantics["demo-distance"], 0, 1)
+            np.testing.assert_allclose(target["proxies"]["lowFrequency"], expected)
+            for broken in ({**weights, "lowFrequency": {"intercept": 0, "weights": {"demo-other": 1}}},
+                           {k: v for k, v in weights.items() if k != "onsetActivity"},
+                           {**weights, "rmsEnergy": {"intercept": 0, "weights": {}, "clip": [0.5, 0.2]}}):
+                with self.subTest(broken=sorted(broken)):
+                    author_dimensions(fixture, names, proxyWeights=broken)
+                    with self.assertRaises(ranker.AnalysisError):
+                        ranker.load_plan(fixture.manifest_path)
+
+    def test_axis_names_may_be_any_non_blank_text(self) -> None:
+        names = ["demo-tensión", "demo held breath", "демо-даль"]
+        weights = {feature: {"intercept": 0.2, "weights": {names[0]: 0.4, names[1]: -0.1}}
+                   for feature in ranker.TRAJECTORY_FEATURES}
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            author_dimensions(fixture, names, proxyWeights=weights)
+            plan = ranker.load_plan(fixture.manifest_path)
+            self.assertEqual(list(plan["dimensions"]), names)
+            self.assertEqual(plan["dimensionMapping"]["ignored"], [names[2]])
+            for broken in ([*names, names[0]], [names[0], "  "], [names[0], 3]):
+                with self.subTest(broken=broken):
+                    author_dimensions(fixture, broken, proxyWeights=weights)
+                    with self.assertRaisesRegex(ranker.AnalysisError, "non-empty list of unique"):
+                        ranker.load_plan(fixture.manifest_path)
+
+    def test_landmarks_place_the_loudest_moment_and_the_tail(self) -> None:
+        audio = tone(330.0, seconds=12.0, amplitude=0.05)
+        burst = slice(round(6.0 * SAMPLE_RATE), round(6.5 * SAMPLE_RATE))
+        audio[burst] = tone(440.0, seconds=0.5, amplitude=0.8)
+        landmarks = features(audio)["landmarks"]
+        self.assertAlmostEqual(landmarks["peakRmsSeconds"], 6.25, delta=0.3)
+        self.assertAlmostEqual(landmarks["tailStartSeconds"], 12.0 - 3.0, delta=0.01)
+        self.assertIn("not verified musical phrases", landmarks["basis"])
+        onsets = features(pulse_track(seconds=12.0))["landmarks"]["strongestOnsets"]
+        times = [onset["seconds"] for onset in onsets]
+        self.assertTrue(0 < len(times) <= 5 and times == sorted(times))
+        pulses = np.arange(0.25, 12.0, 0.5)
+        self.assertTrue(all(np.min(np.abs(pulses - t)) < 0.1 for t in times))
+
+    def test_an_extend_without_a_requested_duration_is_not_flagged_short(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ManifestFixture(Path(directory))
+            fixture.creative["cues"][0]["payload"].pop("duration")
+            write_json(fixture.creative_path, fixture.creative)
+            fixture.creative_hash = ranker.sha_file(fixture.creative_path)
+            fixture.payload.pop("duration")
+            fixture.execution["sourceDraftSha256"] = fixture.creative_hash
+            fixture.execution["cues"][0]["payload"].pop("duration")
+            write_json(fixture.execution_path, fixture.execution)
+            fixture.execution_hash = ranker.sha_file(fixture.execution_path)
+            fixture.manifest["creativeDraftSha256"] = fixture.creative_hash
+            write_json(fixture.manifest_path, fixture.manifest)
+            audio = pulse_track(seconds=12.0)
+            fixture.add_candidate(1, audio)
+            with patch.object(ranker, "decode_audio", return_value=audio):
+                ranker.execute(fixture.manifest_path, do_analyze=True)
+            report = json.loads((fixture.root / "analysis/report.json").read_text())
+            candidate = report["candidates"][0]
+            self.assertEqual((candidate["requestedDurationSeconds"], candidate["durationFlag"]),
+                             (None, "NO_REQUESTED_DURATION"))
+
+
+class ScoreReviewPageTests(unittest.TestCase):
+    def test_review_page_reads_the_take_count_from_the_report(self) -> None:
+        try:
+            from pipeline import build_score_candidate_review as review
+        except ImportError:
+            import build_score_candidate_review as review
+        for takes in (1, 3):
+            with self.subTest(takes=takes), tempfile.TemporaryDirectory() as directory:
+                fixture = ManifestFixture(Path(directory))
+                fixture.execution["expectedCandidatesPerRequest"] = takes
+                write_json(fixture.execution_path, fixture.execution)
+                fixture.execution_hash = ranker.sha_file(fixture.execution_path)
+                audio = pulse_track(seconds=12.0)
+                for take in range(1, takes + 1):
+                    fixture.add_candidate(take, audio.copy())
+                with patch.object(ranker, "decode_audio", return_value=audio):
+                    ranker.execute(fixture.manifest_path, do_analyze=True)
+                page = fixture.root / "review/score.html"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    review.build(fixture.root / "analysis/report.json", fixture.creative_path, page)
+                self.assertEqual(page.read_text().count('"sha256"'), takes)
 
 
 if __name__ == "__main__":

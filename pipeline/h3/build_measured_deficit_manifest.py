@@ -34,6 +34,8 @@ from typing import Any, Callable, Iterable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import canonical_sha256 as _canonical_sha, is_below as _is_below, sha256_file as _sha256
 from _common import MediaWorkerRequired as _MediaWorkerRequired, extract_exact_frame as _extract_exact_frame
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stage_finite import H3_FRAME_OFFSET, H3_FRAME_STEP, frame_rule_problem
 
 
 DELIVERY_FPS = 24
@@ -514,6 +516,36 @@ def _stage_plan(plan: dict[str, Any], plan_path: Path, target: Path) -> tuple[Pa
     return manifest_path, _sha256(manifest_path)
 
 
+QUALIFIED_DEFAULT = {"seconds": 7, "expectedFrames": 175}
+
+
+def expected_frames_for(seconds: float, qualified: dict[str, Any] | None = None,
+                        snap: str | None = None) -> tuple[int, str | None]:
+    """Fill expectedFrames for an H3 request of ``seconds``.
+
+    A qualified table entry (the config's qualifiedRequest, or the recorded
+    7-second default) wins and returns ``(frames, None)``. Any other length gets
+    the 17n+5 candidate next to ``seconds * 24`` and the label ``unqualified``.
+    The direction to snap is not guessed: an exact fit needs none, otherwise
+    ``snap`` is "down" or "up", read from a qualification receipt.
+    """
+    qualified = qualified or {}
+    if "expectedFrames" in qualified:
+        return qualified["expectedFrames"], None
+    if seconds == QUALIFIED_DEFAULT["seconds"]:
+        return QUALIFIED_DEFAULT["expectedFrames"], None
+    target = seconds * DELIVERY_FPS
+    below = H3_FRAME_OFFSET + H3_FRAME_STEP * math.floor((target - H3_FRAME_OFFSET) / H3_FRAME_STEP)
+    if below == target:
+        return int(below), "unqualified"
+    if snap not in ("down", "up"):
+        raise DeficitPlanBlocked(
+            f"{seconds}s has no qualified frame count; the 17n+5 candidates are {int(below)} and "
+            f"{int(below) + H3_FRAME_STEP}. Set qualifiedRequest.frameSnap to 'down' or 'up' "
+            "from a qualification receipt, or give expectedFrames")
+    return int(below if snap == "down" else below + H3_FRAME_STEP), "unqualified"
+
+
 def _batch(items: list[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
     if not 1 <= size <= 32:
         raise DeficitPlanBlocked("Finite H3 batch size must be between 1 and 32")
@@ -603,12 +635,16 @@ def build(
 
     qualified = config.get("qualifiedRequest") or {}
     seconds = qualified.get("seconds", 7)
-    expected_frames = qualified.get("expectedFrames", 175)
-    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
-            or not 4 <= seconds <= 15 or isinstance(expected_frames, bool)
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 4 <= seconds <= 15:
+        raise DeficitPlanBlocked("Continuation request must fit the explicit H3 duration/frame contract")
+    expected_frames, frame_qualification = expected_frames_for(
+        seconds, qualified, qualified.get("frameSnap"))
+    if (isinstance(expected_frames, bool)
             or not isinstance(expected_frames, int) or not 1 < expected_frames <= 400
             or abs(expected_frames / DELIVERY_FPS - seconds) >= 0.75):
         raise DeficitPlanBlocked("Continuation request must fit the explicit H3 duration/frame contract")
+    if frame_rule_problem(expected_frames):
+        raise DeficitPlanBlocked("Continuation request: " + frame_rule_problem(expected_frames))
     usable_frames = expected_frames - 1
     batch_size = int(config.get("batchSize", 32))
     if not 1 <= batch_size <= 32:
@@ -683,6 +719,7 @@ def build(
             "prompt": prompt,
             "seconds": seconds,
             "expectedFrames": expected_frames,
+            **({"expectedFramesQualification": frame_qualification} if frame_qualification else {}),
             "short_edge": int(qualified.get("shortEdge", 768)),
             "aspect": str(qualified.get("aspect", "auto")),
             "steps": int(qualified.get("steps", 30)),

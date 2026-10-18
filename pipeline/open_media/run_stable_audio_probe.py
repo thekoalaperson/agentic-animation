@@ -10,6 +10,10 @@ import time
 import numpy as np
 
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def sha(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as stream:

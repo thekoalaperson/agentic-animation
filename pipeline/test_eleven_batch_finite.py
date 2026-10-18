@@ -10,10 +10,12 @@ from unittest import mock
 import urllib.error
 
 from pipeline import eleven_batch_finite as finite
+from pipeline.paid_approval import validate_paid_approval
+from pipeline.test_paid_approval import write_approval
 
 
 class FiniteElevenBatchTest(unittest.TestCase):
-    def manifest(self, root: Path, items=None, financial_approval=True) -> Path:
+    def manifest(self, root: Path, items=None, financial_approval=False) -> Path:
         path = root / "narration.json"
         final_items = items or [{
             "id": "part-01",
@@ -22,6 +24,7 @@ class FiniteElevenBatchTest(unittest.TestCase):
         }]
         path.write_text(json.dumps({
             "version": 1,
+            "episode": "DEMO",
             "financialApproval": financial_approval,
             "language": "hi",
             "voiceId": "testVoice_123",
@@ -40,6 +43,13 @@ class FiniteElevenBatchTest(unittest.TestCase):
         return path
 
     @staticmethod
+    def approval(manifest: Path) -> Path:
+        plan = finite.load_plan(manifest, json.loads(manifest.read_text())["aggregateCharacters"])
+        return write_approval(manifest.parent / "approval.json", episode="DEMO",
+                              lane=finite.APPROVAL_LANE, manifest=manifest,
+                              scope=finite.approval_scope(plan))
+
+    @staticmethod
     def state_for(manifest: Path) -> Path:
         return manifest.with_suffix(".eleven-state.json")
 
@@ -47,18 +57,49 @@ class FiniteElevenBatchTest(unittest.TestCase):
     def cap(manifest: Path) -> int:
         return json.loads(manifest.read_text())["aggregateCharacters"]
 
-    def test_submit_is_refused_before_network_when_financial_approval_is_false(self):
+    def test_submit_is_refused_before_network_without_an_approval_record(self):
+        for boolean in (False, True):
+            with self.subTest(financialApproval=boolean), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self.manifest(root, financial_approval=boolean)
+                state_path = self.state_for(manifest)
+                with mock.patch.object(finite, "_post_once") as post:
+                    with self.assertRaisesRegex(finite.PlanError, "requires a current approval record"):
+                        finite.execute(manifest, self.cap(manifest), submit=True,
+                                       state_path=state_path,
+                                       api_key="offline-placeholder")
+                post.assert_not_called()
+                self.assertFalse(state_path.exists())
+                dry = finite.execute(manifest, self.cap(manifest), submit=False)
+                self.assertEqual((dry["financialApproval"], dry["financialAuthorized"]),
+                                 (boolean, False))
+
+    def test_authority_change_is_found_by_the_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manifest = self.manifest(root, financial_approval=False)
-            state_path = self.state_for(manifest)
-            with mock.patch.object(finite, "_post_once") as post:
-                with self.assertRaisesRegex(finite.PlanError, "financialApproval is false"):
-                    finite.execute(manifest, self.cap(manifest), submit=True,
-                                   state_path=state_path,
-                                   api_key="offline-placeholder")
-            post.assert_not_called()
-            self.assertFalse(state_path.exists())
+            authority = root / "GOAL.md"
+            authority.write_text("demo direction\n", encoding="utf-8")
+            manifest = self.manifest(root)
+            doc = json.loads(manifest.read_text())
+            doc.update(authority="GOAL.md", authoritySha256=finite._sha256_file(authority))
+            manifest.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(finite.execute(manifest, self.cap(manifest), submit=False)["mode"], "DRY_RUN")
+            authority.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(finite.PlanError, "authority changed"):
+                finite.execute(manifest, self.cap(manifest), submit=False)
+
+    def test_wrapper_counts_only_characters_still_pending(self):
+        wrapper = importlib.import_module("run_narration_gpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.manifest(Path(tmp), items=[
+                {"id": "a", "text": "पहला वाक्य।", "output": "a.mp3"},
+                {"id": "b", "text": "दूसरा।", "output": "b.mp3"}])
+            plan = finite.load_plan(manifest, self.cap(manifest))
+            state = self.state_for(manifest)
+            self.assertEqual(wrapper.pending_characters(plan, state), plan["aggregateCharacters"])
+            finite._atomic_json(state, {"items": {"a": {"status": "COMPLETED"},
+                                                  "b": {"status": "PLANNED"}}})
+            self.assertEqual(wrapper.pending_characters(plan, state), len("दूसरा।"))
 
     def test_gpu_wrapper_imports_shared_receipt_helpers(self):
         wrapper = importlib.import_module("run_narration_gpu")
@@ -68,6 +109,14 @@ class FiniteElevenBatchTest(unittest.TestCase):
             self.assertEqual(json.loads(receipt.read_text()), {"noOverage": True})
             self.assertEqual(wrapper._sha256_file(receipt),
                              hashlib.sha256(receipt.read_bytes()).hexdigest())
+
+    def test_schema_covers_a_valid_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = json.loads(self.manifest(Path(tmp)).read_text())
+        shown = finite.schema()
+        self.assertLessEqual(set(doc), set(shown["requiredRootFields"]) | set(shown["optionalRootFields"]))
+        self.assertLessEqual(set(shown["requiredRootFields"]), set(doc))
+        self.assertEqual(set(doc["voiceSettings"]), set(shown["voiceSettingRanges"]))
 
     def test_default_is_dry_run_with_no_network_or_state_write(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +188,11 @@ class FiniteElevenBatchTest(unittest.TestCase):
             root = Path(tmp)
             manifest = self.manifest(root)
             plan = finite.load_plan(manifest, self.cap(manifest))
+            approval = self.approval(manifest)
+            evidence = validate_paid_approval(
+                approval, episode="DEMO", lane=finite.APPROVAL_LANE, manifest_path=manifest,
+                manifest_sha256=plan["manifestSha256"], finite_execution=finite.approval_scope(plan))
+            plan.update(approvalAdmission=evidence)
             state_path = self.state_for(manifest)
             state = finite._initial_state(plan)
             state["items"]["part-01"]["status"] = "UNCERTAIN_NETWORK_ERROR"
@@ -146,7 +200,8 @@ class FiniteElevenBatchTest(unittest.TestCase):
             with mock.patch.object(finite, "_post_once") as post:
                 with self.assertRaises(finite.UncertainPost):
                     finite.execute(manifest, self.cap(manifest), submit=True,
-                                   state_path=state_path, api_key="unused")
+                                   state_path=state_path, api_key="unused",
+                                   approval_admission=approval)
             post.assert_not_called()
 
     def test_http_4xx_is_recorded_and_never_reposted(self):
@@ -161,10 +216,11 @@ class FiniteElevenBatchTest(unittest.TestCase):
                 raise urllib.error.HTTPError(
                     url, 400, "bad request", {}, io.BytesIO(b"invalid input"))
 
+            approval = self.approval(manifest)
             with self.assertRaises(finite.PlanError):
                 finite.execute(manifest, self.cap(manifest), submit=True,
                                state_path=state_path, post_fn=reject,
-                               api_key="offline-placeholder")
+                               api_key="offline-placeholder", approval_admission=approval)
             self.assertEqual(len(calls), 1)
             state = json.loads(state_path.read_text())
             self.assertEqual(state["items"]["part-01"]["status"],
@@ -172,7 +228,7 @@ class FiniteElevenBatchTest(unittest.TestCase):
             with self.assertRaises(finite.UncertainPost):
                 finite.execute(manifest, self.cap(manifest), submit=True,
                                state_path=state_path, post_fn=reject,
-                               api_key="offline-placeholder")
+                               api_key="offline-placeholder", approval_admission=approval)
             self.assertEqual(len(calls), 1)
 
     def test_mocked_submit_posts_once_validates_and_hash_resumes(self):
@@ -195,9 +251,10 @@ class FiniteElevenBatchTest(unittest.TestCase):
                 return audio, {"status": 200, "requestId": "offline-test",
                                "contentType": "audio/mpeg"}
 
+            approval = self.approval(manifest)
             first = finite.execute(manifest, self.cap(manifest), submit=True,
                                    state_path=state_path, post_fn=fake_post,
-                                   api_key="offline-placeholder")
+                                   api_key="offline-placeholder", approval_admission=approval)
             self.assertEqual(first["networkCalls"], 1)
             self.assertEqual(len(calls), 1)
             output = root / "audio/part-01.mp3"
@@ -205,7 +262,7 @@ class FiniteElevenBatchTest(unittest.TestCase):
                              hashlib.sha256(audio).hexdigest())
             second = finite.execute(manifest, self.cap(manifest), submit=True,
                                     state_path=state_path, post_fn=fake_post,
-                                    api_key="offline-placeholder")
+                                    api_key="offline-placeholder", approval_admission=approval)
             self.assertEqual(second["status"], "ALREADY_COMPLETED")
             self.assertEqual(second["networkCalls"], 0)
             self.assertEqual(len(calls), 1)

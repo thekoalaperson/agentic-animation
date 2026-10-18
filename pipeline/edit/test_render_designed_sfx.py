@@ -36,6 +36,14 @@ class DesignedSfxContractTests(unittest.TestCase):
         self.assertEqual(sfx.emotion_values({'kineticEnergy': 20})['kinetic'], 20)
         self.assertEqual(sfx.emotion_values({'emotions': {'kineticEnergy': 30}})['kinetic'], 30)
 
+    def test_a_wave_that_declares_its_dimensions_keeps_exactly_those(self):
+        row = {'shot': 1, 'values': {'demo-pull': 40, 'demo-calm': 70}}
+        self.assertEqual(sfx.emotion_values(row, ['demo-pull', 'demo-calm']),
+                         {'demo-pull': 40, 'demo-calm': 70})
+        self.assertEqual(sfx.emotion_values({'values': {'kineticEnergy': 5}}, ['kinetic']),
+                         {'kinetic': 5})
+        self.assertEqual(sfx.emotion_values(row, ['demo-missing']), {'demo-missing': None})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

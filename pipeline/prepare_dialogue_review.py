@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Source-bound dialogue sheets and blind speech-observation jobs.
+"""Source-bound dialogue review sheets, speech windows and sheet-observation plans.
 
 No paid API calls. A sheet is evidence for review, never an acceptance record.
-Without --preview this runs on the qualified GPU worker. --preview draws the
-same sheets anywhere ffmpeg runs, names them *-preview-not-final, records the
-real host and ffmpeg build, and writes no observation manifest. When the local
-ffmpeg has no drawtext filter or no font is available, timestamps are not
-burned in; the frame ordinals and times stay in each proof record.
+Sheets render on the qualified GPU host. --preview draws the same sheets anywhere
+ffmpeg runs, names them *-preview-not-final, records the real host and ffmpeg
+build, and writes no observation manifest. When the local ffmpeg has no
+drawtext filter or no font is available, clip IDs and timestamps are not burned
+in; the frame ordinals and times stay in each proof record.
+--measure-speech-windows runs anywhere ffmpeg runs. Each measurement is a new speech-windows-attempt-NNN.json:
+conservative, hash-bound speech windows that a review decision may copy as the
+clip's speechWindow. Earlier attempts stay; speech-windows.json indexes them,
+so a second run with transcript evidence, other thresholds or another host adds
+an attempt instead of refusing. With
+--observation-prompt and --observation-max-credits it also writes
+sheet-observation-manifest.json for observe_media_finite.py.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 
@@ -22,6 +31,11 @@ import _common
 
 WORKER_FONT = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 PREVIEW = "-preview-not-final"
+
+if __package__:
+    from ._common import adopt_legacy_record, atomic_json, attempt_records, write_attempt_json
+else:
+    from _common import adopt_legacy_record, atomic_json, attempt_records, write_attempt_json
 
 
 def sha(path):
@@ -55,51 +69,23 @@ def select_jobs(plan, selected_ids, expected):
     return rows
 
 
-def timestamp_filter(font):
-    """The drawtext stage that burns each frame's time, or '' without a font."""
+def timestamp_filter(font, label=""):
+    """The drawtext stage that burns each frame's clip ID and time, or '' without a font."""
     if font is None:
         return ""
     if any(c in str(font) for c in "':,[]\\;"):
         raise ValueError("Unsafe font path for an ffmpeg filter: " + str(font))
     return ("drawtext=fontfile=" + str(font) + ":"
-            "text='%{pts\\:hms}':fontsize=17:fontcolor=white:box=1:boxcolor=black@0.75:x=4:y=4,")
+            "text='" + label + "%{pts\\:hms}':fontsize=18:fontcolor=white:box=1:"
+            "boxcolor=black@0.75:x=4:y=4,")
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("manifest", type=Path)
-    ap.add_argument("--repo-root", type=Path, required=True)
-    ap.add_argument("--max-jobs", type=int, required=True)
-    ap.add_argument("--ids", help="Explicit comma-separated completed subset; never changes source manifest")
-    ap.add_argument("--preview", action="store_true",
-                    help="Draw sheets anywhere ffmpeg runs; outputs are labelled preview-not-final")
-    ap.add_argument("--font", type=Path, help="Timestamp font; otherwise the profile fonts.review, then the worker DejaVuSans")
-    a = ap.parse_args(argv)
-    host = None
-    if a.preview:
-        font = _common.review_font(a.font) or (WORKER_FONT if WORKER_FONT.is_file() else None)
-        if "drawtext" not in _common.ffmpeg_capabilities()["filters"]:
-            font = None
-        host = _common.preview_host_record(font)
-    else:
-        if platform.system() != "Linux":
-            raise SystemExit("Heavy media preparation requires the qualified GPU host")
-        subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                       capture_output=True, check=True, timeout=30)
-        font = _common.review_font(a.font) or WORKER_FONT
-    suffix = PREVIEW if a.preview else ""
-    root = a.repo_root.resolve()
-    manifest = a.manifest.resolve()
-    here = manifest.parent
-    here.relative_to(root / "film")
-    plan = json.loads(manifest.read_text())
-    selected = select_jobs(plan, a.ids, a.max_jobs)
-    review = here / "dense-review"
-    review.mkdir(exist_ok=True)
+def verified_jobs(plan, manifest, root, here, selected):
+    """Each selected job's video, digest and sidecar, refusing any changed binding."""
     jobs = []
     for row in selected:
         source = (root / row["source"]).resolve()
-        source.relative_to(root / "film")
+        source.relative_to(root)
         prompt = (root / row["prompt"]).resolve()
         prompt.relative_to(here)
         video = (root / row["outputStem"]).with_suffix(".mp4").resolve()
@@ -113,6 +99,192 @@ def main(argv=None):
                 or meta.get("executionManifestSha256") != sha(manifest)):
             raise ValueError("Source/output provenance changed: " + row["id"])
         jobs.append((row, video, digest, meta_path))
+    return jobs
+
+
+def _silences(path, noise_db, minimum_silence):
+    done = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+                           "-af", f"silencedetect=noise={noise_db}dB:d={minimum_silence}",
+                           "-f", "null", "-"], capture_output=True, text=True, check=True,
+                          timeout=300)
+    starts = [float(x) for x in re.findall(r"silence_start: (-?[0-9.]+)", done.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: (-?[0-9.]+)", done.stderr)]
+    return list(zip(starts, ends + [None] * (len(starts) - len(ends))))
+
+
+def speech_window(duration, silences, handle, transcript_span=None):
+    """A conservative speech window from detected silences, or the whole clip.
+
+    Energy detection hears ambience as speech and soft words as silence, so the
+    window gets at least ``handle`` seconds either side, never excludes a
+    transcript span, and falls back to the full clip when it would be empty.
+    """
+    start, end = 0.0, duration
+    for silence_start, silence_end in silences:
+        if silence_start <= 0.0 + 1e-6 and silence_end is not None:
+            start = max(start, silence_end)
+        if silence_end is None or silence_end >= duration - 1e-3:
+            end = min(end, max(silence_start, 0.0))
+    detected = None if end <= start else {"start": round(start, 6), "end": round(end, 6)}
+    if detected is None:
+        return None, {"start": 0.0, "end": round(duration, 6)}, True
+    if transcript_span:
+        start = min(start, float(transcript_span["start"]))
+        end = max(end, float(transcript_span["end"]))
+    window = {"start": round(max(0.0, start - handle), 6),
+              "end": round(min(duration, end + handle), 6)}
+    return detected, window, False
+
+
+def measure_speech_windows(manifest, root, jobs, *, noise_db, minimum_silence, handle,
+                           transcripts=None):
+    """Write one offline, hash-bound speech-windows attempt beside the manifest.
+
+    This is measurement, not admission: the review decisions copy a chosen
+    window into the record the timeline reads as speechWindow. A run whose
+    document equals the latest attempt adds nothing; any other run adds an
+    attempt and never replaces one. speech-windows.json is the attempt index.
+    """
+    here = manifest.parent
+    ffmpeg = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+                            check=True).stdout.splitlines()[0]
+    spans = {}
+    if transcripts is not None:
+        evidence = json.loads(transcripts.read_text(encoding="utf-8"))
+        spans = {row["id"]: row for row in evidence.get("items", [])
+                 if row.get("transcriptSpan")}
+    items = []
+    for row, video, digest, meta_path in jobs:
+        probe = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_streams",
+                                           "-show_format", "-of", "json", str(video)],
+                                          capture_output=True, text=True, check=True,
+                                          timeout=120).stdout)
+        if not any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
+            raise ValueError("Speech windows need the clip's audio stream: " + row["id"])
+        duration = float(probe["format"]["duration"])
+        span = spans.get(row["id"])
+        if span and span.get("sourceSha256") != digest:
+            raise ValueError("Transcript evidence describes other bytes: " + row["id"])
+        detected, window, fallback = speech_window(
+            duration, _silences(video, noise_db, minimum_silence), handle,
+            span["transcriptSpan"] if span else None)
+        items.append({"id": row["id"], "source": str(video.relative_to(here)),
+                      "sourceSha256": digest, "sidecarSha256": sha(meta_path),
+                      "durationSeconds": round(duration, 6), "detected": detected,
+                      "speechWindow": window, "fallbackToFullClip": fallback,
+                      "transcriptSpan": span["transcriptSpan"] if span else None})
+    doc = {"schemaVersion": 1, "kind": "dialogue-speech-windows",
+           "manifestSha256": sha(manifest),
+           "transcriptEvidenceSha256": sha(transcripts) if transcripts else None,
+           "method": "ffmpeg-silencedetect",
+           "thresholds": {"noiseDb": noise_db, "minimumSilenceSeconds": minimum_silence,
+                          "minimumHandleSeconds": handle},
+           "ffmpeg": ffmpeg, "computeHost": platform.node(),
+           "policy": ("Energy-based measurement; complete speech outranks a tight trim. A window "
+                      "is never narrower than a supplied transcript span and falls back to the "
+                      "full clip when no speech is found. Admission copies a chosen window."),
+           "admission": "not implied", "items": items}
+    # A single speech-windows.json from before the attempt files is kept as one.
+    adopt_legacy_record(here, "speech-windows")
+    attempts = attempt_records(here, "speech-windows")
+    if attempts and attempts[-1]["record"] == doc:
+        target = here / attempts[-1]["path"]
+    else:
+        target = write_attempt_json(here, "speech-windows", doc)
+    atomic_json(here / "speech-windows.json", {
+        "kind": "dialogue-speech-windows-index", "manifestSha256": doc["manifestSha256"],
+        "latest": target.name, "attempts": attempt_records(here, "speech-windows")})
+    return target, doc
+
+
+def observation_manifest(here, root, plan, evidence, prompt_file, max_credits):
+    """A sheet-observation plan in the shape observe_media_finite.py runs.
+
+    The prompt is this project's own file; nothing here writes a rubric.
+    Sheets are images, the only part the observation lane sends today.
+    """
+    here, root = here.resolve(), root.resolve()
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError("Observation prompt file is empty")
+    jobs = []
+    for item in evidence:
+        if not re.fullmatch(r"[a-z0-9-]+", item["id"]):
+            raise ValueError("Observation job IDs must be lowercase letters, digits and hyphens: "
+                             + item["id"])
+        sheet = (here / item["sheet"]).resolve()
+        jobs.append({"id": item["id"], "prompt": prompt,
+                     "media": [{"path": sheet.relative_to(root).as_posix(),
+                                "sha256": item["sheetSha256"]}]})
+    return {"episode": plan["episode"], "projectRoot": os.path.relpath(root, here),
+            "financialApproval": False, "maxCredits": max_credits,
+            "promptFile": prompt_file.resolve().relative_to(root).as_posix(),
+            "promptSha256": sha(prompt_file),
+            "purpose": "Blind description of review sheets; advisory only", "jobs": jobs}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("manifest", type=Path)
+    ap.add_argument("--repo-root", "--project", dest="project", type=Path, required=True,
+                    help="project root; the manifest, stills and clips must sit inside it")
+    ap.add_argument("--max-jobs", type=int, required=True)
+    ap.add_argument("--ids", help="Explicit comma-separated completed subset; never changes source manifest")
+    windows = ap.add_argument_group("offline speech windows (ffmpeg only, any host)")
+    windows.add_argument("--measure-speech-windows", action="store_true",
+                         help="add a speech-windows attempt and stop; no sheets, no worker needed")
+    windows.add_argument("--noise-db", type=float, default=-35.0)
+    windows.add_argument("--minimum-silence", type=float, default=0.30)
+    windows.add_argument("--minimum-handle", type=float, default=0.25)
+    windows.add_argument("--transcript-evidence", type=Path,
+                         help="measure_dialogue_speech.py output; windows never cut its spans")
+    ap.add_argument("--preview", action="store_true",
+                    help="Draw sheets anywhere ffmpeg runs; outputs are labelled preview-not-final")
+    ap.add_argument("--font", type=Path, help="Timestamp font; otherwise the profile fonts.review, then the worker DejaVuSans")
+    observing = ap.add_argument_group("sheet observation plan (optional)")
+    observing.add_argument("--observation-prompt", type=Path,
+                           help="this project's own describe-only prompt file")
+    observing.add_argument("--observation-max-credits", type=float,
+                           help="ceiling the observation approval record will bind")
+    a = ap.parse_args(argv)
+    if (a.observation_prompt is None) != (a.observation_max_credits is None):
+        ap.error("--observation-prompt and --observation-max-credits go together")
+    if a.preview and a.observation_prompt is not None:
+        ap.error("--preview writes no observation plan")
+    if not a.measure_speech_windows:
+        # Sheets: the worker gate comes before any project file is read.
+        host = None
+        if a.preview:
+            font = _common.review_font(a.font) or (WORKER_FONT if WORKER_FONT.is_file() else None)
+            if "drawtext" not in _common.ffmpeg_capabilities()["filters"]:
+                font = None
+            host = _common.preview_host_record(font)
+        else:
+            if platform.system() != "Linux":
+                raise SystemExit("Heavy media preparation requires the qualified GPU host")
+            subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, check=True, timeout=30)
+            font = _common.review_font(a.font) or WORKER_FONT
+        suffix = PREVIEW if a.preview else ""
+    root = a.project.resolve()
+    manifest = a.manifest.resolve()
+    here = manifest.parent
+    here.relative_to(root)
+    plan = json.loads(manifest.read_text())
+    selected = select_jobs(plan, a.ids, a.max_jobs)
+    if a.measure_speech_windows:
+        target, doc = measure_speech_windows(
+            manifest, root, verified_jobs(plan, manifest, root, here, selected),
+            noise_db=a.noise_db, minimum_silence=a.minimum_silence, handle=a.minimum_handle,
+            transcripts=a.transcript_evidence)
+        print(json.dumps({"speechWindows": str(target),
+                          "index": str(here / "speech-windows.json"), "items": len(doc["items"]),
+                          "fallbacks": sum(x["fallbackToFullClip"] for x in doc["items"]),
+                          "networkCalls": 0}))
+        return
+    review = here / "dense-review"
+    review.mkdir(exist_ok=True)
+    jobs = verified_jobs(plan, manifest, root, here, selected)
 
     def one(job):
         row, video, digest, meta_path = job
@@ -144,8 +316,10 @@ def main(argv=None):
                 raise ValueError("Existing review evidence changed")
             return old
         rows = (len(frames) + 4) // 5
-        vf = ("select='not(mod(n,12))+eq(n," + str(count-1) + ")',scale=384:216,"
-              + timestamp_filter(font) + "tile=5x" + str(rows))
+        # Five 400 px columns: a 2000 px sheet with each frame's clip ID and time.
+        label = (row["id"] + " " if re.fullmatch(r"[A-Za-z0-9_.-]+", row["id"]) else "")
+        vf = ("select='not(mod(n,12))+eq(n," + str(count-1) + ")',scale=400:225,"
+              + timestamp_filter(font, label) + "tile=5x" + str(rows))
         subprocess.run(["ffmpeg", "-v", "error", "-n", "-i", str(video), "-vf", vf,
                         "-frames:v", "1", "-q:v", "2", str(sheet)], check=True, timeout=120)
         entry["sheetSha256"] = sha(sheet)
@@ -162,10 +336,9 @@ def main(argv=None):
         return
     save(here / "dense-review-index.json", {"manifestSha256": sha(manifest),
         "episode": plan["episode"], "items": evidence, "acceptance": "not implied"})
-    blind = {"episode": plan["episode"], "purpose": "Blind native-Hindi completeness observation; advisory only",
-        "jobs": [{"id": row["id"], "mode": "speech", "file": str(video.relative_to(here)),
-                  "sha256": digest} for row, video, digest, _ in jobs]}
-    save(here / "speech-observation-manifest.json", blind)
+    if a.observation_prompt is not None:
+        save(here / "sheet-observation-manifest.json", observation_manifest(
+            here, root, plan, evidence, a.observation_prompt, a.observation_max_credits))
     print(json.dumps({"jobs": len(jobs), "sheets": len(evidence), "networkCalls": 0}))
 
 

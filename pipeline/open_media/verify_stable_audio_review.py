@@ -10,6 +10,10 @@ import socket
 import sys
 
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

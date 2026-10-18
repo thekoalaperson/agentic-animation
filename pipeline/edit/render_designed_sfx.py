@@ -12,6 +12,8 @@ import re
 import numpy as np
 
 SR = 48000
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
 # What a source batch declares it came from, and the route its receipt names.
 # A generated batch declares ``model`` (the qualified Small-SFX model when it
 # names none); a recorded or library batch declares ``route`` below instead.
@@ -74,13 +76,20 @@ def bound_file(ep, spec):
     return path
 
 
-def emotion_values(row):
-    """Support both legacy flat waves and the current nested eight-axis map."""
+LEGACY_EMOTION_KEYS = ('awe', 'dread', 'devotion', 'grief', 'hope', 'scale', 'kinetic', 'intimacy')
+
+
+def emotion_values(row, dimensions=None):
+    """The wave's own declared dimensions; a wave that declares none keeps the legacy eight.
+
+    The legacy 'kineticEnergy' spelling still fills 'kinetic'.
+    """
     values = row.get('emotions', row.get('values', row))
     if not isinstance(values, dict):
         raise RuntimeError('Emotion map must be an object')
+    keys = LEGACY_EMOTION_KEYS if dimensions is None else tuple(dimensions)
     return {key: values.get(key, values.get('kineticEnergy') if key == 'kinetic' else None)
-            for key in ('awe', 'dread', 'devotion', 'grief', 'hope', 'scale', 'kinetic', 'intimacy')}
+            for key in keys}
 
 def load_contract(ep, m):
     """V2 supports independently verified palettes and scene-bound working clocks."""
@@ -221,7 +230,7 @@ def render(ep,root):
         origin={k:job[k] for k in ('origin','licence','terms') if k in job}
         rows.append({**c,'source':str(src),'sourceSha256':sha(src),'sourcePrompt':job['prompt'],**origin,'edited':str(out),'sha256':sha(out),'duration':len(a)/SR,
                      'filters':filters,'tempoOutputLengthCorrectionSeconds':-length_error,'gainDb':gain,'peakSafetyGain':safety,
-                     'emotion':emotion_values(w),'picture':overlapping})
+                     'emotion':emotion_values(w,wave.get('dimensions')),'picture':overlapping})
         print(c['id'],round(len(a)/SR,3),flush=True)
     assert np.max(np.abs(stem))<.95
     if sha(root/'design.json')!=design_digest:

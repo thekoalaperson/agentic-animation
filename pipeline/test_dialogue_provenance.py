@@ -9,13 +9,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dialogue_provenance import canonical_sha, validate_dialogue_request
 
 
-def bind_fixture(record, prompt_text):
+def bind_fixture(record, prompt_text, references=()):
     """Build the nested fields emitted by kie_video.py, without any network."""
     local = {key: record[key] for key in (
         'jobId', 'model', 'sourceSha256', 'promptSha256', 'executionManifestSha256',
         'executionRequestSha256', 'resolution', 'aspectRatio', 'durationSeconds', 'audio')}
     local.update(version=1, referenceOnly=False, multiClip=False,
-                 inputHashes=dict(primary=record['sourceSha256'], last=None, references=[], videos=[]))
+                 inputHashes=dict(primary=record['sourceSha256'], last=None, references=list(references),
+                                     videos=[]))
     record['localRequest'] = local
     record['localRequestSha256'] = canonical_sha(local)
     request = {key: record[key] for key in ('model', 'sourceSha256', 'promptSha256',
@@ -57,6 +58,19 @@ class DialogueEnvelopeTests(unittest.TestCase):
         self.record.update(requestSha256=digest, requestFingerprint=digest)
         with self.assertRaisesRegex(ValueError, 'provider input mismatch: prompt'):
             validate_dialogue_request(self.record, self.expected, 'A corrected action.\n')
+
+    def test_frozen_references_must_match_in_order(self):
+        refs = ['e'*64, 'f'*64]
+        record = bind_fixture(copy.deepcopy(self.expected), 'A corrected action.\n', refs)
+        validate_dialogue_request(record, {**self.expected, 'referenceSha256s': refs},
+                                  'A corrected action.\n')
+        for wrong in ([], refs[::-1], refs[:1]):
+            with self.subTest(expected=wrong), self.assertRaisesRegex(ValueError, 'references'):
+                validate_dialogue_request(record, {**self.expected, 'referenceSha256s': wrong},
+                                          'A corrected action.\n')
+        with self.assertRaisesRegex(ValueError, 'references'):
+            validate_dialogue_request(self.record, {**self.expected, 'referenceSha256s': refs},
+                                      'A corrected action.\n')
 
 
 if __name__ == '__main__':

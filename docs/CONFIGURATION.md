@@ -21,6 +21,13 @@ Two optional profile keys are read by an agent, not by any tool. `instructions`
 lists private files holding the user's current preferences; an empty list, or
 no key, is normal. `researchCorpus` names the source texts a project draws on.
 Neither grants authority.
+`providers.kie.usdPerCredit` is the operator's own reading of the Kie price.
+Dry runs and sidecars use it to show dollars beside credits. It has no default,
+and without it the tools show credits only. `AGENTIC_UPLOAD_LOG` names the file
+where `_common.upload_ref` appends one line per upload, and `upload_ref` refuses
+to upload without a log. The paid runners point it at the project's
+`work/upload-log.jsonl`. Run directly with the variable unset, `kie_video.py`
+writes `upload-log.jsonl` beside its output stem.
 
 Project structure remains small:
 
@@ -50,15 +57,74 @@ SHA-256 goes into each preview's audit.
 
 ## Authority
 
+Two different things are bound before a paid run. The approval record says who
+may spend, how much, and on which exact manifest bytes. The manifest's
+`authority` file says what the film is: the direction the batch was frozen
+against. Changing either one means a new freeze or a new record. Neither
+substitutes for the other.
+
 A profile's `authorizer` is a label. Paid execution requires a separate approval
-record bound to exact manifest bytes and finite limits. Version 2 records use an
-explicit project root, arbitrary authorizer identity, request/item count, and a
-usage limit. They do not require Git. New providers, top-ups, and publication are
-never inherited from a sample or another production's grant.
+record bound to exact manifest bytes and finite limits. A manifest's
+`financialApproval` is reported by the dry run but is never sufficient: agents
+write manifests, so only the record authorizes a submission. Version 2 records
+use an explicit project root, arbitrary authorizer identity, request/item count,
+and a usage limit. They do not require Git. New providers, top-ups, and
+publication are never inherited from a sample or another production's grant.
+
+| Lane | Runner | `finiteExecution` keys |
+|---|---|---|
+| `grok-dialogue` | `kie_dialogue_finite.py` | `jobs`, `generatedSeconds`, `credits` (the manifest's `maximumCredits`) |
+| `elevenlabs-narration` | `eleven_batch_finite.py` | `items`, `characters` |
+| `suno-score` | `kie_music_finite.py` | `requests`, `credits`, `sourceSeconds` |
+| `media-observation` | `observe_media_finite.py` | `jobs`, `credits` (the plan's `maxCredits`) |
+
+`paid_approval.py describe` prints the same table from code.
+`paid_approval.py draft LANE MANIFEST --out RECORD` writes a record with status
+`DRAFT` and the grant fields empty, which every runner refuses.
+`paid_approval.py check RECORD MANIFEST LANE` names whatever is stale. The empty
+fields record a person's actual grant, written from their own words when they
+give it. An agent does not fill them from its own judgement. Draft the record
+after the final freeze, because any later edit to the manifest changes the hash
+the record binds.
+
+Recovery needs no new record. `kie_music_finite.py --poll` and
+`kie_dialogue_finite.py --reconcile-only` poll and land task IDs that are
+already recorded, and never post a new generation request.
+`kie_video.py --resume-only` reads no wallet either. A dialogue batch that was
+started on the manifest's `financialApproval` alone has no record behind it,
+so the current runner can only reconcile what that batch already posted. Its
+unsubmitted jobs resume with the runner that started the batch.
+
+A definite provider failure is a recorded task that ended `GENERATION_FAILED`.
+The dialogue runner skips it and never posts it again. The run finishes
+`PARTIAL` and names the failed IDs. It still stops after three definite
+failures in a row, or when every job in a concurrency group fails. A retry is a
+new paid POST, so `kie_dialogue_finite.py --submit --retry-failed` runs only
+under a version 3 record. Version 3 is version 2 plus
+`automaticRetryAuthorized: true` and a `retryBudget` of `{jobs, credits}`,
+both set by the person who grants it. `jobs` counts retry attempts across the
+whole batch, not distinct jobs, and `credits` is checked against the priced
+retries before anything is posted as well as against what lands. Only the
+dialogue lane accepts version 3, and it also authorizes a plain `--submit`. The
+grant must be in place before the
+batch's first submission, because a batch keeps the record it started with.
+The retried request is identical, and the failed record moves to
+`motion/<id>.attempts/attempt-NNN.pending.json`. A job's first attempt counts
+toward `maximumCredits`. Every later attempt counts toward the retry budget. If
+a run stops after a record has moved but before its retry was posted, a plain
+`--submit` refuses and names the job; only `--retry-failed` posts it.
+A changed prompt is not a retry. Freeze those jobs as a new manifest
+(`--freeze --only <ids> --selection-reason`) with its own approval, and admit its takes through
+`dialogueOutputs[scene].executionManifest`.
 
 Old grants and receipts retain their original schema and runner. Migrate paths
 with an external relocation map, not by editing recorded source hashes or
 approval wording. A changed runner hash is not permission to resume old jobs.
+A relocation map is JSON with `originalEpisodeRoot` (the absolute project path
+before the move) and/or `paths` (recorded absolute path to its project-relative
+path now). The subtitle exporter and asset registry take it as `--relocation-map`.
+A map only says where a recorded file now lives; content hashes are still
+compared.
 
 Delivery metadata must explicitly supply upload settings, including video
 language, visibility, audience, category, and AI-use disclosure. Unknown choices

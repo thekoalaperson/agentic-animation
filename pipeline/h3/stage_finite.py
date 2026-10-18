@@ -9,6 +9,32 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import image_dimensions
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
+class StageError(ValueError):
+    """The authored plan cannot be staged without breaking its source binding."""
+
+
+# H3 renders 17n+5 frames. The cited vLLM page now returns 404; the rule is
+# corroborated by every frame count this repository has recorded and by
+# third-party notes. A plan that breaks it would halt only after the GPU had
+# rendered the take, so staging refuses it first.
+H3_FRAME_STEP = 17
+H3_FRAME_OFFSET = 5
+
+
+def frame_rule_problem(frames):
+    """Why ``frames`` cannot be an H3 expectedFrames value, or None."""
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames <= H3_FRAME_OFFSET:
+        return f"expectedFrames must be a whole number above {H3_FRAME_OFFSET}, not {frames!r}"
+    if (frames - H3_FRAME_OFFSET) % H3_FRAME_STEP:
+        below = frames - (frames - H3_FRAME_OFFSET) % H3_FRAME_STEP
+        return (f"expectedFrames {frames} is not 17n+5; the nearest H3 lengths are "
+                f"{below} and {below + H3_FRAME_STEP}")
+    return None
+
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -31,6 +57,11 @@ def aspect_warning(item, field, source, tolerance=0.03):
 def stage(plan_path, target):
     plan = json.loads(plan_path.read_text())
     root = Path(plan.pop("sourceRoot")).resolve()
+    for item in plan["items"]:
+        if "expectedFrames" in item:
+            problem = frame_rule_problem(item["expectedFrames"])
+            if problem:
+                raise StageError(f"{item.get('id')}: {problem}")
     target.mkdir(parents=True, exist_ok=True)
     (target / "stills").mkdir(exist_ok=True)
     warnings = []
@@ -42,11 +73,13 @@ def stage(plan_path, target):
             if source_field not in item:
                 continue
             source = (root / item[source_field]).resolve()
-            assert source.is_relative_to(root)
+            if not source.is_relative_to(root):
+                raise StageError(f"{item.get('id')}: {source_field} escapes sourceRoot: {source}")
             destination = target / "stills" / source.name
             digest = sha(source)
             if destination.exists():
-                assert sha(destination) == digest, "Staged source name collision"
+                if sha(destination) != digest:
+                    raise StageError(f"{item.get('id')}: staged still name collision at {destination}")
             else:
                 shutil.copy2(source, destination)
             item[name_field] = source.name
@@ -57,7 +90,8 @@ def stage(plan_path, target):
     path = target / "manifest.json"
     text = json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
     if path.exists():
-        assert path.read_text() == text, "Immutable staged manifest changed"
+        if path.read_text() != text:
+            raise StageError(f"immutable staged manifest changed: {path}")
     else:
         path.write_text(text)
     summary = dict(manifest=str(path), jobs=len(plan["items"]),
@@ -68,9 +102,12 @@ def stage(plan_path, target):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("plan", type=Path)
     ap.add_argument("target", type=Path)
     args = ap.parse_args()
-    stage(args.plan.resolve(), args.target.resolve())
+    try:
+        stage(args.plan.resolve(), args.target.resolve())
+    except StageError as exc:
+        raise SystemExit(f"REFUSED: {exc}") from exc
 

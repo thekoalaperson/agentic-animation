@@ -45,6 +45,9 @@ class AudioAuthoringTests(unittest.TestCase):
         self.assertEqual(conform, [{"movement": "hush", "silence": True, "timelineStart": 0.0,
                                     "timelineDuration": 4.0, "reason": "The film opens unscored.",
                                     "repriseJoins": []}])
+        # A silence places no take, so the wave audit records no fit for it.
+        audit = json.loads((self.work / "music-wave-audit.json").read_text())
+        self.assertEqual(audit["scoreFits"], [])
 
     def shaped(self, shaping=None, breaths=()):
         plan = {"runtimeSeconds": 4.0, "events": self.events(), "musicBreaths": list(breaths)}

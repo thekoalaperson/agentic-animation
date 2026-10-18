@@ -11,6 +11,7 @@ working-audio-context-audition-not-final) that no later stem, Short or master
 step accepts.
 """
 import argparse
+import copy
 import json
 from pathlib import Path
 import shutil
@@ -67,6 +68,29 @@ def check_working_receipts(config, stem_audit, sfx_audit):
             raise RuntimeError('Working audio stem receipt mismatch')
     if sfx_audit['sha256']!=config['inputs']['sfx']['sha256'] or sfx_audit['clockSha256']!=config['inputs']['clock']['sha256']:
         raise RuntimeError('Working effects do not bind the current clock')
+
+
+def resolve_working_placements(placements, clock):
+    """Resolve event-anchored score placements on this working clock.
+
+    Absolute placements pass through untouched; anchored ones get the same
+    resolution and basis record as build_episode_timeline gives them.
+    """
+    import build_episode_timeline as timeline
+    placements=copy.deepcopy(placements)
+    anchored=[p for p in placements if isinstance(p,dict) and ('anchor' in p or 'until' in p)]
+    if not anchored:
+        return placements,[]
+    try:
+        for placement in anchored:
+            timeline._check_score_anchor_shape(placement.get('movement'),placement)
+    except ValueError as exc:
+        raise RuntimeError(f'Working score placement: {exc}') from None
+    errors=timeline._resolve_score_anchors(anchored,clock['events'],float(clock['runtimeSeconds']))
+    if errors:
+        raise RuntimeError('Working score placement: '+'; '.join(e['error'] for e in errors))
+    return placements,[{k:p[k] for k in ('movement','timelineStart','timelineDuration','resolvedFrom')}
+                       for p in anchored]
 
 
 def mix_working(ep, config_path, config, audition=False, host=None):
@@ -169,6 +193,9 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     plan = clock if voice_only else dict(clock, **{k: score[k] for k in ("scorePlacements", "musicBreaths", "musicNormalization")},
                                          **{k: score[k] for k in ("musicShaping",) if k in score})
+    resolved = []
+    if not voice_only:
+        plan["scorePlacements"], resolved = resolve_working_placements(plan["scorePlacements"], clock)
     voice = assembly.build_voice(ep, output, plan)
     outputs = {"voice": voice}
     if not voice_only:
@@ -184,6 +211,8 @@ def main(argv=None):
                "rendererSha256": assembly.sha(Path(assembly.__file__)),
                "runtimeSeconds": clock["runtimeSeconds"],
                "outputs": {k: {"path": str(p), "sha256": assembly.sha(p)} for k, p in outputs.items()}}
+    if resolved:
+        receipt["resolvedScorePlacements"] = resolved
     label_audition(receipt, args.audition, host)
     (output / "audio-stem-audit.json").write_text(json.dumps(receipt, indent=2)+"\n")
     print(json.dumps(receipt, indent=2))

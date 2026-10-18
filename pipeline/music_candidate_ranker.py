@@ -33,11 +33,29 @@ from typing import Any
 import numpy as np
 
 
-ANALYZER_VERSION = 1
+# Version 2: anchors may name their own dimensions, the report records the
+# dimension mapping it used, and each take carries acoustic landmarks.
+ANALYZER_VERSION = 2
+# The default dimension set. Its proxy reading (default_proxies) applies only
+# when the anchors declare exactly these eight, in this order.
 SEMANTIC_DIMENSIONS = (
     "awe", "dread", "devotion", "grief", "hope", "scale", "kinetic",
     "intimacy",
 )
+# default_proxies written as a table, so the report can record and hash it.
+DEFAULT_PROXY_WEIGHTS = {
+    "rmsEnergy": {"intercept": 0.12, "clip": [0.04, 1.0], "weights": {
+        "scale": 0.35, "awe": 0.20, "dread": 0.20, "hope": 0.10, "grief": 0.08,
+        "intimacy": -0.13}},
+    "lowFrequency": {"intercept": 0.20, "clip": [0.0, 1.0], "weights": {
+        "scale": 0.50, "dread": 0.30, "intimacy": -0.20}},
+    "spectralBrightness": {"intercept": 0.25, "clip": [0.0, 1.0], "weights": {
+        "hope": 0.35, "awe": 0.20, "devotion": 0.15, "dread": -0.25, "grief": -0.15}},
+    "spectralSpread": {"intercept": 0.20, "clip": [0.0, 1.0], "weights": {
+        "awe": 0.45, "scale": 0.35, "intimacy": -0.20}},
+    "onsetActivity": {"intercept": 0.0, "clip": [0.0, 1.0], "weights": {
+        "kinetic": 0.70, "dread": 0.18, "hope": 0.08, "intimacy": -0.18, "grief": -0.12}},
+}
 TRAJECTORY_FEATURES = (
     "rmsEnergy", "lowFrequency", "spectralBrightness", "spectralSpread",
     "onsetActivity",
@@ -181,8 +199,12 @@ def load_plan(manifest_path: Path) -> dict[str, Any]:
         raise AnalysisError("creative draft and semantic anchors must be version 1")
     if anchors.get("kind") != "authored-semantic-target-not-audio-measurement":
         raise AnalysisError("semantic anchor kind does not preserve the advisory boundary")
-    if tuple(anchors.get("dimensions") or ()) != SEMANTIC_DIMENSIONS:
-        raise AnalysisError("semantic dimensions/order differ from the analyzer contract")
+    dimensions = anchors.get("dimensions")
+    if (not isinstance(dimensions, list) or not dimensions
+            or len(set(map(str, dimensions))) != len(dimensions)
+            or not all(isinstance(name, str) and name.strip() for name in dimensions)):
+        raise AnalysisError("semantic dimensions must be a non-empty list of unique names")
+    dimensions = tuple(dimensions)
 
     cues = creative.get("cues")
     common = creative.get("commonPayload")
@@ -212,10 +234,10 @@ def load_plan(manifest_path: Path) -> dict[str, Any]:
         if number <= previous_scene:
             raise AnalysisError("semantic anchors must be strictly ordered by scene")
         previous_scene = number
-        if not isinstance(values, dict) or tuple(values.keys()) != SEMANTIC_DIMENSIONS:
+        if not isinstance(values, dict) or tuple(values.keys()) != dimensions:
             raise AnalysisError(f"scene {number}: semantic value schema changed")
         if any(not isinstance(values[name], (int, float)) or isinstance(values[name], bool)
-               or not 0 <= values[name] <= 100 for name in SEMANTIC_DIMENSIONS):
+               or not 0 <= values[name] <= 100 for name in dimensions):
             raise AnalysisError(f"scene {number}: semantic values must be 0..100")
         parsed_anchors.append({"scene": number, "values": values})
     hard_transitions = anchors.get("hardTransitions") or []
@@ -281,6 +303,8 @@ def load_plan(manifest_path: Path) -> dict[str, Any]:
                    or not 0 <= value <= 1 for value in values.values()):
                 raise AnalysisError(f"{cue_id}.{family}: targets must be normalized 0..1")
 
+    mapping = dimension_mapping(manifest, dimensions, profiles)
+
     score_weights = manifest.get("scoreWeights")
     expected_weights = set(TRAJECTORY_FEATURES + GLOBAL_FEATURES + ENDING_FEATURES)
     if (not isinstance(score_weights, dict) or set(score_weights) != expected_weights
@@ -319,7 +343,69 @@ def load_plan(manifest_path: Path) -> dict[str, Any]:
         "sampling": sampling,
         "profiles": profiles,
         "scoreWeights": score_weights,
+        "dimensions": dimensions,
+        "dimensionMapping": mapping,
     }
+
+
+def _validate_proxy_weights(table: Any, dimensions: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(table, dict) or set(table) != set(TRAJECTORY_FEATURES):
+        raise AnalysisError(f"proxyWeights must give every trajectory {TRAJECTORY_FEATURES} a reading")
+    for feature, spec in table.items():
+        if not isinstance(spec, dict) or not {"intercept", "weights"} <= set(spec) \
+                or set(spec) - {"intercept", "weights", "clip"}:
+            raise AnalysisError(f"proxyWeights.{feature} needs intercept and weights, optional clip")
+        numbers = [spec["intercept"], *(spec["weights"].values()
+                                        if isinstance(spec["weights"], dict) else [None])]
+        clip = spec.get("clip", [0.0, 1.0])
+        if (not isinstance(spec["weights"], dict)
+                or any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x)
+                       for x in numbers)):
+            raise AnalysisError(f"proxyWeights.{feature} must hold finite numbers")
+        unknown = set(spec["weights"]) - set(dimensions)
+        if unknown:
+            raise AnalysisError(f"proxyWeights.{feature} names dimensions the anchors do not "
+                                f"author: {sorted(unknown)}")
+        if (not isinstance(clip, list) or len(clip) != 2
+                or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in clip)
+                or not 0 <= clip[0] < clip[1] <= 1):
+            raise AnalysisError(f"proxyWeights.{feature}.clip must be [low, high] inside 0..1")
+    return table
+
+
+def dimension_mapping(manifest: dict[str, Any], dimensions: tuple[str, ...],
+                      profiles: dict[str, Any]) -> dict[str, Any]:
+    """Choose, and record, how authored dimensions become acoustic proxy targets.
+
+    The default reading applies only to the exact default eight. Any other set
+    needs authored proxyWeights, or every movement's own curves at promptBlend 1.
+    The analyzer never guesses what an axis sounds like.
+    """
+    authored = list(dimensions)
+    table = manifest.get("proxyWeights")
+    if table is not None:
+        source, table = "authored-proxyWeights", _validate_proxy_weights(table, dimensions)
+    elif dimensions == SEMANTIC_DIMENSIONS:
+        source, table = "default-eight-axis", DEFAULT_PROXY_WEIGHTS
+    elif all(float(profile["promptBlend"]) == 1.0 and set(profile["curves"]) == set(TRAJECTORY_FEATURES)
+             for profile in profiles.values()):
+        return {"source": "movement-curves-only", "sha256": None, "authored": authored,
+                "mapped": [], "defaulted": [], "ignored": authored,
+                "note": "every movement's own curves set its targets; the anchors' "
+                        "dimensions shape no proxy"}
+    else:
+        raise AnalysisError(
+            "these dimensions are not the default eight: give the analysis manifest "
+            "proxyWeights (per trajectory: intercept, weights by dimension, optional clip), "
+            "or set promptBlend 1 with curves for every trajectory "
+            f"{list(TRAJECTORY_FEATURES)} in each movement profile")
+    used = sorted({name for spec in table.values() for name, weight in spec["weights"].items()
+                   if weight != 0})
+    return {"source": source, "sha256": sha_bytes(canonical_bytes(table)), "table": table,
+            "authored": authored,
+            "mapped": used if source == "authored-proxyWeights" else [],
+            "defaulted": used if source == "default-eight-axis" else [],
+            "ignored": [name for name in authored if name not in used]}
 
 
 def discover_candidates(plan: dict[str, Any]) -> dict[str, Any]:
@@ -463,12 +549,52 @@ def semantic_target(plan: dict[str, Any], cue: dict[str, Any]) -> dict[str, Any]
         measured_positions = np.linspace(float(selected[0]["start"]), float(selected[-1]["end"]), bins)
         scene_positions = np.interp(measured_positions, centers, scenes)
     semantics: dict[str, np.ndarray] = {}
-    for name in SEMANTIC_DIMENSIONS:
+    for name in plan["dimensions"]:
         semantics[name] = interpolate_with_hard_barriers(plan, name, scene_positions)
+    mapping = plan["dimensionMapping"]
+    if mapping["source"] == "default-eight-axis":
+        proxies = default_proxies(semantics)
+    elif mapping["source"] == "authored-proxyWeights":
+        proxies = table_proxies(mapping["table"], semantics, bins)
+    else:
+        # promptBlend is 1 and every trajectory has a curve, so these are replaced.
+        proxies = {name: np.zeros(bins) for name in TRAJECTORY_FEATURES}
+    profile = plan["profiles"][cue["id"]]
+    blend = float(profile["promptBlend"])
+    normalized_positions = np.linspace(0.0, 1.0, bins)
+    for name, points in profile["curves"].items():
+        prompt_curve = interp_points(validate_points(points, f"{cue['id']}.{name}"),
+                                     normalized_positions)
+        proxies[name] = np.clip((1.0 - blend) * proxies[name] + blend * prompt_curve,
+                                0, 1)
+    return {
+        "scenePositions": scene_positions,
+        "semantics": semantics,
+        "proxies": proxies,
+        "globals": {name: float(profile["globals"][name]) for name in GLOBAL_FEATURES},
+        "ending": {name: float(profile["ending"][name]) for name in ENDING_FEATURES},
+    }
 
+
+def table_proxies(table: dict[str, Any], semantics: dict[str, np.ndarray],
+                  bins: int) -> dict[str, np.ndarray]:
+    """An authored linear reading: intercept plus weighted dimensions, clipped."""
+    result = {}
+    for feature in TRAJECTORY_FEATURES:
+        spec = table[feature]
+        value = np.full(bins, float(spec["intercept"]))
+        for name, weight in spec["weights"].items():
+            value = value + float(weight) * semantics[name]
+        low, high = spec.get("clip", [0.0, 1.0])
+        result[feature] = np.clip(value, float(low), float(high))
+    return result
+
+
+def default_proxies(semantics: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The default eight-axis reading, unchanged since version 1 (see DEFAULT_PROXY_WEIGHTS)."""
     # These are explicit editing proxies, not claims that an emotion has a
     # unique or detectable acoustic signature.
-    proxies = {
+    return {
         "rmsEnergy": np.clip(
             0.12 + 0.35 * semantics["scale"] + 0.20 * semantics["awe"]
             + 0.20 * semantics["dread"] + 0.10 * semantics["hope"]
@@ -493,21 +619,6 @@ def semantic_target(plan: dict[str, Any], cue: dict[str, Any]) -> dict[str, Any]
             + 0.08 * semantics["hope"] - 0.18 * semantics["intimacy"]
             - 0.12 * semantics["grief"], 0, 1
         ),
-    }
-    profile = plan["profiles"][cue["id"]]
-    blend = float(profile["promptBlend"])
-    normalized_positions = np.linspace(0.0, 1.0, bins)
-    for name, points in profile["curves"].items():
-        prompt_curve = interp_points(validate_points(points, f"{cue['id']}.{name}"),
-                                     normalized_positions)
-        proxies[name] = np.clip((1.0 - blend) * proxies[name] + blend * prompt_curve,
-                                0, 1)
-    return {
-        "scenePositions": scene_positions,
-        "semantics": semantics,
-        "proxies": proxies,
-        "globals": {name: float(profile["globals"][name]) for name in GLOBAL_FEATURES},
-        "ending": {name: float(profile["ending"][name]) for name in ENDING_FEATURES},
     }
 
 
@@ -748,8 +859,27 @@ def extract_features(audio: np.ndarray, sample_rate: int, frame_size: int,
         "terminalSilence": float(np.clip(terminal_silence_seconds / 3.0, 0, 1)),
         "abruptness": abruptness,
     }
+    # Landmarks: where things happen in this take, so it can be aimed at a
+    # picture moment in the edit. Times are frame centres in seconds.
+    centres = (starts + frame_size / 2.0) / sample_rate
+    strongest = sorted(selected, key=lambda index: -float(onset_envelope[index]))[:5]
+    quiet = sorted(breathing_runs, key=lambda run: run[0] - run[1])[:8]
+    landmarks = {
+        "peakRmsSeconds": float(centres[int(np.argmax(rms_db))]),
+        "strongestOnsets": [{"seconds": float(centres[index]),
+                             "strength": float(onset_envelope[index])}
+                            for index in sorted(strongest)],
+        "quietPhraseBoundaries": [{"startSeconds": float(starts[start] / sample_rate),
+                                   "endSeconds": float(min(duration, (starts[end - 1] + frame_size)
+                                                           / sample_rate))}
+                                  for start, end in sorted(quiet)],
+        "tailStartSeconds": float(max(0.0, duration - tail_seconds)),
+        "basis": "advisory acoustic measurements; quiet boundaries are low-energy runs of at "
+                 "least 250 ms, not verified musical phrases",
+    }
     return {
         "durationSeconds": duration,
+        "landmarks": landmarks,
         "frameCount": count,
         "sampleRate": sample_rate,
         "frameSize": frame_size,
@@ -976,15 +1106,17 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any],
             int(sampling["sectionBins"]), float(sampling["lowFrequencyHz"]),
         )
         fit = fit_candidate(features, targets[binding["cueId"]], plan["scoreWeights"])
-        requested_duration = float(
-            {item["id"]: item for item in plan["materializedCues"]}
-            [binding["cueId"]]["payload"]["duration"]
-        )
+        requested = ({item["id"]: item for item in plan["materializedCues"]}
+                     [binding["cueId"]]["payload"].get("duration"))
+        # An extend requests no duration, so it has no ratio to flag.
+        requested_duration = float(requested) if requested is not None else None
         analyzed.append({
             **binding,
             "requestedDurationSeconds": requested_duration,
-            "durationRatio": features["durationSeconds"] / requested_duration,
+            "durationRatio": (features["durationSeconds"] / requested_duration
+                              if requested_duration else None),
             "durationFlag": (
+                "NO_REQUESTED_DURATION" if not requested_duration else
                 "SHORTER_THAN_85_PERCENT_OF_REQUEST"
                 if features["durationSeconds"] < 0.85 * requested_duration else "OK"
             ),
@@ -1065,7 +1197,8 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any],
             "scope": "Ranks measurable technical fit and cross-movement acoustic diversity.",
             "limitations": [
                 "No waveform feature proves an emotion, story meaning, originality, Indian flavor, or musical quality.",
-                "The eight authored semantic dimensions are converted to transparent editing proxies; they are not inferred back from audio.",
+                "The authored semantic dimensions are converted to transparent editing proxies by the recorded dimensionMapping; they are not inferred back from audio.",
+                "Landmarks are measured times to audition against picture, not musical analysis.",
                 "A high score cannot approve a take. Internal creative audition and the reviewer's listening verdict remain decisive.",
                 "Tempo confidence measures periodic recurrence, not whether a rhythm is aesthetically right.",
             ],
@@ -1093,7 +1226,9 @@ def analyze(plan: dict[str, Any], inventory: dict[str, Any],
         },
         "missingMovements": inventory["missingMovements"],
         "partialMovements": inventory["partialMovements"],
+        "expectedCandidatesPerMovement": inventory["expectedCandidatesPerMovement"],
         "orphanMediaIgnored": inventory["orphans"],
+        "dimensionMapping": plan["dimensionMapping"],
         "targets": target_report,
         "candidates": analyzed,
         "rankings": rankings,

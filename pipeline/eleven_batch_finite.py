@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Finite, resumable ElevenLabs Hindi narration batch runner.
+"""Finite, resumable ElevenLabs narration batch runner.
 
 The command is a dry run unless ``--submit`` is present.  It intentionally
 does not query subscriptions, enable overages, top up an account, choose a
 fallback format, or retry a POST.  An interrupted POST is cost-ambiguous and
 therefore remains blocked for manual reconciliation.
 
-Manifest schema (item paths are relative to the manifest directory and must
-remain below ``episodeRoot``):
+Manifest schema, version 1 (item paths are relative to the manifest directory
+and must remain below ``episodeRoot``):
 
     {
       "version": 1,
       "language": "hi",
-      "voiceId": "...",
+      "voiceId": "<the voice cast for this film>",
       "modelId": "eleven_multilingual_v2",
       "outputFormat": "mp3_44100_192",
       "voiceSettings": {
-        "stability": 0.6,
-        "similarity_boost": 0.8,
-        "style": 0.0,
-        "use_speaker_boost": true,
-        "speed": 0.9
+        "stability": <0..1>,
+        "similarity_boost": <0..1>,
+        "style": <0..1>,
+        "use_speaker_boost": <true|false>,
+        "speed": <0.7..1.2>
       },
       "items": [
         {"id": "narration-part-01", "textFile": "part-01-hi.txt",
@@ -28,9 +28,22 @@ remain below ``episodeRoot``):
       ]
     }
 
-An item may contain ``text`` instead of ``textFile``, but never both.  Voice,
-model, output format and voice settings are root-level so a batch cannot
-silently drift between items.
+The tool supplies no voice settings: every value is the operator's frozen
+choice for this film, inside the ranges shown.  An item may contain ``text``
+instead of ``textFile``, but never both.  In version 1, voice, model, output
+format and voice settings are root-level so a batch cannot silently drift
+between items.
+
+Version 2 keeps that property while letting a film cast several voices in one
+manifest and one approval.  An optional root ``cast`` maps a speaker name to
+``{"voiceId", "modelId", "voiceSettings"}``; an item names its ``speaker``
+from the cast, and an item without one uses the root voice (``voiceId``,
+``modelId`` and ``voiceSettings`` together), which then must exist.  Every
+voice is frozen in the manifest, so nothing drifts between items.  Version 2
+also accepts a declared ISO 639-1 ``language`` (sent as ``language_code`` only
+to models that accept it), per-item ``voiceSettings`` and ``seed``, and root
+``pronunciationDictionaryLocators``.  Models come from ``MODELS``, a dated
+allowlist with no fallback.  Run ``--print-schema`` for the whole contract.
 """
 
 from __future__ import annotations
@@ -52,13 +65,13 @@ import urllib.request
 if __package__:
     from ._common import (atomic_json as _atomic_json,
                           atomic_new_bytes as _atomic_new_bytes,
-                          canonical_sha256 as _canonical_sha, env_key,
+                          canonical_sha256 as _canonical_sha, env_key, project_root,
                           sha256_file as _sha256_file)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
     from _common import (atomic_json as _atomic_json,
                          atomic_new_bytes as _atomic_new_bytes,
-                         canonical_sha256 as _canonical_sha, env_key,
+                         canonical_sha256 as _canonical_sha, env_key, project_root,
                          sha256_file as _sha256_file)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
@@ -68,6 +81,107 @@ ALLOWED_MODEL = "eleven_multilingual_v2"
 ALLOWED_FORMAT = "mp3_44100_192"
 STATE_VERSION = 1
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+VOICE_SETTING_RANGES = {"stability": (0, 1), "similarity_boost": (0, 1), "style": (0, 1),
+                        "speed": (0.7, 1.2), "use_speaker_boost": "boolean"}
+ITEM_FIELDS = {"id", "text", "textFile", "textSha256", "output"}
+# Version 2 only. Version 1 manifests keep exactly ITEM_FIELDS.
+V2_ITEM_FIELDS = {"speaker", "voiceSettings", "seed"}
+V2_ROOT_FIELDS = {"cast", "pronunciationDictionaryLocators"}
+LANGUAGE_CODE = re.compile(r"[a-z]{2,3}\Z")
+SEED_RANGE = (0, 4294967295)
+MAX_DICTIONARY_LOCATORS = 3
+MODEL_EVIDENCE = ("https://elevenlabs.io/docs/overview/models and "
+                  "https://elevenlabs.io/docs/api-reference/text-to-speech/convert, read 2026-10-18")
+PRICING_EVIDENCE = ("https://elevenlabs.io/pricing, read 2026-10-18: one credit per character "
+                    "for multilingual v2; 0.5 to 1 credit per character for Flash through the "
+                    "API; no credit rate stated for v3 or v4. https://elevenlabs.io/pricing/api "
+                    "gives dollar prices only and no credit rate.")
+# The models a version 2 manifest may freeze. There is no fallback: a model
+# not listed here is refused. languageCode says whether the provider documents
+# language_code for the model (it states multilingual_v2 does not take it).
+# creditsPerCharacter is the highest credit rate the provider publishes for the
+# model, or None where it publishes none; the approval and the preflight count
+# characters, so they bound credits only where this is at most 1.
+# exercised says whether this repository has a recorded paid run on it; a new
+# entry needs its own page reading on the day it is added.
+MODELS = {
+    ALLOWED_MODEL: {"verifiedAt": "2026-10-18", "languageCode": False,
+                    "maxCharactersPerRequest": 10000, "creditsPerCharacter": 1,
+                    "exercised": True},
+    "eleven_v4": {"verifiedAt": "2026-10-18", "languageCode": True,
+                  "maxCharactersPerRequest": 10000, "creditsPerCharacter": None,
+                  "exercised": False},
+    "eleven_v3": {"verifiedAt": "2026-10-18", "languageCode": True,
+                  "maxCharactersPerRequest": 5000, "creditsPerCharacter": None,
+                  "exercised": False},
+    # The pricing page gives 0.5 to 1 credit per character through the API.
+    "eleven_flash_v2_5": {"verifiedAt": "2026-10-18", "languageCode": True,
+                          "maxCharactersPerRequest": 40000, "creditsPerCharacter": 1,
+                          "exercised": False},
+}
+
+
+def model_cautions(plan: dict[str, Any]) -> dict[str, list[str]]:
+    """The models a plan uses that have no published credit rate, or no recorded run.
+
+    The approval binds characters. For a model whose credit rate is unpublished
+    or above one per character, that ceiling bounds spend only by assumption,
+    so the dry run names it for the person who signs the approval record.
+    """
+    used = sorted({voice["modelId"] for voice in plan["voices"]})
+    return {
+        "unpublishedPricingModels": [
+            m for m in used if MODELS[m]["creditsPerCharacter"] is None
+            or MODELS[m]["creditsPerCharacter"] > 1],
+        "unexercisedModels": [m for m in used if not MODELS[m]["exercised"]],
+    }
+
+
+def schema() -> dict[str, Any]:
+    """The narration manifest contract, read from the validator's own values."""
+    return {
+        "manifest": "any work/ path; item paths are relative to the manifest",
+        "requiredRootFields": ["version", "financialApproval", "language", "voiceId", "modelId",
+                               "outputFormat", "voiceSettings", "aggregateCharacters", "items"],
+        "optionalRootFields": ["episode", "episodeRoot", "provenancePathBase", "projectRoot",
+                               "sourcePlan", "sourcePlanSha256", "productionOverrides",
+                               "productionOverridesSha256", "authority", "authoritySha256"],
+        "describes": "version 1; version 2 differs where the version2 block says",
+        "fixedValues": {"version": 1, "language": "hi", "modelId": ALLOWED_MODEL,
+                        "outputFormat": ALLOWED_FORMAT},
+        "voiceSettingRanges": VOICE_SETTING_RANGES,
+        "voiceSettingsNote": "every key is required and frozen; no value is supplied by the tool",
+        "itemFields": sorted(ITEM_FIELDS),
+        "itemRule": ("exactly one of text or textFile; textSha256, when present, binds the "
+                     "textFile bytes; output is a relative .mp3 below episodeRoot"),
+        "aggregateCharacters": "sum of stripped item text lengths; --max-characters must equal it",
+        "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
+        "approvalLane": APPROVAL_LANE,
+        "approvalScope": ["items", "characters"],
+        "version2": {
+            "version": 2,
+            "rootVoice": ("voiceId, modelId and voiceSettings together; optional when every "
+                          "item names a cast speaker"),
+            "optionalRootFields": sorted(V2_ROOT_FIELDS),
+            "cast": "speaker name -> {voiceId, modelId, voiceSettings}; every key required",
+            "language": ("required ISO 639-1 code (or ISO 639-3 where the provider uses it); "
+                         "sent as language_code only to models whose entry says languageCode"),
+            "itemFields": sorted(ITEM_FIELDS | V2_ITEM_FIELDS),
+            "itemVoiceSettings": "optional complete voiceSettings that replaces the speaker's for one item",
+            "seed": list(SEED_RANGE),
+            "pronunciationDictionaryLocators": (
+                f"up to {MAX_DICTIONARY_LOCATORS} of "
+                "{pronunciationDictionaryId, versionId}; sent with every item"),
+            "models": MODELS,
+            "modelEvidence": MODEL_EVIDENCE,
+            "pricingEvidence": PRICING_EVIDENCE,
+            "pricingNote": ("the approval and the credit preflight count characters; for a "
+                            "model whose creditsPerCharacter is null or above 1 that bounds "
+                            "credits only by assumption, and the dry run names such models"),
+            "deferred": ("previous_text/next_text: the provider page does not say whether "
+                         "context text is billed, so the character ceiling could not bind it"),
+        },
+    }
 
 
 class PlanError(ValueError):
@@ -141,6 +255,23 @@ def _verified_binding(manifest_path: Path, doc: dict[str, Any],
     return {"kind": path_key, "path": str(path), "sha256": actual}
 
 
+def _verified_authority(manifest_path: Path, doc: dict[str, Any]) -> dict[str, str] | None:
+    """Check the production authority at load time, so the dry run finds a change.
+
+    Paths resolve from the manifest's directory, exactly as the GPU wrapper
+    always resolved them. A manifest without an authority binding is unchanged.
+    """
+    raw_path, raw_sha = doc.get("authority"), doc.get("authoritySha256")
+    if raw_path is None and raw_sha is None:
+        return None
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(raw_sha, str):
+        raise PlanError("authority and authoritySha256 must be supplied together")
+    path = (manifest_path.parent / raw_path).resolve()
+    if not path.is_file() or _sha256_file(path) != raw_sha:
+        raise PlanError(f"production authority changed after the narration manifest was frozen: {path}")
+    return {"path": str(path), "sha256": raw_sha}
+
+
 def _validate_voice_settings(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PlanError("voiceSettings must be an object")
@@ -169,6 +300,50 @@ def _hindi_text(text: Any, item_id: str) -> str:
     return text
 
 
+def _cast_voice(value: Any, label: str) -> dict[str, Any]:
+    """One frozen version 2 voice: an allowlisted model, a voice ID and every setting."""
+    if not isinstance(value, dict) or set(value) != {"voiceId", "modelId", "voiceSettings"}:
+        raise PlanError(f"{label} must be exactly voiceId, modelId and voiceSettings")
+    if not isinstance(value["voiceId"], str) or not SAFE_ID.fullmatch(value["voiceId"]):
+        raise PlanError(f"{label}: voiceId is missing or malformed")
+    if value["modelId"] not in MODELS:
+        raise PlanError(f"{label}: modelId {value['modelId']!r} is not in the dated allowlist "
+                        f"{sorted(MODELS)}; there is no fallback")
+    return {"voiceId": value["voiceId"], "modelId": value["modelId"],
+            "voiceSettings": _validate_voice_settings(value["voiceSettings"])}
+
+
+def _version2_voices(doc: dict[str, Any]) -> tuple[str, dict[str | None, dict[str, Any]], list]:
+    """Language, the voices by speaker (None is the root voice) and dictionary locators."""
+    language = doc.get("language")
+    if not isinstance(language, str) or not LANGUAGE_CODE.fullmatch(language):
+        raise PlanError("version 2 needs a declared lowercase ISO 639 language code")
+    voices: dict[str | None, dict[str, Any]] = {}
+    root = {key: doc[key] for key in ("voiceId", "modelId", "voiceSettings") if key in doc}
+    if root:
+        voices[None] = _cast_voice(root, "root voice")
+    cast = doc.get("cast", {})
+    if not isinstance(cast, dict):
+        raise PlanError("cast must map speaker names to voices")
+    for speaker, voice in cast.items():
+        if not isinstance(speaker, str) or not speaker.strip() or speaker != speaker.strip():
+            raise PlanError(f"cast speaker name is empty or padded: {speaker!r}")
+        voices[speaker] = _cast_voice(voice, f"cast[{speaker}]")
+    if not voices:
+        raise PlanError("version 2 needs a root voice or a cast")
+    locators = doc.get("pronunciationDictionaryLocators", [])
+    if not isinstance(locators, list) or len(locators) > MAX_DICTIONARY_LOCATORS:
+        raise PlanError(f"pronunciationDictionaryLocators must list at most "
+                        f"{MAX_DICTIONARY_LOCATORS} locators")
+    for locator in locators:
+        if (not isinstance(locator, dict)
+                or set(locator) != {"pronunciationDictionaryId", "versionId"}
+                or not all(isinstance(v, str) and SAFE_ID.fullmatch(v) for v in locator.values())):
+            raise PlanError("each pronunciation dictionary locator is exactly "
+                            "pronunciationDictionaryId and versionId, both frozen")
+    return language, voices, [dict(locator) for locator in locators]
+
+
 def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
     if max_characters <= 0:
         raise PlanError("--max-characters must be a positive integer")
@@ -177,20 +352,36 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
         doc = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise PlanError(f"cannot read manifest: {exc}") from exc
-    if not isinstance(doc, dict) or doc.get("version") != 1:
-        raise PlanError("manifest version must be 1")
+    if not isinstance(doc, dict) or doc.get("version") not in (1, 2):
+        raise PlanError("manifest version must be 1 or 2")
+    version = doc["version"]
     if not isinstance(doc.get("financialApproval"), bool):
         raise PlanError("financialApproval must be an explicit boolean")
-    if doc.get("language") != "hi":
-        raise PlanError("finite narration batches are Hindi-only (language must be 'hi')")
-    voice_id = doc.get("voiceId")
-    if not isinstance(voice_id, str) or not SAFE_ID.fullmatch(voice_id):
-        raise PlanError("voiceId is missing or malformed")
-    if doc.get("modelId") != ALLOWED_MODEL:
-        raise PlanError(f"modelId must be {ALLOWED_MODEL}")
-    if doc.get("outputFormat") != ALLOWED_FORMAT:
-        raise PlanError(f"outputFormat must be {ALLOWED_FORMAT}; no quality fallback")
-    settings = _validate_voice_settings(doc.get("voiceSettings"))
+    if version == 1:
+        if set(doc) & V2_ROOT_FIELDS:
+            # An older runner would ignore these and speak every line in one voice.
+            raise PlanError(f"{sorted(set(doc) & V2_ROOT_FIELDS)} need a version 2 manifest")
+        if doc.get("language") != "hi":
+            raise PlanError("finite narration batches are Hindi-only (language must be 'hi')")
+        voice_id = doc.get("voiceId")
+        if not isinstance(voice_id, str) or not SAFE_ID.fullmatch(voice_id):
+            raise PlanError("voiceId is missing or malformed")
+        if doc.get("modelId") != ALLOWED_MODEL:
+            raise PlanError(f"modelId must be {ALLOWED_MODEL}")
+        if doc.get("outputFormat") != ALLOWED_FORMAT:
+            raise PlanError(f"outputFormat must be {ALLOWED_FORMAT}; no quality fallback")
+        settings = _validate_voice_settings(doc.get("voiceSettings"))
+        language, locators = "hi", []
+        voices: dict[str | None, dict[str, Any]] = {
+            None: {"voiceId": voice_id, "modelId": ALLOWED_MODEL, "voiceSettings": settings}}
+    else:
+        known = set(schema()["requiredRootFields"]) | set(schema()["optionalRootFields"])
+        unknown = set(doc) - known - V2_ROOT_FIELDS
+        if unknown:
+            raise PlanError(f"version 2 does not know root fields {sorted(unknown)}")
+        if doc.get("outputFormat") != ALLOWED_FORMAT:
+            raise PlanError(f"outputFormat must be {ALLOWED_FORMAT}; no quality fallback")
+        language, voices, locators = _version2_voices(doc)
     items = doc.get("items")
     if not isinstance(items, list) or not items:
         raise PlanError("items must be a non-empty array")
@@ -212,11 +403,12 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
             ),
         ) if binding is not None
     ]
+    authority = _verified_authority(manifest_path, doc)
     normalized: list[dict[str, Any]] = []
     ids: set[str] = set()
     outputs: set[str] = set()
     total = 0
-    allowed_item_keys = {"id", "text", "textFile", "output"}
+    allowed_item_keys = ITEM_FIELDS if version == 1 else ITEM_FIELDS | V2_ITEM_FIELDS
     for pos, item in enumerate(items):
         if not isinstance(item, dict):
             raise PlanError(f"item {pos}: must be an object")
@@ -245,7 +437,11 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
                 raw_text = text_path.read_text(encoding="utf-8")
             except OSError as exc:
                 raise PlanError(f"{item_id}: cannot read textFile: {exc}") from exc
+            if "textSha256" in item and _sha256_file(text_path) != item["textSha256"]:
+                raise PlanError(f"{item_id}: textFile changed after the manifest was frozen")
         else:
+            if "textSha256" in item:
+                raise PlanError(f"{item_id}: textSha256 binds a textFile, not inline text")
             text_path = None
             raw_text = item["text"]
         text = _hindi_text(raw_text, item_id)
@@ -266,9 +462,12 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
         outputs.add(output_key)
         chars = len(text)
         total += chars
-        normalized.append({"id": item_id, "text": text, "textFile":
-                           str(text_path) if text_path else None,
-                           "output": str(output), "characters": chars})
+        row = {"id": item_id, "text": text, "textFile":
+               str(text_path) if text_path else None,
+               "output": str(output), "characters": chars}
+        if version == 2:
+            row.update(_version2_item(item, item_id, voices, chars))
+        normalized.append(row)
     if total > max_characters:
         raise PlanError(f"aggregate characters {total} exceed explicit cap {max_characters}")
     declared_total = doc.get("aggregateCharacters")
@@ -284,10 +483,22 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
             f"--max-characters must equal frozen aggregateCharacters {declared_total}"
         )
 
-    config = {"language": "hi", "voiceId": voice_id,
-              "modelId": ALLOWED_MODEL, "outputFormat": ALLOWED_FORMAT,
-              "voiceSettings": settings}
+    if version == 1:
+        # Unchanged since version 1: recorded state binds this exact dict's hash.
+        config = {"language": "hi", "voiceId": voice_id,
+                  "modelId": ALLOWED_MODEL, "outputFormat": ALLOWED_FORMAT,
+                  "voiceSettings": settings}
+    else:
+        config = {"version": 2, "language": language, "outputFormat": ALLOWED_FORMAT,
+                  "rootVoice": voices.get(None),
+                  "cast": {k: v for k, v in voices.items() if k is not None},
+                  "pronunciationDictionaryLocators": locators}
+    used = {item.get("speaker") for item in normalized}
     return {"manifest": str(manifest_path), "manifestSha256": _sha256_file(manifest_path),
+            "version": version,
+            "voices": [{"speaker": speaker, "voiceId": voices[speaker]["voiceId"],
+                        "modelId": voices[speaker]["modelId"]}
+                       for speaker in sorted(used, key=lambda s: (s is not None, s or ""))],
             "config": config, "configSha256": _canonical_sha(config),
             "items": normalized, "aggregateCharacters": total,
             "maxCharacters": max_characters,
@@ -295,8 +506,60 @@ def load_plan(manifest_path: Path, max_characters: int) -> dict[str, Any]:
             "sourceBindings": bindings,
             "sourceBindingsSha256": _canonical_sha(bindings),
             "financialApproval": doc.get("financialApproval") is True,
+            "authority": authority,
             "episode": doc.get("episode"),
             "approvalAdmissionSha256": None, "approvalAuthorizationId": None}
+
+
+def _version2_item(item: dict[str, Any], item_id: str,
+                   voices: dict[str | None, dict[str, Any]], chars: int) -> dict[str, Any]:
+    speaker = item.get("speaker")
+    if speaker not in voices:
+        raise PlanError(f"{item_id}: speaker {speaker!r} is not in the cast"
+                        if speaker is not None else
+                        f"{item_id}: names no speaker and the manifest has no root voice")
+    voice = dict(voices[speaker])
+    if "voiceSettings" in item:
+        voice["voiceSettings"] = _validate_voice_settings(item["voiceSettings"])
+    if chars > MODELS[voice["modelId"]]["maxCharactersPerRequest"]:
+        raise PlanError(f"{item_id}: {chars} characters exceed {voice['modelId']}'s "
+                        "documented per-request limit")
+    result: dict[str, Any] = {"speaker": speaker, "voice": voice}
+    if "seed" in item:
+        seed = item["seed"]
+        if (isinstance(seed, bool) or not isinstance(seed, int)
+                or not SEED_RANGE[0] <= seed <= SEED_RANGE[1]):
+            raise PlanError(f"{item_id}: seed must be an integer in {list(SEED_RANGE)}")
+        result["seed"] = seed
+    return result
+
+
+def request_url(plan: dict[str, Any], item: dict[str, Any]) -> str:
+    config = plan["config"]
+    voice_id = item["voice"]["voiceId"] if plan.get("version") == 2 else config["voiceId"]
+    return (f"{API_ROOT}/{urllib.parse.quote(voice_id, safe='')}"
+            f"?output_format={urllib.parse.quote(config['outputFormat'], safe='')}")
+
+
+def request_body(plan: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """The exact POST body. Version 1 keeps its original three keys."""
+    config = plan["config"]
+    if plan.get("version") != 2:
+        return {"text": item["text"], "model_id": config["modelId"],
+                "voice_settings": config["voiceSettings"]}
+    voice = item["voice"]
+    body: dict[str, Any] = {"text": item["text"], "model_id": voice["modelId"],
+                            "voice_settings": voice["voiceSettings"]}
+    if MODELS[voice["modelId"]]["languageCode"]:
+        body["language_code"] = config["language"]
+    if "seed" in item:
+        body["seed"] = item["seed"]
+    if config["pronunciationDictionaryLocators"]:
+        body["pronunciation_dictionary_locators"] = [
+            {"pronunciation_dictionary_id": row["pronunciationDictionaryId"],
+             "version_id": row["versionId"]}
+            for row in config["pronunciationDictionaryLocators"]]
+    return body
 
 
 def _initial_state(plan: dict[str, Any]) -> dict[str, Any]:
@@ -402,6 +665,14 @@ def _verify_resumable(plan: dict[str, Any], state: dict[str, Any]) -> list[dict[
     return pending
 
 
+APPROVAL_LANE = "elevenlabs-narration"
+
+
+def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite execution limits an approval record must bind exactly."""
+    return {"items": len(plan["items"]), "characters": plan["aggregateCharacters"]}
+
+
 def execute(manifest_path: Path, max_characters: int, submit: bool,
             state_path: Path | None = None,
             post_fn: Callable[[str, dict[str, Any], str],
@@ -413,20 +684,18 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
         approval = validate_paid_approval(
             approval_admission,
             episode=plan["episode"],
-            lane="elevenlabs-narration",
+            lane=APPROVAL_LANE,
             manifest_path=Path(plan["manifest"]),
             manifest_sha256=plan["manifestSha256"],
-            finite_execution={
-                "items": len(plan["items"]),
-                "characters": plan["aggregateCharacters"],
-            },
+            finite_execution=approval_scope(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
     plan["approvalAdmission"] = approval
     plan["approvalAdmissionSha256"] = approval["sha256"] if approval else None
     plan["approvalAuthorizationId"] = approval["authorizationId"] if approval else None
-    plan["financialAuthorized"] = plan["financialApproval"] or approval is not None
+    # The manifest's financialApproval is reported, never trusted on its own.
+    plan["financialAuthorized"] = approval is not None
     default_state = Path(plan["manifest"]).with_suffix(".eleven-state.json")
     state_path = (state_path or default_state).resolve()
     if state_path != default_state.resolve():
@@ -434,22 +703,32 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
             f"custom state paths are forbidden for paid batches; use canonical {default_state}"
         )
     if not submit:
-        return {"mode": "DRY_RUN", "networkCalls": 0,
-                "financialApproval": plan["financialApproval"],
-                "financialAuthorized": plan["financialAuthorized"],
-                "approvalAdmissionSha256": (
-                    approval["sha256"] if approval else None
-                ),
-                "manifest": plan["manifest"],
-                "aggregateCharacters": plan["aggregateCharacters"],
-                "maxCharacters": plan["maxCharacters"],
-                "items": [{"id": x["id"], "characters": x["characters"],
-                           "output": x["output"]} for x in plan["items"]]}
+        report = {"mode": "DRY_RUN", "networkCalls": 0,
+                  "financialApproval": plan["financialApproval"],
+                  "financialAuthorized": plan["financialAuthorized"],
+                  "approvalAdmissionSha256": (
+                      approval["sha256"] if approval else None
+                  ),
+                  "manifest": plan["manifest"],
+                  "aggregateCharacters": plan["aggregateCharacters"],
+                  "maxCharacters": plan["maxCharacters"],
+                  "items": [{"id": x["id"], "characters": x["characters"],
+                             "output": x["output"],
+                             **({"speaker": x["speaker"], "voiceId": x["voice"]["voiceId"],
+                                 "modelId": x["voice"]["modelId"],
+                                 "creditsPerCharacter":
+                                     MODELS[x["voice"]["modelId"]]["creditsPerCharacter"],
+                                 "exercised": MODELS[x["voice"]["modelId"]]["exercised"]}
+                                if plan["version"] == 2 else {})}
+                            for x in plan["items"]]}
+        if plan["version"] == 2:
+            report.update(model_cautions(plan))
+        return report
 
     if not plan["financialAuthorized"]:
         raise PlanError(
-            "financialApproval is false and no current approval admission was supplied; "
-            "submission is gated"
+            "submission requires a current approval record (--approval-admission); "
+            "the manifest's financialApproval never authorizes spending"
         )
 
     # The lock is owned by the immutable manifest, never by a caller-selected
@@ -479,13 +758,10 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
             raise PlanError("ELEVENLABS_API_KEY is missing from the explicit credential sources")
         pending_root = state_path.parent / f".{state_path.stem}-responses"
         calls = 0
-        config = plan["config"]
-        url = (f"{API_ROOT}/{urllib.parse.quote(config['voiceId'], safe='')}"
-               f"?output_format={urllib.parse.quote(config['outputFormat'], safe='')}")
         for item in pending:
             record = state["items"][item["id"]]
-            body = {"text": item["text"], "model_id": config["modelId"],
-                    "voice_settings": config["voiceSettings"]}
+            url = request_url(plan, item)
+            body = request_body(plan, item)
             record.update(status="POSTING_UNCERTAIN", postAttempt=1,
                           requestSha256=_canonical_sha(body), postStartedAt=_now())
             _persist(state_path, state)  # durable before the network boundary
@@ -560,16 +836,175 @@ def execute(manifest_path: Path, max_characters: int, submit: bool,
             pass
 
 
+def freeze(draft_path: Path, manifest_path: Path, project: Path, *,
+           voice_settings: dict[str, Any] | None, voice_id: str | None = None,
+           authority_path: Path | None = None, cast: dict[str, Any] | None = None,
+           language: str | None = None) -> dict[str, Any]:
+    """Write a narration manifest from a draft plan, then dry-run it.
+
+    Accepts the narration-plan.json that prepare_episode_production.py writes
+    (project-relative outputs, inline text) and items that name a textFile,
+    which are bound by textSha256. Voice settings are the operator's own
+    frozen choice; the tool supplies none. financialApproval is always false.
+    """
+    project = project.resolve()
+    manifest_path = manifest_path.resolve()
+    if manifest_path.exists():
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}")
+    if not _is_below(manifest_path, project) or not _is_below(draft_path.resolve(), project):
+        raise PlanError("draft and manifest must both sit inside the project")
+    try:
+        draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot read narration draft: {exc}") from exc
+    voice = voice_id or draft.get("voiceId") or draft.get("voice")
+    model = draft.get("modelId", draft.get("model", ALLOWED_MODEL))
+    if cast is None and language in (None, "hi"):
+        if voice_settings is None:
+            raise PlanError("a single-voice freeze needs --voice-settings")
+        settings = _validate_voice_settings(voice_settings)
+        if not isinstance(voice, str) or not SAFE_ID.fullmatch(voice):
+            raise PlanError("no cast voice: pass --voice-id or name voiceId in the draft")
+        if model != ALLOWED_MODEL:
+            raise PlanError(f"a version 1 manifest accepts only {ALLOWED_MODEL}; the draft asks "
+                            f"for {model!r}; pass --cast to freeze version 2")
+    items = draft.get("items")
+    if not isinstance(items, list) or not items:
+        raise PlanError("draft items must be a non-empty list")
+    here = manifest_path.parent
+    frozen, problems, total = [], [], 0
+    version = 1 if cast is None and language in (None, "hi") else 2
+    for position, item in enumerate(items):
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not SAFE_ID.fullmatch(item_id):
+            problems.append(f"item {position}: id is missing or malformed")
+            continue
+        output = item.get("output")
+        if not isinstance(output, str) or not output.endswith(".mp3"):
+            problems.append(f"{item_id}: output must be a project-relative .mp3 path")
+            continue
+        row: dict[str, Any] = {"id": item_id,
+                               "output": os.path.relpath(project / output, here)}
+        if isinstance(item.get("textFile"), str):
+            text_path = (project / item["textFile"]).resolve()
+            if not text_path.is_file():
+                problems.append(f"{item_id}: textFile is missing: {text_path}")
+                continue
+            row.update(textFile=os.path.relpath(text_path, here),
+                       textSha256=_sha256_file(text_path))
+            text = text_path.read_text(encoding="utf-8")
+        else:
+            text = item.get("text")
+            row["text"] = text
+        if not isinstance(text, str) or not text.strip():
+            problems.append(f"{item_id}: narration text is empty")
+            continue
+        total += len(text.strip())
+        if version == 2:
+            if isinstance(item.get("speaker"), str) and item["speaker"].strip():
+                row["speaker"] = item["speaker"].strip()
+            row.update({key: item[key] for key in ("seed", "voiceSettings") if key in item})
+        frozen.append(row)
+    if problems:
+        raise PlanError("cannot freeze yet: " + "; ".join(problems))
+    relative_root = os.path.relpath(project, here)
+    if version == 1:
+        doc: dict[str, Any] = {
+            "version": 1, "episode": draft.get("episode"), "financialApproval": False,
+            "language": "hi", "voiceId": voice, "modelId": ALLOWED_MODEL,
+            "outputFormat": ALLOWED_FORMAT, "voiceSettings": settings,
+            "episodeRoot": relative_root, "projectRoot": relative_root,
+            "provenancePathBase": "project",
+            "sourcePlan": draft_path.resolve().relative_to(project).as_posix(),
+            "sourcePlanSha256": _sha256_file(draft_path.resolve()),
+            "aggregateCharacters": total, "items": frozen,
+        }
+    else:
+        doc = {
+            "version": 2, "episode": draft.get("episode"), "financialApproval": False,
+            "language": language or draft.get("language") or "hi",
+            "outputFormat": ALLOWED_FORMAT, "cast": cast or {},
+            "episodeRoot": relative_root, "projectRoot": relative_root,
+            "provenancePathBase": "project",
+            "sourcePlan": draft_path.resolve().relative_to(project).as_posix(),
+            "sourcePlanSha256": _sha256_file(draft_path.resolve()),
+            "aggregateCharacters": total, "items": frozen,
+        }
+        # The root voice speaks every item that names no speaker; it is the
+        # operator's choice, frozen only when they give its settings.
+        if voice_settings is not None:
+            if not isinstance(voice, str) or not SAFE_ID.fullmatch(voice):
+                raise PlanError("--voice-settings names a root voice: pass --voice-id too")
+            doc.update(voiceId=voice, modelId=model, voiceSettings=voice_settings)
+    if authority_path is not None:
+        authority_path = authority_path.resolve()
+        if not authority_path.is_file():
+            raise PlanError(f"authority file is missing: {authority_path}")
+        doc.update(authority=os.path.relpath(authority_path, here),
+                   authoritySha256=_sha256_file(authority_path))
+    raw = (json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    try:
+        _atomic_new_bytes(manifest_path, raw)
+    except FileExistsError as exc:
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}") from exc
+    try:
+        return execute(manifest_path, total, False)
+    except PlanError:
+        manifest_path.unlink()
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--max-characters", type=int, required=True,
-                        help="explicit hard cap for all manifest text")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Item fields: " + ", ".join(sorted(ITEM_FIELDS)) + ". Voice settings: "
+                + ", ".join(sorted(VOICE_SETTING_RANGES)) + ". Run --print-schema for the "
+                "whole contract; the approval lane is " + APPROVAL_LANE + "."))
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--max-characters", type=int,
+                        help="explicit hard cap for all manifest text; must equal aggregateCharacters")
+    parser.add_argument("--print-schema", action="store_true",
+                        help="print the narration manifest contract and exit")
+    parser.add_argument("--freeze", type=Path, metavar="DRAFT",
+                        help="write MANIFEST from a narration plan, then dry-run it")
+    freezing = parser.add_argument_group("freeze inputs")
+    freezing.add_argument("--project", type=Path, help="project root (or AGENTIC_PROJECT_ROOT)")
+    freezing.add_argument("--voice-settings", type=Path,
+                          help="JSON with every voiceSettings key, chosen for this film")
+    freezing.add_argument("--voice-id", help="the cast voice; otherwise the draft's voiceId")
+    freezing.add_argument("--cast", type=Path,
+                          help="JSON mapping each speaker to {voiceId, modelId, voiceSettings}; "
+                               "writes a version 2 manifest")
+    freezing.add_argument("--language", help="ISO 639 code a version 2 manifest declares")
+    freezing.add_argument("--authority", type=Path, help="production authority file to bind")
     parser.add_argument("--submit", action="store_true",
                         help="perform at most one POST for each pending item")
     parser.add_argument("--approval-admission", type=Path,
                         help="hash-bound external paid authorization record")
     args = parser.parse_args(argv)
+    if args.print_schema:
+        print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.freeze is not None:
+        if args.manifest is None or (args.voice_settings is None and args.cast is None):
+            parser.error("--freeze DRAFT needs the MANIFEST path to write and "
+                         "--voice-settings, --cast or both")
+        try:
+            settings = (json.loads(args.voice_settings.read_text(encoding="utf-8"))
+                        if args.voice_settings else None)
+            cast = json.loads(args.cast.read_text(encoding="utf-8")) if args.cast else None
+            result = freeze(args.freeze, args.manifest, project_root(args.project),
+                            voice_settings=settings, voice_id=args.voice_id,
+                            authority_path=args.authority, cast=cast,
+                            language=args.language)
+        except (PlanError, ValueError, OSError) as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"frozen": str(args.manifest.resolve()), **result},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if args.manifest is None or args.max_characters is None:
+        parser.error("manifest and --max-characters are required")
     try:
         result = execute(
             args.manifest,

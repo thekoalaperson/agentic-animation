@@ -47,11 +47,17 @@ class GeometryWarningTests(unittest.TestCase):
         warnings = DIALOGUE.source_geometry_warnings(rows)
         self.assertEqual([w["jobId"] for w in warnings], ["demo-s002"])
         self.assertIn("derive_still.py", warnings[0]["hint"])
+        # A version 3 manifest freezes its own ratio; the warning compares against that.
+        tall = DIALOGUE.source_geometry_warnings(rows, "9:16")
+        self.assertEqual([w["jobId"] for w in tall], ["demo-s001", "demo-s002", "demo-s003"])
+        self.assertEqual({w["sentAspectRatio"] for w in tall}, {"9:16"})
 
     def test_warnings_do_not_enter_the_hashed_execution_request(self):
-        plan = {"manifestSha256": "a" * 64, "geometryWarnings": [{"type": "source-aspect"}]}
+        plan = {"manifestSha256": "a" * 64, "model": "grok-imagine-video-1-5-preview",
+                "resolution": "720p", "aspectRatio": "16:9",
+                "geometryWarnings": [{"type": "source-aspect"}]}
         row = dict(id="demo-s001", sourceSha256="b" * 64, promptSha256="c" * 64,
-                   durationSeconds=7, outputStem="motion/demo-s001")
+                   durationSeconds=7, outputStem="motion/demo-s001", referenceSha256s=[])
         bare = {key: value for key, value in plan.items() if key != "geometryWarnings"}
         self.assertEqual(DIALOGUE.execution_request(plan, row), DIALOGUE.execution_request(bare, row))
 

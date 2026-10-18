@@ -7,6 +7,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+if not __debug__:
+    raise SystemExit("Optimized Python disables production safety gates")
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -30,14 +34,16 @@ def build(report_path, draft_path, output):
                 'id': candidate['id'], 'sha256': candidate['sha256'],
                 'url': quote(os.path.relpath(media, output.parent), safe='/'),
                 'duration': candidate['features']['durationSeconds'],
-                'short': candidate['durationFlag'] != 'OK',
+                'short': candidate['durationFlag'].startswith('SHORTER'),
                 'requested': candidate['requestedDurationSeconds'],
                 'energy': candidate['features']['trajectory']['rmsEnergy'],
             })
-        assert len(takes) == 2, f"{cue['id']}: expected two retrieved takes"
+        # Version 1 reports predate the field and always meant two takes.
+        expected = report.get('expectedCandidatesPerMovement', 2)
+        assert len(takes) == expected, f"{cue['id']}: expected {expected} retrieved takes"
         rows.append({'id': cue['id'], 'shots': cue['shots'],
-                     'title': cue['payload']['title'],
-                     'prompt': cue['payload']['style'],
+                     'title': cue['payload'].get('title', cue['id']),
+                     'prompt': cue['payload'].get('style', ''),
                      'takes': sorted(takes, key=lambda x: x['id']),
                      'arc': cue.get('emotionalArc'),
                      'wave': report['targets'][cue['id']]['authoredSemanticWave']})

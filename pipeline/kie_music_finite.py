@@ -7,6 +7,16 @@ manifest, and caller-supplied request/credit ceilings.  Each movement receives
 at most one POST.  Ambiguous POSTs and provider failures stop the run and are
 never regenerated automatically.  --poll is a separate, idempotent recovery
 operation for already-persisted task IDs.
+
+--submit is re-entrant. On a fresh batch it posts one cue; once that cue is
+DOWNLOADED, the next --submit posts every cue still PLANNED. While the first
+cue is in flight it posts nothing. A wrong price or payload therefore costs one
+request. run_score_gpu.py does this sequence in one invocation.
+
+A version 2 cue may extend an earlier cue's take (derivedFrom). It waits as
+WAITING_PARENT, is never posted while its parent is in flight, and is posted
+once by a later --submit after the parent is DOWNLOADED. Recorded version 1
+manifests keep their nine-key payload rule and their recorded routes.
 """
 
 from __future__ import annotations
@@ -28,12 +38,12 @@ import urllib.request
 if __package__:
     from ._common import (atomic_json as _atomic_json,
                           atomic_new_bytes as _atomic_bytes_new, env_key,
-                          sha256_file as _sha_file)
+                          sha256_file as _sha_file, usd_per_credit)
     from .paid_approval import PaidApprovalError, validate_paid_approval
 else:
     from _common import (atomic_json as _atomic_json,
                          atomic_new_bytes as _atomic_bytes_new, env_key,
-                         sha256_file as _sha_file)
+                         sha256_file as _sha_file, usd_per_credit)
     from paid_approval import PaidApprovalError, validate_paid_approval
 
 
@@ -47,8 +57,254 @@ IN_PROGRESS = {"PENDING", "WAITING", "QUEUING", "GENERATING", "CREATE_TASK",
                "TEXT_SUCCESS", "FIRST_SUCCESS"}
 
 
+PAYLOAD_FIELDS = {"model", "customMode", "instrumental", "prompt", "title",
+                  "duration", "callBackUrl", "negativeTags", "style"}
+CUE_FIELDS = {"id", "shots", "emotionalArc", "payload"}
+
+# Version 2 manifests. Version 1 keeps its nine-key rule above, unchanged, so
+# recorded manifests validate and resume exactly as they were frozen.
+V6_FAMILY = frozenset({"V6", "V6_MINI", "V6_WILD"})
+MANIFEST_VERSIONS = {1, 2}
+DERIVED_CUE_FIELD = "derivedFrom"
+DERIVED_OPERATIONS = {"extend"}
+# Per-route code allowlists, read from Kie's generate-music and extend-music
+# pages on 2026-10-18. Frozen keys are camelCase; _create maps them to the
+# provider's snake_case input names. A key on no list is refused.
+V6_OPTIONAL_FIELDS = frozenset({"prompt", "callBackUrl", "negativeTags", "styleWeight",
+                                "weirdnessConstraint", "audioWeight", "variety",
+                                "vocalGender", "personaId", "personaModel"})
+ROUTE_FIELDS = {
+    "generate-v6": {"required": frozenset({"model", "customMode", "instrumental", "title", "style"}),
+                    "optional": V6_OPTIONAL_FIELDS | {"duration"}},
+    # instrumental is required here although the provider defaults it to false:
+    # an extend of an instrumental take must not become a sung request by omission.
+    "extend-v6": {"required": frozenset({"model", "instrumental"}),
+                  "optional": V6_OPTIONAL_FIELDS | {"style", "title"}},
+}
+V6_INPUT_NAMES = {"customMode": "custom_mode", "negativeTags": "negative_tags",
+                  "styleWeight": "style_weight", "weirdnessConstraint": "weirdness_constraint",
+                  "audioWeight": "audio_weight", "vocalGender": "vocal_gender",
+                  "personaId": "persona_id", "personaModel": "persona_model",
+                  "audioId": "audio_id", "continueAt": "continue_at"}
+UNIT_FIELDS = ("styleWeight", "weirdnessConstraint", "audioWeight")
+
+
 class PlanError(ValueError):
     pass
+
+
+def schema() -> dict[str, Any]:
+    """The score execution manifest contract, read from the validator's own sets."""
+    return {
+        "manifest": "execution manifest; sourceDraft and outputDirectory sit below it",
+        "requiredRootFields": ["version", "financialApproval", "currentPriceVerified",
+                               "sourceDraft", "sourceDraftSha256", "cues", "creditsPerRequest",
+                               "maxRequests", "maxCredits", "outputDirectory",
+                               "expectedCandidatesPerRequest"],
+        "optionalRootFields": ["episode", "pricing", "provenancePathBase", "projectRoot",
+                               "productionOverrides", "productionOverridesSha256",
+                               "authority", "authoritySha256", "creativeBindings",
+                               "creditsPerExtendRequest"],
+        "versions": {
+            "1": "recorded manifests: exactly the nine payloadFields, model V5_5 or V6, "
+                 "instrumental with an empty prompt, callBackUrl and non-empty negativeTags",
+            "2": "what --freeze writes: exactly the keys frozen in the draft, each from its "
+                 "route's allowlist below; cues may carry derivedFrom",
+        },
+        "cueFields": sorted(CUE_FIELDS),
+        "optionalCueFieldsV2": [DERIVED_CUE_FIELD],
+        "payloadFields": sorted(PAYLOAD_FIELDS),
+        "payloadRules": {"model": ["V5_5", "V6"], "customMode": True, "instrumental": True,
+                         "prompt": "", "duration": "integer 10-360", "style": "1-1000 characters",
+                         "title": "1-80 characters", "negativeTags": "non-empty"},
+        "payloadRoutesV2": {
+            "legacy": "model V5_5 keeps the version 1 nine-key rule and posts to generate "
+                      "with its required callBackUrl",
+            **{route: {"models": sorted(V6_FAMILY), "required": sorted(fields["required"]),
+                       "optional": sorted(fields["optional"])}
+               for route, fields in ROUTE_FIELDS.items()},
+        },
+        "payloadRangesV2": {
+            "customMode": True, "instrumental": "boolean, always frozen explicitly",
+            "prompt": "the lyrics: empty or absent on an instrumental generate, and no prompt "
+                      "key at all on an instrumental extend; 1-5000 characters and required "
+                      "on generate when instrumental is false",
+            "title": "1-80 characters (extend 1-100)", "style": "1-1000 characters",
+            "duration": "integer 10-360 (generate only)", "negativeTags": "non-empty if present",
+            "styleWeight": "0-1, two decimals", "weirdnessConstraint": "0-1, two decimals",
+            "audioWeight": "0-1, two decimals; not with instrumental",
+            "variety": "integer 0-4", "vocalGender": "m or f; not with instrumental",
+            "personaId": "passed through as given; this runner creates no persona",
+            "personaModel": "style_persona or voice_persona",
+            "callBackUrl": "optional https URL; sent when present. Omitting it on "
+                           "jobs/createTask is unverified until one bounded live call",
+        },
+        "derivedFrom": {
+            "shape": "{cueId, take, operation: extend, continueAt}",
+            "rules": "the parent is an earlier cue of this manifest with the same V6-family "
+                     "model; submit waits (WAITING_PARENT) until the parent is DOWNLOADED, "
+                     "then posts with the parent take's real provider track id, refusing a "
+                     "synthesized one; continueAt must fall inside the parent take",
+            "pricing": "creditsPerExtendRequest is required when any cue extends",
+            "sourceSeconds": "an extend requests no duration and adds 0 sourceSeconds",
+            "retention": "the provider keeps generated files 14 days, which limits extending "
+                         "a take across episodes; parents in other manifests are not supported",
+        },
+        "sungWords": "a sung cue's words are text in the film that the screenplay may not "
+                     "contain: record whether they come from the source or were added, and "
+                     "whether they are subtitled",
+        "sourceDraft": "{commonPayload, cues}; frozen cues equal each draft cue with commonPayload "
+                       "merged in. commonPayload reaches extend cues too, so when a draft extends, "
+                       "keep generate-only keys (customMode, duration, an instrumental prompt) "
+                       "on each generate cue rather than in commonPayload",
+        "ceilings": "cues x their kind's price (creditsPerRequest, creditsPerExtendRequest) must "
+                    "fit maxCredits; --max-requests/--max-credits may not exceed the manifest",
+        "financialApproval": "boolean; reported, never sufficient: submission needs an approval record",
+        "approvalLane": "suno-score",
+        "approvalScope": ["requests", "credits", "sourceSeconds"],
+    }
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _short_text(value: Any, limit: int) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= limit and bool(value.strip())
+
+
+def _validate_v1_payload(cue_id: str, payload: Any) -> None:
+    """The version 1 rule, kept exactly as recorded manifests were validated."""
+    required = PAYLOAD_FIELDS
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise PlanError(f"{cue_id}: payload fields must be exactly {sorted(required)}")
+    if payload["model"] not in {"V5_5", "V6"} or payload["customMode"] is not True:
+        raise PlanError(f"{cue_id}: only V5_5 or V6 custom mode is allowed")
+    if payload["instrumental"] is not True or payload["prompt"] != "":
+        raise PlanError(f"{cue_id}: score must be instrumental with empty lyrics prompt")
+    if not isinstance(payload["duration"], int) or not 10 <= payload["duration"] <= 360:
+        raise PlanError(f"{cue_id}: duration must be an integer from 10 to 360")
+    if not isinstance(payload["style"], str) or not 0 < len(payload["style"]) <= 1000:
+        raise PlanError(f"{cue_id}: style must contain at most 1000 characters")
+    if not isinstance(payload["title"], str) or not 0 < len(payload["title"]) <= 80:
+        raise PlanError(f"{cue_id}: title must contain at most 80 characters")
+    if not isinstance(payload["negativeTags"], str) or not payload["negativeTags"].strip():
+        raise PlanError(f"{cue_id}: negativeTags must be non-empty")
+
+
+def _validate_v6_payload(cue_id: str, payload: Any, route: str) -> None:
+    """Exactly the keys frozen in the draft, each from the route's allowlist and range."""
+    fields = ROUTE_FIELDS[route]
+    if not isinstance(payload, dict):
+        raise PlanError(f"{cue_id}: payload must be an object")
+    keys = set(payload)
+    missing = fields["required"] - keys
+    unknown = keys - fields["required"] - fields["optional"]
+    if missing or unknown:
+        hint = (" (commonPayload is merged into extend cues too; keep generate-only keys "
+                "on each generate cue)" if route == "extend-v6" and unknown else "")
+        raise PlanError(f"{cue_id}: {route} payload is missing {sorted(missing)} or carries "
+                        f"keys outside its allowlist {sorted(unknown)}{hint}")
+    if payload["model"] not in V6_FAMILY:
+        raise PlanError(f"{cue_id}: {route} needs a model from {sorted(V6_FAMILY)}")
+    if "customMode" in payload and payload["customMode"] is not True:
+        raise PlanError(f"{cue_id}: customMode must be true")
+    instrumental = payload["instrumental"]
+    if not isinstance(instrumental, bool):
+        raise PlanError(f"{cue_id}: instrumental must be a boolean")
+    lyrics = payload.get("prompt")
+    if instrumental:
+        if lyrics not in (None, ""):
+            raise PlanError(f"{cue_id}: an instrumental cue carries no lyrics prompt")
+        if route == "extend-v6" and "prompt" in payload:
+            raise PlanError(f"{cue_id}: an instrumental extend carries no prompt key, not even "
+                            "an empty one (commonPayload is merged into extend cues too)")
+        for key in ("vocalGender", "audioWeight"):
+            if key in payload:
+                raise PlanError(f"{cue_id}: {key} does not apply to an instrumental cue")
+    elif lyrics is not None or route == "generate-v6":
+        # A sung generate needs lyrics; a sung extend may continue from the audio alone.
+        if not _short_text(lyrics, 5000):
+            raise PlanError(f"{cue_id}: a sung cue freezes its authored lyrics (1-5000 "
+                            "characters) in prompt")
+    if "title" in payload and not _short_text(payload["title"], 80 if route == "generate-v6" else 100):
+        raise PlanError(f"{cue_id}: title is empty or too long")
+    if "style" in payload and not _short_text(payload["style"], 1000):
+        raise PlanError(f"{cue_id}: style must contain 1-1000 characters")
+    if "duration" in payload and (not isinstance(payload["duration"], int)
+                                  or isinstance(payload["duration"], bool)
+                                  or not 10 <= payload["duration"] <= 360):
+        raise PlanError(f"{cue_id}: duration must be an integer from 10 to 360")
+    if "negativeTags" in payload and not _short_text(payload["negativeTags"], 1000):
+        raise PlanError(f"{cue_id}: negativeTags, when present, must be non-empty")
+    for key in UNIT_FIELDS:
+        if key in payload:
+            value = payload[key]
+            if not _is_number(value) or not 0 <= value <= 1 or round(value, 2) != value:
+                raise PlanError(f"{cue_id}: {key} must be 0-1 with at most two decimals")
+    if "variety" in payload and (not isinstance(payload["variety"], int)
+                                 or isinstance(payload["variety"], bool)
+                                 or not 0 <= payload["variety"] <= 4):
+        raise PlanError(f"{cue_id}: variety must be an integer from 0 to 4")
+    if "vocalGender" in payload and payload["vocalGender"] not in {"m", "f"}:
+        raise PlanError(f"{cue_id}: vocalGender must be m or f")
+    if "personaId" in payload and not _short_text(payload["personaId"], 200):
+        raise PlanError(f"{cue_id}: personaId must be a non-empty id")
+    if "personaModel" in payload and payload["personaModel"] not in {"style_persona", "voice_persona"}:
+        raise PlanError(f"{cue_id}: personaModel must be style_persona or voice_persona")
+    callback = payload.get("callBackUrl")
+    if "callBackUrl" in payload and (not isinstance(callback, str)
+                                     or not callback.startswith("https://")):
+        raise PlanError(f"{cue_id}: callBackUrl, when present, must be an https URL")
+
+
+def _validate_derived(cue: dict[str, Any], earlier: dict[str, dict[str, Any]],
+                      expected_candidates: Any) -> None:
+    cue_id, spec = cue["id"], cue[DERIVED_CUE_FIELD]
+    if not isinstance(spec, dict) or set(spec) != {"cueId", "take", "operation", "continueAt"}:
+        raise PlanError(f"{cue_id}: derivedFrom must be exactly {{cueId, take, operation, continueAt}}")
+    if spec["operation"] not in DERIVED_OPERATIONS:
+        raise PlanError(f"{cue_id}: derivedFrom operation must be one of {sorted(DERIVED_OPERATIONS)}")
+    parent = earlier.get(spec["cueId"])
+    if parent is None:
+        raise PlanError(f"{cue_id}: derivedFrom must name an earlier cue of this manifest")
+    take = spec["take"]
+    if (not isinstance(take, int) or isinstance(take, bool) or take < 1
+            or (isinstance(expected_candidates, int) and take > expected_candidates)):
+        raise PlanError(f"{cue_id}: derivedFrom take must be one of the parent's takes")
+    if not _is_number(spec["continueAt"]) or not spec["continueAt"] > 0:
+        raise PlanError(f"{cue_id}: continueAt must be a positive number of seconds")
+    model = cue["payload"].get("model")
+    if model not in V6_FAMILY or parent["payload"].get("model") != model:
+        raise PlanError(f"{cue_id}: an extend uses the parent's own V6-family model")
+
+
+def _validate_v2_cues(cues: list[Any], expected_candidates: Any) -> None:
+    earlier: dict[str, dict[str, Any]] = {}
+    for cue in cues:
+        if (not isinstance(cue, dict) or not CUE_FIELDS <= set(cue)
+                or set(cue) - CUE_FIELDS - {DERIVED_CUE_FIELD}):
+            raise PlanError("each cue must freeze id, shots, emotionalArc and payload, "
+                            "and may add derivedFrom")
+        cue_id = cue.get("id")
+        if not isinstance(cue_id, str) or not SAFE_ID.fullmatch(cue_id) or cue_id in earlier:
+            raise PlanError(f"duplicate or malformed cue id: {cue_id}")
+        payload = cue.get("payload")
+        if DERIVED_CUE_FIELD in cue:
+            _validate_v6_payload(cue_id, payload, "extend-v6")
+            _validate_derived(cue, earlier, expected_candidates)
+        elif isinstance(payload, dict) and payload.get("model") == "V5_5":
+            _validate_v1_payload(cue_id, payload)
+        else:
+            _validate_v6_payload(cue_id, payload, "generate-v6")
+        earlier[cue_id] = cue
+
+
+def cue_credits(doc: dict[str, Any], cue: dict[str, Any]) -> int:
+    """The frozen price of one cue's single request, by kind."""
+    if DERIVED_CUE_FIELD in cue:
+        return doc["creditsPerExtendRequest"]
+    return doc["creditsPerRequest"]
 
 
 class UncertainRequest(RuntimeError):
@@ -123,6 +379,36 @@ def _verified_binding(manifest_path: Path, doc: dict[str, Any],
     return {"kind": path_key, "path": str(path), "sha256": actual}
 
 
+def _verified_authority(manifest_path: Path, doc: dict[str, Any]) -> dict[str, Any] | None:
+    """Check authority and creative bindings at load time, so the dry run finds a change.
+
+    Paths resolve from the manifest's directory, exactly as run_score_gpu.py
+    always resolved them. A manifest without these fields is unchanged.
+    """
+    raw_path, raw_sha = doc.get("authority"), doc.get("authoritySha256")
+    result: dict[str, Any] = {}
+    if raw_path is not None or raw_sha is not None:
+        if not isinstance(raw_path, str) or not raw_path or not isinstance(raw_sha, str):
+            raise PlanError("authority and authoritySha256 must be supplied together")
+        path = (manifest_path.parent / raw_path).resolve()
+        if not path.is_file() or _sha_file(path) != raw_sha:
+            raise PlanError(f"authority changed after the score manifest was frozen: {path}")
+        result["authority"] = {"path": str(path), "sha256": raw_sha}
+    bindings = doc.get("creativeBindings")
+    if bindings is not None:
+        if not isinstance(bindings, list):
+            raise PlanError("creativeBindings must be a list of {path, sha256}")
+        for position, binding in enumerate(bindings):
+            if (not isinstance(binding, dict) or not isinstance(binding.get("path"), str)
+                    or not isinstance(binding.get("sha256"), str)):
+                raise PlanError(f"creativeBindings[{position}] must carry path and sha256")
+            path = (manifest_path.parent / binding["path"]).resolve()
+            if not path.is_file() or _sha_file(path) != binding["sha256"]:
+                raise PlanError(f"creative/timing input changed after freezing: {binding['path']}")
+        result["creativeBindings"] = len(bindings)
+    return result or None
+
+
 def load_plan(manifest_path: Path, max_requests: int,
               max_credits: int) -> dict[str, Any]:
     if max_requests <= 0 or max_credits <= 0:
@@ -132,8 +418,9 @@ def load_plan(manifest_path: Path, max_requests: int,
         doc = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise PlanError(f"cannot read execution manifest: {exc}") from exc
-    if not isinstance(doc, dict) or doc.get("version") != 1:
-        raise PlanError("execution manifest version must be 1")
+    if not isinstance(doc, dict) or doc.get("version") not in MANIFEST_VERSIONS:
+        raise PlanError("execution manifest version must be 1 or 2")
+    version = doc["version"]
     if not isinstance(doc.get("financialApproval"), bool):
         raise PlanError("financialApproval must be an explicit boolean")
     if not isinstance(doc.get("currentPriceVerified"), bool):
@@ -148,6 +435,7 @@ def load_plan(manifest_path: Path, max_requests: int,
     production_binding = _verified_binding(
         manifest_path, doc, "productionOverrides", "productionOverridesSha256"
     )
+    authority = _verified_authority(manifest_path, doc)
     try:
         source = json.loads(source_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -165,39 +453,34 @@ def load_plan(manifest_path: Path, max_requests: int,
     ]
     if cues != materialized_source:
         raise PlanError("frozen cues are not byte-semantically equal to source draft cues")
-    ids: set[str] = set()
-    for cue in cues:
-        if not isinstance(cue, dict) or set(cue) != {"id", "shots", "emotionalArc", "payload"}:
-            raise PlanError("each cue must freeze id, shots, emotionalArc and payload")
-        cue_id = cue.get("id")
-        if not isinstance(cue_id, str) or not SAFE_ID.fullmatch(cue_id) or cue_id in ids:
-            raise PlanError(f"duplicate or malformed cue id: {cue_id}")
-        ids.add(cue_id)
-        payload = cue.get("payload")
-        required = {"model", "customMode", "instrumental", "prompt", "title",
-                    "duration", "callBackUrl", "negativeTags", "style"}
-        if not isinstance(payload, dict) or set(payload) != required:
-            raise PlanError(f"{cue_id}: payload fields must be exactly {sorted(required)}")
-        if payload["model"] not in {"V5_5", "V6"} or payload["customMode"] is not True:
-            raise PlanError(f"{cue_id}: only V5_5 or V6 custom mode is allowed")
-        if payload["instrumental"] is not True or payload["prompt"] != "":
-            raise PlanError(f"{cue_id}: score must be instrumental with empty lyrics prompt")
-        if not isinstance(payload["duration"], int) or not 10 <= payload["duration"] <= 360:
-            raise PlanError(f"{cue_id}: duration must be an integer from 10 to 360")
-        if not isinstance(payload["style"], str) or not 0 < len(payload["style"]) <= 1000:
-            raise PlanError(f"{cue_id}: style must contain at most 1000 characters")
-        if not isinstance(payload["title"], str) or not 0 < len(payload["title"]) <= 80:
-            raise PlanError(f"{cue_id}: title must contain at most 80 characters")
-        if not isinstance(payload["negativeTags"], str) or not payload["negativeTags"].strip():
-            raise PlanError(f"{cue_id}: negativeTags must be non-empty")
+    if version == 1:
+        ids: set[str] = set()
+        for cue in cues:
+            if not isinstance(cue, dict) or set(cue) != CUE_FIELDS:
+                raise PlanError("each cue must freeze id, shots, emotionalArc and payload")
+            cue_id = cue.get("id")
+            if not isinstance(cue_id, str) or not SAFE_ID.fullmatch(cue_id) or cue_id in ids:
+                raise PlanError(f"duplicate or malformed cue id: {cue_id}")
+            ids.add(cue_id)
+            _validate_v1_payload(cue_id, cue.get("payload"))
+    else:
+        _validate_v2_cues(cues, doc.get("expectedCandidatesPerRequest"))
     credits_each = doc.get("creditsPerRequest")
     manifest_requests = doc.get("maxRequests")
     manifest_credits = doc.get("maxCredits")
     if not all(isinstance(x, int) and not isinstance(x, bool) and x > 0
                for x in (credits_each, manifest_requests, manifest_credits)):
         raise PlanError("creditsPerRequest/maxRequests/maxCredits must be positive integers")
+    extends = [cue for cue in cues if DERIVED_CUE_FIELD in cue]
+    extend_price = doc.get("creditsPerExtendRequest")
+    if version == 1 and "creditsPerExtendRequest" in doc:
+        raise PlanError("creditsPerExtendRequest needs a version 2 manifest")
+    if "creditsPerExtendRequest" in doc or extends:
+        if not isinstance(extend_price, int) or isinstance(extend_price, bool) or extend_price <= 0:
+            raise PlanError("an extend cue needs creditsPerExtendRequest, a positive integer "
+                            "you verified for the extend route")
     request_count = len(cues)
-    expected_credits = request_count * credits_each
+    expected_credits = sum(cue_credits(doc, cue) for cue in cues)
     if request_count > manifest_requests or expected_credits > manifest_credits:
         raise PlanError("frozen cue count exceeds manifest ceiling")
     if request_count > max_requests or expected_credits > max_credits:
@@ -214,7 +497,7 @@ def load_plan(manifest_path: Path, max_requests: int,
     fingerprint = _sha_file(manifest_path)
     return {"path": str(manifest_path), "sha256": fingerprint, "doc": doc,
             "sourceSha256": source_sha, "cues": cues, "outputRoot": str(output_root),
-            "productionBinding": production_binding,
+            "productionBinding": production_binding, "authority": authority,
             "expectedCandidatesPerRequest": expected_candidates,
             "requestCount": request_count, "expectedCredits": expected_credits,
             "maxRequests": max_requests, "maxCredits": max_credits}
@@ -278,12 +561,23 @@ def _request_json(method: str, url: str, key: str,
     return result["data"]
 
 
+def provider_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """The jobs/createTask body for a V6-family request; an audioId makes it an extend.
+
+    callBackUrl is sent only when frozen, so a version 1 V6 body is unchanged.
+    """
+    body: dict[str, Any] = {"model": "ai-music-api/extend" if "audioId" in payload
+                            else "ai-music-api/generate"}
+    if "callBackUrl" in payload:
+        body["callBackUrl"] = payload["callBackUrl"]
+    body["input"] = {V6_INPUT_NAMES.get(k, k): v for k, v in payload.items()
+                     if k != "callBackUrl"}
+    return body
+
+
 def _create(payload: dict[str, Any], key: str) -> dict[str, Any]:
-    if payload["model"] == "V6":
-        names = {"customMode": "custom_mode", "negativeTags": "negative_tags"}
-        body = {"model": "ai-music-api/generate", "callBackUrl": payload["callBackUrl"],
-                "input": {names.get(k, k): v for k, v in payload.items() if k != "callBackUrl"}}
-        return _request_json("POST", API_ROOT + "jobs/createTask", key, body)
+    if payload["model"] in V6_FAMILY:
+        return _request_json("POST", API_ROOT + "jobs/createTask", key, provider_body(payload))
     return _request_json("POST", API_ROOT + "generate", key, payload)
 
 
@@ -311,8 +605,11 @@ def _record_v6(task_id: str, key: str) -> dict[str, Any]:
         urls = data.get("resultUrls") or []
         if not isinstance(urls, list) or not urls or any(not isinstance(u, str) for u in urls):
             raise PlanError("V6 success lacks valid resultUrls; retain task for reconciliation")
-        result["response"] = {"sunoData": [{"audioUrl": u, "id": f"{task_id}-{i}"}
-                                             for i, u in enumerate(urls, 1)]}
+        # No provider track id came back. The placeholder keeps takes distinct,
+        # and idSynthesized stops it from ever being sent as a parent audio_id.
+        result["response"] = {"sunoData": [{"audioUrl": u, "id": f"{task_id}-{i}",
+                                            "idSynthesized": True}
+                                           for i, u in enumerate(urls, 1)]}
     return result
 
 
@@ -322,7 +619,7 @@ def _download(url: str) -> bytes:
         return response.read()
 
 
-def _validate_mp3(path: Path, requested_seconds: int) -> dict[str, Any]:
+def _validate_mp3(path: Path, requested_seconds: int | None) -> dict[str, Any]:
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of",
@@ -330,7 +627,8 @@ def _validate_mp3(path: Path, requested_seconds: int) -> dict[str, Any]:
         info = json.loads(probe.stdout)
         audio = [x for x in info.get("streams", []) if x.get("codec_type") == "audio"]
         duration = float((info.get("format") or {}).get("duration") or 0)
-        minimum = max(5.0, requested_seconds * 0.25)
+        # An extend requests no duration; the provider chooses its length.
+        minimum = max(5.0, (requested_seconds or 0) * 0.25)
         if not audio or duration < minimum:
             raise PlanError("candidate has no non-trivial audio stream")
         subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0",
@@ -409,14 +707,59 @@ def _acquire_lock(path: Path) -> int:
     return fd
 
 
+def _parent_request(plan: dict[str, Any], state: dict[str, Any],
+                    cue: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(request, parent binding) for an extend whose parent has landed; (None, None) while it waits.
+
+    The parent is bound by its sidecar hash and the provider's own track and
+    task ids. A synthesized track id is refused before anything is posted.
+    """
+    spec = cue[DERIVED_CUE_FIELD]
+    parent = state["items"][spec["cueId"]]
+    if parent.get("status") != "DOWNLOADED":
+        return None, None
+    _completed_ok(plan, spec["cueId"], parent)
+    takes = [row for row in parent.get("candidates", []) if row.get("index") == spec["take"]]
+    if len(takes) != 1:
+        raise PlanError(f"{cue['id']}: parent {spec['cueId']} landed no take {spec['take']}")
+    take = takes[0]
+    track = take.get("providerMetadata") or {}
+    audio_id = track.get("id")
+    if (not isinstance(audio_id, str) or not audio_id or track.get("idSynthesized")
+            or audio_id == f"{parent.get('taskId')}-{spec['take']}"):
+        raise PlanError(f"{cue['id']}: parent take carries no provider track id, only a "
+                        "synthesized one; an extend cannot name it")
+    seconds = (take.get("media") or {}).get("durationSeconds")
+    if not _is_number(seconds) or not spec["continueAt"] < seconds:
+        raise PlanError(f"{cue['id']}: continueAt {spec['continueAt']} falls outside the "
+                        f"parent take ({seconds} s)")
+    binding = {**spec, "sidecar": take["sidecar"], "sidecarSha256": take["sidecarSha256"],
+               "sha256": take["sha256"], "taskId": parent["taskId"], "audioId": audio_id,
+               "model": cue["payload"]["model"]}
+    request = {**cue["payload"], "audioId": audio_id, "continueAt": spec["continueAt"]}
+    return request, binding
+
+
 def submit(plan: dict[str, Any], state_path: Path, key: str,
            create_fn: Callable[[dict[str, Any], str], dict[str, Any]]) -> dict[str, Any]:
-    if not plan.get("financialAuthorized", plan["doc"].get("financialApproval") is True):
-        raise PlanError("financialApproval is false; submission is gated")
+    if plan.get("financialAuthorized") is not True:
+        raise PlanError("submission requires a current approval record (--approval-admission); "
+                        "the manifest's financialApproval never authorizes spending")
     if plan["doc"].get("currentPriceVerified") is not True:
         raise PlanError("currentPriceVerified is false; credit ceiling is not authorized")
     state = _load_state(plan, state_path, create=True)
     _preflight_output_namespace(plan, state)
+    # One cue goes first and must land before the rest are posted, so a wrong
+    # price or a refused payload costs one request, not the batch.
+    statuses = [state["items"][cue["id"]].get("status") for cue in plan["cues"]]
+    first_landed = "DOWNLOADED" in statuses
+    allowed = len(statuses) if first_landed else 0 if any(
+        status != "PLANNED" for status in statuses) else 1
+    # Every extend whose parent has landed is resolved before the first POST,
+    # so a parent without a provider track id refuses the run, not half of it.
+    derived = {cue["id"]: _parent_request(plan, state, cue) for cue in plan["cues"]
+               if DERIVED_CUE_FIELD in cue
+               and state["items"][cue["id"]].get("status") in {"PLANNED", "WAITING_PARENT"}}
     calls = 0
     for cue in plan["cues"]:
         record = state["items"][cue["id"]]
@@ -426,13 +769,24 @@ def submit(plan: dict[str, Any], state_path: Path, key: str,
             continue
         if status == "SUBMITTED" or status == "PENDING" or status == "RESULT_READY":
             continue
-        if status != "PLANNED":
+        if status not in {"PLANNED", "WAITING_PARENT"}:
             raise UncertainRequest(f"{cue['id']}: {status}; generation POST will not be retried")
+        request, parent = derived.get(cue["id"], (cue["payload"], None))
+        if request is None:
+            # The parent has not landed: never post, and say so in the state.
+            if status != "WAITING_PARENT":
+                record["status"] = "WAITING_PARENT"
+                _persist(state_path, state)
+            continue
+        if calls >= allowed:
+            continue
         record.update(status="POSTING_UNCERTAIN", postAttempts=1, postStartedAt=_now())
+        if parent is not None:
+            record.update(parent=parent, postedRequestSha256=_sha_bytes(_canonical(request)))
         _persist(state_path, state)
         calls += 1
         try:
-            response = create_fn(cue["payload"], key)
+            response = create_fn(request, key)
         except urllib.error.HTTPError as exc:
             status = "HTTP_4XX_REFUSED" if 400 <= exc.code < 500 else "UNCERTAIN_HTTP_ERROR"
             record.update(status=status, httpStatus=exc.code, postFinishedAt=_now())
@@ -452,8 +806,17 @@ def submit(plan: dict[str, Any], state_path: Path, key: str,
         record.update(status="SUBMITTED", taskId=task_id, postFinishedAt=_now(),
                       providerCreateResponse=response)
         _persist(state_path, state)
-    return {"operation": "SUBMIT", "generationPosts": calls,
-            "state": str(state_path), "expectedCredits": plan["expectedCredits"]}
+    planned = sum(state["items"][cue["id"]].get("status") == "PLANNED" for cue in plan["cues"])
+    waiting = [cue["id"] for cue in plan["cues"]
+               if state["items"][cue["id"]].get("status") == "WAITING_PARENT"]
+    result = {"operation": "SUBMIT", "generationPosts": calls, "stillPlanned": planned,
+              "state": str(state_path), "expectedCredits": plan["expectedCredits"]}
+    if planned:
+        result["note"] = "the first cue must land (--poll) before --submit posts the rest"
+    if waiting:
+        result["waitingParent"] = waiting
+        result["stillPlanned"] = planned + len(waiting)
+    return result
 
 
 def _tracks(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -472,7 +835,7 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
     state = _load_state(plan, state_path, create=False)
     _preflight_output_namespace(plan, state)
     output_root = Path(plan["outputRoot"])
-    polls = downloads = 0
+    polls = downloads = planned = 0
     for cue in plan["cues"]:
         item = state["items"][cue["id"]]
         status = item.get("status")
@@ -485,7 +848,11 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
         if status == "DOWNLOADED":
             _completed_ok(plan, cue["id"], item)
             continue
-        if status in {"PLANNED", "POSTING_UNCERTAIN", "UNCERTAIN_POST",
+        if status in {"PLANNED", "WAITING_PARENT"}:
+            # Not posted yet: submit posts it once the first cue (or its parent) has landed.
+            planned += 1
+            continue
+        if status in {"POSTING_UNCERTAIN", "UNCERTAIN_POST",
                       "UNCERTAIN_RESPONSE", "UNCERTAIN_HTTP_ERROR",
                       "HTTP_4XX_REFUSED", "GENERATION_FAILED"}:
             raise UncertainRequest(f"{cue['id']}: cannot poll state {status}")
@@ -538,7 +905,8 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
                          "staged": str(staged), "providerMetadata": track}
             item.setdefault("candidates", []).append(candidate)
             _persist(state_path, state)
-            media = _validate_mp3(staged, int(cue["payload"]["duration"]))
+            duration = cue["payload"].get("duration")
+            media = _validate_mp3(staged, int(duration) if duration is not None else None)
             candidate.update(status="VALIDATED", media=media)
             _persist(state_path, state)
             output = output_root / f"{cue['id']}-take-{index}.mp3"
@@ -562,6 +930,11 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
                            "providerMetadata": track, "media": media,
                            "file": str(output), "sha256": response_sha,
                            "selectionVerdict": "unreviewed"}
+            if "parent" in item:
+                sidecar_doc["derivedFrom"] = item["parent"]
+                # What was actually posted: the frozen payload plus the parent's
+                # audioId and continueAt, hashed before the POST.
+                sidecar_doc["postedRequestSha256"] = item["postedRequestSha256"]
             _atomic_bytes_new(
                 sidecar,
                 (json.dumps(sidecar_doc, ensure_ascii=False, sort_keys=True, indent=2)
@@ -574,7 +947,27 @@ def poll(plan: dict[str, Any], state_path: Path, key: str,
         item["downloadedAt"] = _now()
         _persist(state_path, state)
     return {"operation": "POLL", "recordGets": polls, "candidateDownloads": downloads,
-            "state": str(state_path)}
+            "notYetPosted": planned, "state": str(state_path)}
+
+
+APPROVAL_LANE = "suno-score"
+
+
+def record_route(plan: dict[str, Any]) -> Callable[[str, str], dict[str, Any]]:
+    """The poll endpoint for a batch: every V6-family model polls jobs/recordInfo."""
+    models = {cue["payload"]["model"] for cue in plan["cues"]}
+    if len(models) != 1:
+        raise PlanError("Each score batch must use one model for unambiguous recovery")
+    return _record_v6 if models <= V6_FAMILY else _record
+
+
+def approval_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    """The finite execution limits an approval record must bind exactly.
+
+    sourceSeconds sums each cue's requested duration; an extend requests none.
+    """
+    return {"requests": plan["requestCount"], "credits": plan["expectedCredits"],
+            "sourceSeconds": sum(x["payload"].get("duration", 0) for x in plan["cues"])}
 
 
 def execute(manifest_path: Path, max_requests: int, max_credits: int,
@@ -585,31 +978,36 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
     plan = load_plan(manifest_path, max_requests, max_credits)
     try:
         approval = validate_paid_approval(
-            approval_admission, episode=plan["doc"].get("episode"), lane="suno-score",
+            approval_admission, episode=plan["doc"].get("episode"), lane=APPROVAL_LANE,
             manifest_path=Path(plan["path"]), manifest_sha256=plan["sha256"],
-            finite_execution={"requests": plan["requestCount"],
-                              "credits": plan["expectedCredits"],
-                              "sourceSeconds": sum(x["payload"]["duration"] for x in plan["cues"])},
+            finite_execution=approval_scope(plan),
         )
     except PaidApprovalError as exc:
         raise PlanError(str(exc)) from exc
-    plan["financialAuthorized"] = plan["doc"].get("financialApproval") is True or approval is not None
+    # The manifest's financialApproval is reported, never trusted on its own.
+    # Polling needs no new record; it checks the one the batch state recorded.
+    plan["financialAuthorized"] = approval is not None
     plan["approvalAdmissionSha256"] = approval["sha256"] if approval else None
     plan["approvalAuthorizationId"] = approval["authorizationId"] if approval else None
     if operation == "dry-run":
+        usd = usd_per_credit()
         return {"operation": "DRY_RUN", "networkCalls": 0,
+                "estimatedCredits": plan["expectedCredits"],
+                "estimatedUsd": round(plan["expectedCredits"] * usd, 4) if usd is not None else None,
+                "usdPerCredit": usd,
                 "financialApproval": plan["doc"].get("financialApproval") is True,
                 "financialAuthorized": plan["financialAuthorized"],
                 "approvalAdmissionSha256": plan["approvalAdmissionSha256"],
                 "requests": plan["requestCount"], "expectedCredits": plan["expectedCredits"],
                 "maxRequests": max_requests, "maxCredits": max_credits,
-                "sourceSeconds": sum(x["payload"]["duration"] for x in plan["cues"])}
+                "sourceSeconds": approval_scope(plan)["sourceSeconds"]}
     if operation not in {"submit", "poll"}:
         raise PlanError(f"unknown operation: {operation}")
     if operation == "submit" and not plan["financialAuthorized"]:
         # Refuse at the immutable plan gate before looking for a credential,
         # creating state, acquiring a lock, or touching the network.
-        raise PlanError("financialApproval is false; submission is gated")
+        raise PlanError("submission requires a current approval record (--approval-admission); "
+                        "the manifest's financialApproval never authorizes spending")
     if operation == "submit" and plan["doc"].get("currentPriceVerified") is not True:
         raise PlanError("currentPriceVerified is false; credit ceiling is not authorized")
     default_state = Path(plan["path"]).with_suffix(".state.json").resolve()
@@ -627,10 +1025,7 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
             raise PlanError("KIE_KEY is missing from the explicit credential sources")
         if operation == "submit":
             return submit(plan, state_path, key, create_fn or _create)
-        models = {cue["payload"]["model"] for cue in plan["cues"]}
-        if len(models) != 1:
-            raise PlanError("Each score batch must use one model for unambiguous recovery")
-        return poll(plan, state_path, key, record_fn or (_record_v6 if models == {"V6"} else _record),
+        return poll(plan, state_path, key, record_fn or record_route(plan),
                     download_fn or _download)
     finally:
         try:
@@ -639,16 +1034,152 @@ def execute(manifest_path: Path, max_requests: int, max_credits: int,
             pass
 
 
+UTC_SECOND = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+
+def _new_bytes(path: Path, raw: bytes) -> None:
+    try:
+        _atomic_bytes_new(path, raw)
+    except FileExistsError as exc:
+        raise PlanError(f"refusing to overwrite {path}") from exc
+
+
+def freeze(draft_path: Path, manifest_path: Path, *, credits_per_request: int,
+           price_verified_at: str, price_evidence: str, authority_path: Path,
+           output_directory: str = "sources", expected_candidates: int = 2,
+           episode: str | None = None,
+           credits_per_extend_request: int | None = None) -> dict[str, Any]:
+    """Write an execution manifest from a {commonPayload, cues} draft, then dry-run it.
+
+    The cue list is the draft's cues with commonPayload merged in, exactly what
+    load_plan compares. The price is the operator's own live reading; the tool
+    never supplies a rate. financialApproval is always false: only a separate
+    approval record, drafted after this freeze, authorizes spending. It writes
+    a version 2 manifest; a draft with extend cues also needs the extend price.
+    """
+    manifest_path = manifest_path.resolve()
+    if manifest_path.exists():
+        raise PlanError(f"refusing to overwrite a frozen manifest: {manifest_path}")
+    if (isinstance(credits_per_request, bool) or not isinstance(credits_per_request, int)
+            or credits_per_request <= 0):
+        raise PlanError("--credits-per-request must be the positive whole rate you verified today")
+    if not isinstance(price_verified_at, str) or not UTC_SECOND.fullmatch(price_verified_at):
+        raise PlanError("--price-verified-at must be a UTC time such as 2026-01-01T12:00:00Z")
+    if not isinstance(price_evidence, str) or not price_evidence.strip():
+        raise PlanError("--price-evidence must say where the live price was read")
+    root = manifest_path.parent
+    draft_path = draft_path.resolve()
+    try:
+        source = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot read score draft: {exc}") from exc
+    common, cues = source.get("commonPayload"), source.get("cues")
+    if not isinstance(common, dict) or not isinstance(cues, list) or not cues:
+        raise PlanError("score draft needs commonPayload and a non-empty cues list")
+    root.mkdir(parents=True, exist_ok=True)
+    if not _is_below(draft_path, root):
+        copy = root / "creative-draft.json"
+        if copy.exists() and copy.read_bytes() != draft_path.read_bytes():
+            raise PlanError(f"{copy} already holds a different draft")
+        if not copy.exists():
+            _new_bytes(copy, draft_path.read_bytes())
+        draft_path = copy
+    authority_path = authority_path.resolve()
+    if not authority_path.is_file():
+        raise PlanError(f"authority file is missing: {authority_path}")
+    materialized = [{**cue, "payload": {**common, **cue.get("payload", {})}} for cue in cues]
+    extends = sum(isinstance(cue, dict) and DERIVED_CUE_FIELD in cue for cue in materialized)
+    if extends and (isinstance(credits_per_extend_request, bool)
+                    or not isinstance(credits_per_extend_request, int)
+                    or credits_per_extend_request <= 0):
+        raise PlanError("--credits-per-extend-request must be the positive whole extend rate "
+                        "you verified today")
+    pricing = {"creditsPerRequest": credits_per_request, "verifiedAtUtc": price_verified_at,
+               "evidence": price_evidence.strip()}
+    if extends:
+        pricing["creditsPerExtendRequest"] = credits_per_extend_request
+    total = (len(materialized) - extends) * credits_per_request + extends * (
+        credits_per_extend_request or 0)
+    doc = {
+        "version": 2, "episode": episode or source.get("episode"),
+        "financialApproval": False, "currentPriceVerified": True,
+        "pricing": pricing,
+        "sourceDraft": draft_path.relative_to(root).as_posix(),
+        "sourceDraftSha256": _sha_file(draft_path),
+        "authority": os.path.relpath(authority_path, root),
+        "authoritySha256": _sha_file(authority_path),
+        "creditsPerRequest": credits_per_request, "maxRequests": len(materialized),
+        "maxCredits": total,
+        **({"creditsPerExtendRequest": credits_per_extend_request} if extends else {}),
+        "outputDirectory": output_directory,
+        "expectedCandidatesPerRequest": expected_candidates,
+        "cues": materialized,
+    }
+    _new_bytes(manifest_path, (json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2)
+                               + "\n").encode("utf-8"))
+    try:
+        return execute(manifest_path, doc["maxRequests"], doc["maxCredits"])
+    except PlanError:
+        manifest_path.unlink()
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--max-requests", type=int, required=True)
-    parser.add_argument("--max-credits", type=int, required=True)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Cue fields: " + ", ".join(sorted(CUE_FIELDS)) + " (version 2 adds "
+                + DERIVED_CUE_FIELD + "). Version 1 payload fields: "
+                + ", ".join(sorted(PAYLOAD_FIELDS)) + ". Version 2 generate fields: "
+                + ", ".join(sorted(ROUTE_FIELDS["generate-v6"]["required"]
+                                   | ROUTE_FIELDS["generate-v6"]["optional"]))
+                + ". Run --print-schema for the whole contract and ranges; the approval "
+                "lane is suno-score."))
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--max-requests", type=int)
+    parser.add_argument("--max-credits", type=int)
+    parser.add_argument("--print-schema", action="store_true",
+                        help="print the score manifest contract and exit")
+    parser.add_argument("--freeze", type=Path, metavar="DRAFT",
+                        help="write MANIFEST from a {commonPayload, cues} draft, then dry-run it")
+    freezing = parser.add_argument_group("freeze inputs (the price is your own live reading)")
+    freezing.add_argument("--credits-per-request", type=int)
+    freezing.add_argument("--credits-per-extend-request", type=int,
+                          help="the extend route's own rate; needed when a cue extends another")
+    freezing.add_argument("--price-verified-at", help="UTC time you read the provider's price")
+    freezing.add_argument("--price-evidence", help="where you read it: page URL and model")
+    freezing.add_argument("--authority", type=Path, help="the production authority file to bind")
+    freezing.add_argument("--output-directory", default="sources",
+                          help="candidate folder below the manifest (default sources)")
+    freezing.add_argument("--expected-candidates", type=int, default=2,
+                          help="takes the provider returns per request (default 2)")
+    freezing.add_argument("--episode", help="project code when the draft names none")
     parser.add_argument("--approval-admission", type=Path)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--submit", action="store_true")
     actions.add_argument("--poll", action="store_true")
     args = parser.parse_args(argv)
+    if args.print_schema:
+        print(json.dumps(schema(), ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.freeze is not None:
+        if args.manifest is None or args.authority is None:
+            parser.error("--freeze DRAFT needs the MANIFEST path to write and --authority")
+        try:
+            result = freeze(args.freeze, args.manifest,
+                            credits_per_request=args.credits_per_request,
+                            price_verified_at=args.price_verified_at,
+                            price_evidence=args.price_evidence, authority_path=args.authority,
+                            output_directory=args.output_directory,
+                            expected_candidates=args.expected_candidates, episode=args.episode,
+                            credits_per_extend_request=args.credits_per_extend_request)
+        except PlanError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"frozen": str(args.manifest.resolve()), **result},
+                         ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.manifest is None or args.max_requests is None or args.max_credits is None:
+        parser.error("manifest, --max-requests and --max-credits are required")
     operation = "submit" if args.submit else "poll" if args.poll else "dry-run"
     try:
         result = execute(args.manifest, args.max_requests, args.max_credits,
