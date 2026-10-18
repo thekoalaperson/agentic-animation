@@ -31,6 +31,9 @@ shot of a figure standing as its authority.
 When two looks both seem right, a few test frames of one key moment made in
 each can settle it more cheaply than argument.
 
+For sacred material, reverence lives in how figures are treated, not in a
+shading technique.
+
 ## Consistency without sameness
 
 Shared references help recurring identities, costumes, props, and locations

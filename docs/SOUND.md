@@ -36,7 +36,7 @@ composition and use its actual duration. Preserve starts, endings, and exact
 prompts when they are useful for later revisions.
 
 Spotting decides where music enters, leaves, meets a picture moment and falls
-silent, and continuous scoring is one answer. The fields that carry it are the
+silent. The fields that carry it are the
 `scorePlacements` in `timeline-inputs.json` (`movement`, `take`,
 `timelineStart`/`timelineDuration` or an `anchor`/`until` on a measured event's
 start, speech start, speech end or end plus an offset, an optional
