@@ -446,6 +446,175 @@ def _scene_handles(dialogue_outputs: dict[str, Any], row_kind: dict[str, str],
     return result
 
 
+PICTURE_WINDOW_KEYS = {"from", "to", "source", "sourceSha256", "sourceStart", "role", "reason"}
+
+
+def _whole_frames(value: Any, label: str) -> int:
+    if not _finite_seconds(value) or value < 0:
+        raise ValueError(f"{label} must be non-negative finite seconds")
+    frames = value * DELIVERY_FPS
+    if abs(frames - round(frames)) > 1e-6:
+        raise ValueError(f"{label} {value} is not a whole number of {DELIVERY_FPS} fps frames")
+    return round(frames)
+
+
+def _picture_window_shape(raw: Any) -> list[dict[str, Any]]:
+    """Check authored ``pictureWindows`` before any picture is placed.
+
+    Each window covers ``from``..``to`` seconds of the event's kept window with
+    other accepted picture, played at speed 1.0 from ``sourceStart`` seconds of
+    that source. The event's own audio stays its clock; the rest stays native.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("pictureWindows must be a non-empty array")
+    result, cursor = [], 0
+    for index, window in enumerate(raw):
+        label = f"picture window {index}"
+        if not isinstance(window, dict) or set(window) != PICTURE_WINDOW_KEYS:
+            raise ValueError(f"{label} needs exactly {sorted(PICTURE_WINDOW_KEYS)}")
+        left = _whole_frames(window["from"], f"{label} from")
+        right = _whole_frames(window["to"], f"{label} to")
+        if right <= left or left < cursor:
+            raise ValueError(f"{label} must end after it starts and must not overlap the window before it")
+        for key in ("source", "role", "reason"):
+            if not isinstance(window[key], str) or not window[key].strip():
+                raise ValueError(f"{label} needs a non-empty {key}")
+        result.append({"from": left, "to": right,
+                       "sourceStart": _whole_frames(window["sourceStart"], f"{label} sourceStart"),
+                       "source": window["source"],
+                       "sourceSha256": _require_hex_sha(window["sourceSha256"], f"{label} sourceSha256"),
+                       "role": window["role"].strip(), "reason": window["reason"].strip()})
+        cursor = right
+    return result
+
+
+def _resolve_picture_windows(
+    event: dict[str, Any], windows: list[dict[str, Any]], *, episode: Path, repo: Path,
+    config_path: Path, h3_by_scene: dict[str, list[dict[str, Any]]],
+    dialogue_media: dict[str, tuple[Path, MediaProbe, dict[str, Any], dict[str, Any]]],
+    minimum_frames: int, micro_words: set[str],
+) -> list[dict[str, Any]]:
+    """Bind each picture window to frames a review already accepted.
+
+    A window's source is an accepted ledger segment at speed 1.0 (its frames
+    inside the accepted in/out), or another admitted dialogue clip with its
+    audio dropped. A borrowed dialogue window must lie wholly outside that
+    clip's measured speech, so no silent lip movement reaches the cut; with
+    no measured speech window the borrow is refused.
+    """
+    duration_frames = round(event["duration"] * DELIVERY_FPS)
+    resolved = []
+    for index, window in enumerate(windows):
+        label = f"{event['id']} picture window {index}"
+        frames = window["to"] - window["from"]
+        first, last = window["sourceStart"], window["sourceStart"] + frames
+        if window["to"] > duration_frames:
+            raise ValueError(f"{label} ends after the event's kept window ({duration_frames} frames)")
+        source = _resolve_path(episode, repo, config_path, window["source"])
+        sha = window["sourceSha256"]
+        kind = scene = None
+        for scene_id, candidates in h3_by_scene.items():
+            for candidate in candidates:
+                if (candidate["path"] == source and candidate["sha256"] == sha
+                        and candidate["speed"] == 1.0 and candidate["sourceStartFrame"] <= first
+                        and last <= candidate["sourceEndFrame"]):
+                    kind, scene = "segment", scene_id
+                    break
+            if kind:
+                break
+        if kind is None:
+            for scene_id, (path, info, entry, output) in dialogue_media.items():
+                if scene_id == event["id"] or path != source or output.get("sha256") != sha:
+                    continue
+                natural = info.video_frames or math.floor((info.video_duration or info.duration) * DELIVERY_FPS + 1e-6)
+                speech = _speech_window(entry, output)
+                if speech is None:
+                    raise ValueError(f"{label} borrows {scene_id}, whose speech window is unmeasured")
+                if last > natural:
+                    raise ValueError(f"{label} runs past the end of {scene_id}'s clip")
+                if first / DELIVERY_FPS < speech[1] and last / DELIVERY_FPS > speech[0]:
+                    raise ValueError(f"{label} would show {scene_id} speaking; borrow only frames outside its measured speech")
+                kind, scene = "dialogue", scene_id
+                break
+        if kind is None:
+            raise ValueError(f"{label} source is neither an accepted speed-1.0 segment holding those frames "
+                             "nor another admitted dialogue clip")
+        if frames < minimum_frames and not _is_micro_role(window["role"], micro_words):
+            raise ValueError(f"{label} is shorter than minimumPictureSegmentSeconds; name its micro-cut role")
+        resolved.append({
+            "from": round(window["from"] / DELIVERY_FPS, 6), "to": round(window["to"] / DELIVERY_FPS, 6),
+            "frames": frames, "source": _portable_path(source, episode), "sourceSha256": sha,
+            "sourceStart": round(first / DELIVERY_FPS, 6), "sourceKind": kind, "sourceSceneId": scene,
+            "role": window["role"], "reason": window["reason"],
+        })
+    return resolved
+
+
+def _cover_native_parts(native: list[tuple[int, int, Any]],
+                        windows: list[dict[str, Any]]) -> list[tuple[int, int, Any]]:
+    """Lay picture windows over a dialogue event's native parts, in frame order.
+
+    A native part keeps its crop; a covered part carries its resolved window
+    in place of the crop. With no windows the native parts come back unchanged.
+    """
+    if not windows:
+        return native
+    covers = [(round(w["from"] * DELIVERY_FPS), round(w["to"] * DELIVERY_FPS), w) for w in windows]
+    parts = []
+    for left, right, crop in native:
+        cursor = left
+        for cover_left, cover_right, _ in covers:
+            if cover_right <= cursor or cover_left >= right:
+                continue
+            if cover_left > cursor:
+                parts.append((cursor, cover_left, crop))
+            cursor = min(right, cover_right)
+        if cursor < right:
+            parts.append((cursor, right, crop))
+    return sorted(parts + covers, key=lambda part: part[0])
+
+
+def _record_split_edits(blocks: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
+    """Name a split edit where a picture window continues its neighbour's picture.
+
+    When a dialogue event opens on the frames that directly follow the previous
+    picture, its sound arrives before its own picture (J). When it closes on the
+    frames that directly precede the next picture, the next picture arrives
+    while its sound still plays (L). The renderer merges such source-contiguous
+    windows into one run, so the picture does not restart at the boundary.
+    """
+    by_id = {event["id"]: event for event in events}
+
+    def source_span(candidate: dict[str, Any]) -> tuple[str, str, int, int] | None:
+        if abs(float(candidate.get("speed", 1.0)) - 1.0) > 1e-9:
+            return None
+        start = round(float(candidate["sourceStart"]) * DELIVERY_FPS)
+        return (candidate["path"], candidate["sourceSha256"], start, start + int(candidate["frames"]))
+
+    for index, block in enumerate(blocks):
+        cover = block["candidates"][0] if block["kind"] == "dialogue-fixed-sync" else {}
+        if "pictureWindow" not in cover:
+            continue
+        event = by_id[block["events"][0]]
+        here = source_span(cover)
+        neighbours = []
+        if index and abs(block["start"] - event["start"]) < 1e-6 and blocks[index - 1]["candidates"]:
+            neighbours.append(("J", "start", blocks[index - 1], blocks[index - 1]["candidates"][-1]))
+        if (index + 1 < len(blocks) and abs(block["start"] + block["duration"] - event["end"]) < 1e-6
+                and blocks[index + 1]["candidates"]):
+            neighbours.append(("L", "end", blocks[index + 1], blocks[index + 1]["candidates"][0]))
+        for kind, boundary, other_block, other in neighbours:
+            there = source_span(other)
+            if here is None or there is None or here[:2] != there[:2]:
+                continue
+            if (there[3] == here[2]) if kind == "J" else (here[3] == there[2]):
+                event.setdefault("splitEdits", []).append({
+                    "kind": kind, "boundary": boundary,
+                    "with": other.get("sceneId") or other_block["events"][-1 if kind == "J" else 0],
+                    "seconds": block["duration"],
+                })
+
+
 def _speech_rule(row: dict[str, Any]) -> None:
     scene_id = row.get("still_id")
     if row.get("durationRule") not in (None, "speech") or any(
@@ -1479,6 +1648,8 @@ def build_timeline(
                                 or not math.isfinite(crop_from) or not 0 < crop_from < info.duration
                                 or abs(crop_from * DELIVERY_FPS - round(crop_from * DELIVERY_FPS)) > 1e-6):
                             raise ValueError("Timed dialogue crop must start at an interior native frame boundary")
+                if output.get("pictureWindows") is not None:
+                    admitted["pictureWindows"] = _picture_window_shape(output["pictureWindows"])
                 admitted.update({
                     "sourceSceneId": source_scene_id,
                     "sha256": actual_sha,
@@ -1925,6 +2096,20 @@ def build_timeline(
             event['subtitleCueWeights'] = effective_text[scene_id]['cueWeights']
         events.append(event)
 
+    minimum_picture_frames = round(float(config.get("minimumPictureSegmentSeconds", 1.3)) * DELIVERY_FPS)
+    micro_words = set(config.get("microCutRoleWords", MICRO_CUT_ROLE_WORDS))
+    for event in events:
+        windows = dialogue_media[event["id"]][3].get("pictureWindows") if event["kind"] == "dialogue" else None
+        if not windows:
+            continue
+        try:
+            event["pictureWindows"] = _resolve_picture_windows(
+                event, windows, episode=episode, repo=repo, config_path=config_path,
+                h3_by_scene=h3_by_scene, dialogue_media=dialogue_media,
+                minimum_frames=minimum_picture_frames, micro_words=micro_words)
+        except ValueError as exc:
+            errors.append({"type": "picture-window", "sceneId": event["id"], "error": str(exc)})
+
     for event_index, event in enumerate(events):
         for candidate_index, candidate in enumerate(h3_by_scene.get(event['id'], [])):
             link = candidate.get('continuationOf', {})
@@ -1932,15 +2117,14 @@ def build_timeline(
                 continue
             parent = events[event_index-1] if event_index else {}
             selected_endpoint = (parent.get('sourceStart', 0) + parent.get('duration', 0)) * DELIVERY_FPS
+            covered_end = any(abs(w['to'] - parent.get('duration', 0)) < 1e-6
+                              for w in parent.get('pictureWindows', []))
             if (candidate_index != 0 or parent.get('kind') != 'dialogue'
                     or parent.get('picture') != link['source']
                     or parent.get('audioSha256') != link['sourceSha256']
-                    or abs(selected_endpoint-link['endFrameExclusive']) > 1e-3):
+                    or abs(selected_endpoint-link['endFrameExclusive']) > 1e-3 or covered_end):
                 errors.append(dict(type='h3-continuation-contract',sceneId=event['id'],
                                    error='Selected preceding dialogue no longer ends on the bound native endpoint'))
-
-    minimum_picture_frames = round(float(config.get("minimumPictureSegmentSeconds", 1.3)) * DELIVERY_FPS)
-    micro_words = set(config.get("microCutRoleWords", MICRO_CUT_ROLE_WORDS))
     blocks: list[dict[str, Any]] = []
     coverage_borrowing: list[dict[str, Any]] = []
     block_number = 0
@@ -1957,9 +2141,38 @@ def build_timeline(
                 if not 0 < cut_frame < duration_frames:
                     raise TimelineIncomplete(f"Timed crop falls outside the kept dialogue window: {event['id']}")
                 windows = [(0, cut_frame, None), (cut_frame, duration_frames, event["pictureCrop"])]
+            windows = _cover_native_parts(windows, event.get("pictureWindows", []))
             for part, (left, right, crop) in enumerate(windows, 1):
                 part_frames = right - left
                 part_duration = round(part_frames / DELIVERY_FPS, 6)
+                if isinstance(crop, dict) and "sourceKind" in crop:
+                    # Picture covered by other accepted frames; the event's audio is untouched.
+                    cover = crop
+                    candidate = {
+                        "path": cover["source"],
+                        "sourceStart": cover["sourceStart"],
+                        "duration": part_duration,
+                        "frames": part_frames,
+                        "role": cover["role"],
+                        "status": "approved",
+                        "sourceSha256": cover["sourceSha256"],
+                        "pictureWindow": {"sourceKind": cover["sourceKind"],
+                                          "sourceSceneId": cover["sourceSceneId"],
+                                          "reason": cover["reason"]},
+                    }
+                    status = "ready"
+                else:
+                    candidate = {
+                        "path": event["picture"],
+                        "sourceStart": round((source_start_frame + left) / DELIVERY_FPS, 6),
+                        "duration": part_duration,
+                        "frames": part_frames,
+                        "role": "dialogue-fixed-sync",
+                        "status": "approved",
+                        "sourceSha256": event["audioSha256"],
+                        **({"crop": crop} if crop else {}),
+                    }
+                    status = "ready-native-picture-audio-sync"
                 blocks.append(
                 {
                     "id": f"b{block_number:03d}" + (f"-p{part}" if len(windows) > 1 else ""),
@@ -1967,21 +2180,10 @@ def build_timeline(
                     "start": round(event["start"] + left / DELIVERY_FPS, 6),
                     "duration": part_duration,
                     "events": [event["id"]],
-                    "candidates": [
-                        {
-                            "path": event["picture"],
-                            "sourceStart": round((source_start_frame + left) / DELIVERY_FPS, 6),
-                            "duration": part_duration,
-                            "frames": part_frames,
-                            "role": "dialogue-fixed-sync",
-                            "status": "approved",
-                            "sourceSha256": event["audioSha256"],
-                            **({"crop": crop} if crop else {}),
-                        }
-                    ],
+                    "candidates": [candidate],
                     "availableSeconds": part_duration,
                     "selectedSeconds": part_duration,
-                    "status": "ready-native-picture-audio-sync",
+                    "status": status,
                 }
                 )
             index += 1
@@ -2095,6 +2297,8 @@ def build_timeline(
         )
         index = end_index
 
+    _record_split_edits(blocks, events)
+
     # Preserve the exact allocation evidence even when picture coverage is
     # short.  A continuation planner must be able to prove which accepted
     # source frames were consumed before it commissions another H3 frame; a
@@ -2193,6 +2397,11 @@ def build_timeline(
             "accepted generated motion only; H3 picture is silent; Grok dialogue picture/audio stay coupled; "
             "no still padding, dead holds, implicit retiming, or invented media; an H3 speed is legal only "
             "when explicitly authored on its approved ledger segment"
+        ) if not any(event.get("pictureWindows") for event in events) else (
+            "accepted generated motion only; H3 picture is silent; Grok dialogue audio stays on its own "
+            "measured time map while its picture may be covered, in authored windows, by other accepted "
+            "picture at speed 1.0; no still padding, dead holds, implicit retiming, or invented media; an "
+            "H3 speed is legal only when explicitly authored on its approved ledger segment"
         ),
         "timingPolicy": (
             "measured complete Hindi speech; default frame-aligned 0.35-0.55 second narration breaths "

@@ -1759,5 +1759,158 @@ class TimelineBuilderTest(unittest.TestCase):
         self.assertTrue(any(w["type"] == "dialogue-handles-unused" for w in ready["warnings"]))
 
 
+    AUDIO_FIELDS = ("audio", "audioSha256", "audioSourceStart", "audioSourceDuration",
+                    "subtitleAudioAt", "subtitleAudioDuration", "start", "duration", "end")
+
+    def window(self, start, end, source, source_start, role="listener reaction", reason="Hear the line on the listener."):
+        return {"from": start, "to": end, "source": source, "sourceSha256": self.sha(self.ep / source),
+                "sourceStart": source_start, "role": role, "reason": reason}
+
+    def dialogue_blocks(self, plan, scene):
+        return [b for b in plan["pictureBlocks"] if b["kind"] == "dialogue-fixed-sync" and b["events"] == [scene]]
+
+    def test_picture_window_covers_part_of_a_line_with_an_accepted_segment(self):
+        _, before = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.set_output(pictureWindows=[self.window(1.0, 2.5, "work/h3/demo-s004.mp4", 1.0)])
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        a = next(e for e in before["events"] if e["id"] == "demo-s003")
+        b = next(e for e in plan["events"] if e["id"] == "demo-s003")
+        for field in self.AUDIO_FIELDS:
+            self.assertEqual(a[field], b[field], field)  # the Grok audio stays the clock
+        self.assertEqual(b["picture"], a["picture"])
+        self.assertEqual(b["pictureWindows"][0]["sourceKind"], "segment")
+        self.assertEqual(b["pictureWindows"][0]["sourceSceneId"], "demo-s004")
+        blocks = self.dialogue_blocks(plan, "demo-s003")
+        self.assertEqual([blk["candidates"][0]["frames"] for blk in blocks], [24, 36, 39])
+        self.assertEqual(sum(blk["candidates"][0]["frames"] for blk in blocks), round(b["duration"] * 24))
+        native, cover, rest = [blk["candidates"][0] for blk in blocks]
+        self.assertEqual((native["path"], rest["path"]), (b["picture"], b["picture"]))
+        self.assertAlmostEqual(rest["sourceStart"], (7 + 60) / 24, places=5)
+        self.assertEqual((cover["path"], cover["sourceStart"], cover["role"]),
+                         ("work/h3/demo-s004.mp4", 1.0, "listener reaction"))
+        self.assertEqual(cover["sourceSha256"], self.sha(self.ep / "work/h3/demo-s004.mp4"))
+        self.assertEqual([blk["status"] for blk in blocks], ["ready-native-picture-audio-sync", "ready",
+                                                              "ready-native-picture-audio-sync"])
+        self.assertIn("may be covered", plan["picturePolicy"])
+        self.assertIn("stay coupled", before["picturePolicy"])
+        with mock.patch.object(assembly, "probe_duration", return_value=5.0):
+            segments = assembly.build_picture_segments(self.ep, plan)
+        covered = [seg for seg in segments if seg["block"] == blocks[1]["id"]]
+        self.assertEqual(covered[0]["role"], "listener reaction")
+        self.assertNotIn("sceneId", covered[0])  # never counted as its source scene's own picture
+        self.assertEqual(sum(seg["frames"] for seg in segments), round(plan["runtimeSeconds"] * 24))
+
+    def test_picture_windows_are_refused_outside_accepted_frames_or_rules(self):
+        h3 = "work/h3/demo-s004.mp4"
+        cases = {
+            "before the accepted in point": [self.window(1.0, 2.5, h3, 0.5)],
+            "retimed segment": [self.window(1.0, 2.5, "work/h3/demo-s001.mp4", 0.0)],
+            "past the kept window": [self.window(3.0, 4.5, h3, 1.0)],
+            "short without a micro-cut role": [self.window(1.0, 1.5, h3, 1.0)],
+            "changed bytes": [dict(self.window(1.0, 2.5, h3, 1.0), sourceSha256="0" * 64)],
+            "unknown source": [self.window(1.0, 2.5, "work/grok/demo-s003.mp4", 0.0)],
+        }
+        for label, windows in cases.items():
+            with self.subTest(label):
+                self.set_output(pictureWindows=windows)
+                with self.assertRaises(timeline.TimelineIncomplete):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "picture-window" for e in self.readiness()["errors"]),
+                                self.readiness()["errors"])
+        self.set_output(pictureWindows=[self.window(1.0, 1.5, h3, 1.0, role="insert")])
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        shapes = {
+            "overlap": [self.window(1.0, 2.5, h3, 1.0), self.window(2.0, 3.0, h3, 1.0)],
+            "off-frame": [self.window(1.01, 2.5, h3, 1.0)],
+            "no reason": [dict(self.window(1.0, 2.5, h3, 1.0), reason=" ")],
+            "extra key": [dict(self.window(1.0, 2.5, h3, 1.0), speed=2.0)],
+            "empty": [],
+        }
+        for label, windows in shapes.items():
+            with self.subTest(label):
+                self.set_output(pictureWindows=windows)
+                ready, _ = timeline.build_timeline(self.ep, self.config, dry_run=True, probe=self.fake_probe)
+                self.assertTrue(any(e["type"] == "dialogue-admission" and "window" in e["error"].lower()
+                                    for e in ready["errors"]), ready["errors"])
+
+    def test_borrowed_dialogue_picture_records_j_and_l_cuts(self):
+        self._speak_second_row_as_dialogue()
+        _, before = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        old = {e["id"]: e for e in before["events"]}
+        # demo-s002 keeps frames 7..106 of its clip and demo-s003 keeps 7..106 of its own.
+        j_cut = ("demo-s003", self.window(0.0, 0.5, "work/grok/demo-s002.mp4", 106 / 24, role="listener cutaway"))
+        l_cut = ("demo-s002", self.window(93 / 24, 99 / 24, "work/grok/demo-s003.mp4", 1 / 24, role="insert"))
+        expected = {"J": ("demo-s003", {"kind": "J", "boundary": "start", "with": "demo-s002", "seconds": 0.5}),
+                    "L": ("demo-s002", {"kind": "L", "boundary": "end", "with": "demo-s003", "seconds": 0.25})}
+        for kind, (scene, window) in (("J", j_cut), ("L", l_cut)):
+            with self.subTest(kind):
+                config = json.loads(self.config.read_text())
+                for other in ("demo-s002", "demo-s003"):
+                    config["dialogueOutputs"][other].pop("pictureWindows", None)
+                config["dialogueOutputs"][scene]["pictureWindows"] = [window]
+                self.write_json(self.config, config)
+                ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+                self.assertTrue(ready["ready"], ready)
+                by_id = {e["id"]: e for e in plan["events"]}
+                for event_id in ("demo-s002", "demo-s003"):
+                    for field in self.AUDIO_FIELDS:
+                        self.assertEqual(old[event_id][field], by_id[event_id][field], (event_id, field))
+                marked, record = expected[kind]
+                self.assertEqual(by_id[marked]["splitEdits"], [record])
+                self.assertEqual(by_id[marked]["pictureWindows"][0]["sourceKind"], "dialogue")
+                with mock.patch.object(assembly, "probe_duration", return_value=5.0):
+                    segments = assembly.build_picture_segments(self.ep, plan)
+                runs = assembly.coalesce_render_segments(segments)
+                # The window continues its neighbour's frames, so the picture
+                # crosses the boundary as one run instead of restarting.
+                joined = [run for run in runs if len(run["memberSegmentIds"]) > 1]
+                self.assertEqual(len(joined), 1, runs)
+                self.assertEqual(sum(run["frames"] for run in runs), round(plan["runtimeSeconds"] * 24))
+        # Crossing both ways at once continues neither neighbour, so neither is a split edit.
+        config = json.loads(self.config.read_text())
+        config["dialogueOutputs"]["demo-s003"]["pictureWindows"] = [j_cut[1]]
+        config["dialogueOutputs"]["demo-s002"]["pictureWindows"] = [l_cut[1]]
+        self.write_json(self.config, config)
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertEqual([e.get("splitEdits") for e in plan["events"] if e["kind"] == "dialogue"], [None, None])
+
+    def test_borrowed_dialogue_picture_never_shows_its_speech(self):
+        self._speak_second_row_as_dialogue()
+        self.set_output("demo-s003", pictureWindows=[
+            self.window(0.0, 1.5, "work/grok/demo-s002.mp4", 3.0, role="listener reaction")])
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any("speaking" in e.get("error", "") for e in self.readiness()["errors"]))
+        config = json.loads(self.config.read_text())
+        del config["dialogueOutputs"]["demo-s002"]["speechWindow"]
+        config["dialogueOutputs"]["demo-s003"]["pictureWindows"] = [
+            self.window(0.0, 0.5, "work/grok/demo-s002.mp4", 4.5, role="cutaway")]
+        self.write_json(self.config, config)
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any("unmeasured" in e.get("error", "") for e in self.readiness()["errors"]))
+
+    def test_window_over_a_native_endpoint_breaks_its_continuation(self):
+        path = self.ep / "work/h3-review-ledger-v1.json"
+        ledger = json.loads(path.read_text())
+        parent = self.ep / "work/grok/demo-s003.mp4"
+        ledger["entries"]["demo-s004"]["segments"][0].update({
+            "in": 1 / 24, "out": 3.0, "sourceSha256": self.sha(self.ep / "work/h3/demo-s004.mp4"),
+            "continuationOf": dict(source=str(parent.relative_to(self.ep)), sourceSha256=self.sha(parent),
+                                   endFrameExclusive=120, parentKind="dialogue")})
+        self.write_json(path, ledger)
+        config = json.loads(self.config.read_text())
+        del config["dialogueOutputs"]["demo-s003"]["speechWindow"]  # the whole clip, so its native end
+        self.write_json(self.config, config)
+        ready, _ = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        self.set_output(pictureWindows=[self.window(4.0, 5.0, "work/h3/demo-s002.mp4", 0.0, role="insert")])
+        with self.assertRaises(timeline.TimelineIncomplete):
+            timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(any(e["type"] == "h3-continuation-contract" for e in self.readiness()["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()

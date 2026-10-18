@@ -135,7 +135,10 @@ def build_picture_segments(ep: Path, plan: dict) -> list[dict]:
             candidate = block["candidates"][0]
             if isinstance(candidate, str):
                 candidate = {"path": candidate}
-            candidates = [dict(candidate, role="dialogue-fixed-sync")]
+            # A picture window names its own source, hash and role; the native
+            # part keeps the fixed-sync role it always had.
+            role = candidate["role"] if candidate.get("pictureWindow") else "dialogue-fixed-sync"
+            candidates = [dict(candidate, role=role)]
         else:
             candidates = block["candidates"]
         for candidate in candidates:
