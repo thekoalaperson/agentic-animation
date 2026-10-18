@@ -414,6 +414,38 @@ def _picture_rule(row: dict[str, Any]) -> tuple[str, int | None]:
     return "authored", round(exact)
 
 
+def _finite_seconds(value: Any) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value))
+
+
+def _scene_handles(dialogue_outputs: dict[str, Any], row_kind: dict[str, str],
+                   film_pre: float, film_post: float) -> dict[str, tuple[float, float, str]]:
+    """Read per-scene ``handles``, the override of the film-wide ``dialogueHandles``.
+
+    A missing side keeps the film-wide value. Handles widen the kept window
+    around measured speech only, so a negative value, which would cut speech,
+    is refused; the clip's natural frames still bound both sides.
+    """
+    result = {}
+    for scene_id, output in dialogue_outputs.items():
+        raw = output.get("handles") if isinstance(output, dict) else None
+        if raw is None:
+            continue
+        if row_kind.get(scene_id) != "dialogue":
+            raise TimelineIncomplete(f"Dialogue handles name no dialogue scene: {scene_id}")
+        if (not isinstance(raw, dict) or not set(raw) <= {"preSeconds", "postSeconds", "reason"}
+                or not set(raw) & {"preSeconds", "postSeconds"}
+                or not isinstance(raw.get("reason"), str) or not raw["reason"].strip()
+                or any(not _finite_seconds(raw[key]) or raw[key] < 0
+                       for key in ("preSeconds", "postSeconds") if key in raw)):
+            raise TimelineIncomplete(
+                f"Dialogue handles need non-negative finite preSeconds and/or postSeconds and an authored reason: {scene_id}")
+        result[scene_id] = (float(raw.get("preSeconds", film_pre)), float(raw.get("postSeconds", film_post)),
+                            raw["reason"].strip())
+    return result
+
+
 def _speech_rule(row: dict[str, Any]) -> None:
     scene_id = row.get("still_id")
     if row.get("durationRule") not in (None, "speech") or any(
@@ -1694,6 +1726,7 @@ def build_timeline(
     handles = config.get("dialogueHandles", {})
     dialogue_pre = float(handles.get("preSeconds", 0.70))
     dialogue_post = float(handles.get("postSeconds", 0.90))
+    scene_handles = _scene_handles(dialogue_outputs, row_kind, dialogue_pre, dialogue_post)
     preserve_dialogue = config.get("preserveCompleteDialogueClips", False)
     if type(preserve_dialogue) is not bool:
         raise TimelineIncomplete("preserveCompleteDialogueClips must be a boolean")
@@ -1710,6 +1743,7 @@ def build_timeline(
             if natural_frames <= 0:
                 raise TimelineIncomplete(f"Dialogue has no video frames: {scene_id}")
             speech = _speech_window(entry, output)
+            authored_handles = None
             if speech is None:
                 source_start_frame = 0
                 source_end_frame = natural_frames
@@ -1733,16 +1767,22 @@ def build_timeline(
                     raise TimelineIncomplete(
                         f"Invalid dialogue speech window for {scene_id}: {speech_start}..{speech_end}"
                     )
-                source_start_frame = max(0, math.floor((speech_start - dialogue_pre) * DELIVERY_FPS + 1e-7))
+                pre, post = scene_handles.get(scene_id, (dialogue_pre, dialogue_post, None))[:2]
+                source_start_frame = max(0, math.floor((speech_start - pre) * DELIVERY_FPS + 1e-7))
                 source_end_frame = min(
                     natural_frames,
-                    math.ceil((speech_end + dialogue_post) * DELIVERY_FPS - 1e-7),
+                    math.ceil((speech_end + post) * DELIVERY_FPS - 1e-7),
                 )
                 handle_basis = "measured-full-speech-window-plus-authored-handles"
+                authored_handles = scene_handles.get(scene_id)
                 if preserve_dialogue:
                     source_start_frame = 0
                     source_end_frame = natural_frames
                     handle_basis = "measured-subtitle-window-complete-native-performance"
+                    authored_handles = None
+            if scene_id in scene_handles and authored_handles is None:
+                warnings.append({"type": "dialogue-handles-unused", "sceneId": scene_id,
+                                 "reason": "the complete native clip is kept, so per-scene handles have no effect"})
             duration_frames = source_end_frame - source_start_frame
             duration = duration_frames / DELIVERY_FPS
             source_start = source_start_frame / DELIVERY_FPS
@@ -1780,6 +1820,10 @@ def build_timeline(
                     "basis": handle_basis,
                     "preSeconds": round(subtitle_at, 6),
                     "postSeconds": round(duration - subtitle_at - subtitle_duration, 6),
+                    **({"authored": {"preSeconds": authored_handles[0],
+                                     "postSeconds": authored_handles[1],
+                                     "reason": authored_handles[2]}}
+                       if authored_handles else {}),
                 },
                 "admission": {
                     "sidecar": output["sidecar"],

@@ -1703,5 +1703,61 @@ class TimelineBuilderTest(unittest.TestCase):
         decode.assert_not_called()
 
 
+    # Editing grammar: per-scene handles, picture windows, overlaps and transitions.
+
+    def set_output(self, scene="demo-s003", **fields):
+        config = json.loads(self.config.read_text())
+        config["dialogueOutputs"][scene].update(fields)
+        self.write_json(self.config, config)
+
+    def test_scene_handles_override_the_film_wide_handles(self):
+        _, before = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        original = (self.ep / "work/assembly-v1/edit-plan.json").read_bytes()
+        self.set_output(handles={"postSeconds": 0.25, "reason": "Leave on the answer, not the reaction."})
+        ready, after = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertTrue(ready["ready"], ready)
+        a = next(e for e in before["events"] if e["kind"] == "dialogue")
+        b = next(e for e in after["events"] if e["kind"] == "dialogue")
+        # Speech 1.0..3.5 s; pre stays at the film-wide 0.70 s, post shrinks to 0.25 s.
+        self.assertEqual(a["sourceStart"], b["sourceStart"])
+        self.assertAlmostEqual(b["duration"], (90 - 7) / 24, places=6)
+        self.assertEqual(b["subtitleAudioAt"], a["subtitleAudioAt"])
+        self.assertEqual(b["subtitleAudioDuration"], a["subtitleAudioDuration"])
+        self.assertEqual(b["dialogueHandles"]["authored"],
+                         {"preSeconds": 0.7, "postSeconds": 0.25, "reason": "Leave on the answer, not the reaction."})
+        self.assertNotIn("authored", a["dialogueHandles"])
+        # Removing the field restores today's bytes.
+        config = json.loads(self.config.read_text())
+        del config["dialogueOutputs"]["demo-s003"]["handles"]
+        self.write_json(self.config, config)
+        timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        self.assertEqual(original, (self.ep / "work/assembly-v1/edit-plan.json").read_bytes())
+
+    def test_scene_handles_never_cut_speech_and_need_a_reason(self):
+        self.set_output(handles={"preSeconds": 5.0, "postSeconds": 5.0, "reason": "Hold the whole room."})
+        _, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        event = next(e for e in plan["events"] if e["kind"] == "dialogue")
+        self.assertEqual((event["sourceStart"], event["duration"]), (0.0, 5.0))  # bounded by natural frames
+        for invalid in ({"preSeconds": -0.1, "reason": "x"}, {"preSeconds": 0.2},
+                        {"preSeconds": 0.2, "reason": " "}, {"reason": "no seconds"},
+                        {"preSeconds": float("nan"), "reason": "x"}, {"preSeconds": True, "reason": "x"},
+                        {"preSeconds": 0.2, "reason": "x", "extra": 1}):
+            with self.subTest(handles=invalid):
+                self.set_output(handles=invalid)
+                with self.assertRaisesRegex(timeline.TimelineIncomplete, "Dialogue handles"):
+                    timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+
+    def test_scene_handles_without_a_measured_window_are_reported_unused(self):
+        config = json.loads(self.config.read_text())
+        del config["dialogueOutputs"]["demo-s003"]["speechWindow"]
+        config["dialogueOutputs"]["demo-s003"]["handles"] = {"preSeconds": 0.1, "reason": "Tight in."}
+        self.write_json(self.config, config)
+        ready, plan = timeline.build_timeline(self.ep, self.config, probe=self.fake_probe)
+        event = next(e for e in plan["events"] if e["kind"] == "dialogue")
+        self.assertEqual(event["duration"], 5.0)
+        self.assertNotIn("authored", event["dialogueHandles"])
+        self.assertTrue(any(w["type"] == "dialogue-handles-unused" for w in ready["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
